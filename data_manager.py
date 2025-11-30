@@ -24,6 +24,12 @@ import config
 logging.basicConfig(level=config.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
+torch.manual_seed(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+np.random.seed(42)
+import random
+random.seed(42)
 
 class TrendLSTM(nn.Module):
     """

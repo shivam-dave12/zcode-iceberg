@@ -61,8 +61,11 @@ class AetherOracle:
     """
 
     def __init__(self) -> None:
+
+        np.random.seed(42)
+
         # PPO / RL placeholder state: proxy with running winrate for now.
-        self.entry_prob_threshold: float = 0.85  # CHANGED from 0.95; for momentum spikes
+        self.entry_prob_threshold: float = 0.70  # CHANGED from 0.95; for momentum spikes
         self.rr_assumed: float = 3.33  # R:R used for Kelly
         self.mc_paths: int = 100
 

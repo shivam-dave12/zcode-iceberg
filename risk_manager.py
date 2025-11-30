@@ -32,7 +32,7 @@ class RiskManager:
         # Risk tracking
         self.daily_trades = 0
         self.daily_pnl = 0.0
-        self.last_reset = datetime.now()
+        self.last_reset = datetime.utcnow()
 
         self.total_trades = 0
         self.winning_trades = 0
@@ -231,7 +231,7 @@ class RiskManager:
     # ======================================================================
 
     def _reset_daily_counters(self):
-        now = datetime.now()
+        now = datetime.utcnow()
         if now.date() > self.last_reset.date():
             logger.info("Resetting daily counters")
             self.daily_trades = 0

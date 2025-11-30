@@ -38,7 +38,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler(
-            f"zscore_iceberg_hunter_{datetime.now().strftime('%Y%m%d')}.log"
+            f"zscore_iceberg_hunter_{datetime.utcnow().strftime('%Y%m%d')}.log"
         ),
         logging.StreamHandler(sys.stdout),
     ],
@@ -95,7 +95,7 @@ class ZScoreIcebergBot:
 
         if config.ENABLE_EXCEL_LOGGING:
             excel_file = (
-                f"zscore_iceberg_hunter_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                f"zscore_iceberg_hunter_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
             )
             self.excel_logger = ZScoreExcelLogger(filepath=excel_file)
         else:
@@ -238,7 +238,7 @@ class ZScoreIcebergBot:
             if not last_update:
                 return
 
-            idle_sec = (datetime.now() - last_update).total_seconds()
+            idle_sec = (datetime.utcnow() - last_update).total_seconds()
             if idle_sec <= WS_IDLE_RESTART_SEC:
                 return
 
@@ -359,7 +359,7 @@ class ZScoreIcebergBot:
 
             lines = [
                 "Z-Score BOT 15m Report",
-                datetime.now().strftime("Time: %Y-%m-%d %H:%M:%S UTC"),
+                datetime.utcnow().strftime("Time: %Y-%m-%d %H:%M:%S UTC"),
             ]
 
             if last_price > 0:
