@@ -9,6 +9,7 @@ Components:
 - ZScoreIcebergHunterStrategy (strategy.py)
 - RiskManager / OrderManager (existing modules)
 - ZScoreExcelLogger (Excel logging)
+- TelegramCommandHandler (Telegram bot control)
 """
 
 import time
@@ -16,22 +17,20 @@ import signal
 import sys
 import logging
 from datetime import datetime
-
 from futures_api import FuturesAPI
-from futures_websocket import FuturesWebSocket  # imported for completeness
-
+from futures_websocket import FuturesWebSocket # imported for completeness
 import config
 from data_manager import ZScoreDataManager
 from order_manager import OrderManager
 from risk_manager import RiskManager
 from strategy import ZScoreIcebergHunterStrategy
 from zscore_excel_logger import ZScoreExcelLogger
-
 import telegram_config
 from telegram_notifier import (
     send_telegram_message,
     install_global_telegram_log_handler,
 )
+from telegram_command_handler import TelegramCommandHandler
 
 logging.basicConfig(
     level=config.LOG_LEVEL,
@@ -46,12 +45,11 @@ logging.basicConfig(
 
 # Install global Telegram log handler for all WARNING+ logs
 install_global_telegram_log_handler(
-    level=logging.WARNING,     # WARNING, ERROR, CRITICAL
-    throttle_seconds=5.0,      # set to 0.0 if you want zero throttling
+    level=logging.WARNING, # WARNING, ERROR, CRITICAL
+    throttle_seconds=5.0, # set to 0.0 if you want zero throttling
 )
 
 logger = logging.getLogger(__name__)
-
 
 def _handle_uncaught_exception(exc_type, exc_value, exc_traceback) -> None:
     """
@@ -61,18 +59,15 @@ def _handle_uncaught_exception(exc_type, exc_value, exc_traceback) -> None:
         # Let KeyboardInterrupt behave normally
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
         return
-
     logger.error(
         "Uncaught exception",
         exc_info=(exc_type, exc_value, exc_traceback),
     )
 
-
 sys.excepthook = _handle_uncaught_exception
 
 # Seconds without any data_manager update before we treat it as a disconnect
-WS_IDLE_RESTART_SEC = 20.0  # you can tune this if needed
-
+WS_IDLE_RESTART_SEC = 20.0 # you can tune this if needed
 
 class ZScoreIcebergBot:
     """
@@ -83,12 +78,10 @@ class ZScoreIcebergBot:
         logger.info("=" * 80)
         logger.info("Z-SCORE IMBALANCE ICEBERG HUNTER BOT")
         logger.info("=" * 80)
-
         self.api = FuturesAPI(
             api_key=config.COINSWITCH_API_KEY,
             secret_key=config.COINSWITCH_SECRET_KEY,
         )
-
         self.data_manager = ZScoreDataManager()
         self.order_manager = OrderManager()
         self.risk_manager = RiskManager()
@@ -104,12 +97,14 @@ class ZScoreIcebergBot:
         self.strategy = ZScoreIcebergHunterStrategy(
             excel_logger=self.excel_logger,
         )
-
         self.running = False
 
         # Track last times to avoid thrashing
         self._last_stream_check_sec: float = 0.0
         self._last_report_sec: float = 0.0
+
+        # Telegram command handler
+        self.telegram_handler = TelegramCommandHandler(bot_instance=self)
 
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -189,6 +184,13 @@ class ZScoreIcebergBot:
             )
 
             self.running = True
+            
+            # Start Telegram command listener
+            try:
+                self.telegram_handler.start_polling()
+            except Exception as e:
+                logger.error(f"Failed to start Telegram command handler: {e}", exc_info=True)
+            
             self._run_main_loop()
 
         except Exception as e:
@@ -210,11 +212,10 @@ class ZScoreIcebergBot:
                     order_manager=self.order_manager,
                     risk_manager=self.risk_manager,
                 )
-
                 self._check_stream_health()
                 self._maybe_send_telegram_report()
-
                 time.sleep(config.POSITION_CHECK_INTERVAL)
+
             except Exception as e:
                 logger.error(f"Error in main loop: {e}", exc_info=True)
                 time.sleep(1.0)
@@ -223,25 +224,33 @@ class ZScoreIcebergBot:
         """
         Monitor data_manager stats and restart streams (with full REST warmup)
         if we see no updates for WS_IDLE_RESTART_SEC seconds.
-
-        Adds one extra safeguard: if data_manager.start() fails, attempts a raw
-        WebSocket reconnect once via data_manager.ws.connect().
+        Enhanced with automatic reconnection and notification.
         """
         now_sec = time.time()
         if now_sec - self._last_stream_check_sec < 1.0:
             return
-
         self._last_stream_check_sec = now_sec
-
+        
         try:
             last_update = self.data_manager.stats.get("last_update")
             if not last_update:
                 return
-
+            
             idle_sec = (datetime.utcnow() - last_update).total_seconds()
             if idle_sec <= WS_IDLE_RESTART_SEC:
                 return
-
+            
+            # WebSocket issue detected - send Telegram alert
+            alert_msg = (
+                f"⚠️ WEBSOCKET ISSUE DETECTED\n"
+                f"No data for {idle_sec:.1f}s (threshold: {WS_IDLE_RESTART_SEC:.0f}s)\n"
+                f"Attempting automatic restart..."
+            )
+            try:
+                send_telegram_message(alert_msg)
+            except:
+                pass
+            
             logger.warning(
                 "=" * 80
                 + "\n"
@@ -250,7 +259,8 @@ class ZScoreIcebergBot:
                 f"with fresh REST warmup for HTF trend and ATR...\n"
                 + "=" * 80
             )
-
+            
+            # Stop existing connection
             try:
                 self.data_manager.stop()
             except Exception as e:
@@ -258,29 +268,61 @@ class ZScoreIcebergBot:
                     f"Error stopping data manager during restart: {e}",
                     exc_info=True,
                 )
-
-            time.sleep(1.0)
-
-            # Restart streams + REST warmup
-            if not self.data_manager.start():
-                logger.error(
-                    "Data manager restart failed; attempting raw WS reconnect..."
-                )
+            
+            time.sleep(2.0)
+            
+            # Attempt restart with full warmup
+            restart_success = False
+            for attempt in range(3):
                 try:
-                    if self.data_manager.ws and not self.data_manager.ws.connect():
-                        time.sleep(10)
+                    logger.info(f"WebSocket restart attempt {attempt + 1}/3...")
+                    
+                    if self.data_manager.start():
+                        restart_success = True
+                        logger.info(
+                            "Data manager successfully restarted. "
+                            "Historical klines reloaded for HTF trend and ATR filters."
+                        )
+                        
+                        success_msg = (
+                            f"✅ WEBSOCKET RESTORED\n"
+                            f"Reconnected after {idle_sec:.1f}s downtime\n"
+                            f"Attempt: {attempt + 1}/3"
+                        )
+                        try:
+                            send_telegram_message(success_msg)
+                        except:
+                            pass
+                        
+                        break
+                    else:
+                        logger.warning(f"Restart attempt {attempt + 1} failed")
+                        time.sleep(5.0)
+                        
                 except Exception as e:
                     logger.error(
-                        f"Raw WS reconnect attempt failed: {e}",
+                        f"Error in restart attempt {attempt + 1}: {e}",
                         exc_info=True,
                     )
-                    return
-
-            logger.info(
-                "Data manager successfully restarted. "
-                "Historical klines reloaded for HTF trend and ATR filters."
-            )
-
+                    time.sleep(5.0)
+            
+            if not restart_success:
+                # All restart attempts failed
+                error_msg = (
+                    f"❌ WEBSOCKET RESTART FAILED\n"
+                    f"Could not restore connection after 3 attempts\n"
+                    f"Manual intervention may be required"
+                )
+                try:
+                    send_telegram_message(error_msg)
+                except:
+                    pass
+                
+                logger.error(
+                    "Failed to restart WebSocket after 3 attempts. "
+                    "Bot will continue attempting automatic recovery."
+                )
+                
         except Exception as e:
             logger.error(f"Error in WebSocket stream health check: {e}", exc_info=True)
 
@@ -289,7 +331,14 @@ class ZScoreIcebergBot:
         Clean shutdown.
         """
         self.running = False
-
+        
+        # Stop Telegram command handler
+        try:
+            if self.telegram_handler:
+                self.telegram_handler.stop_polling()
+        except Exception as e:
+            logger.error(f"Error stopping Telegram handler: {e}")
+        
         try:
             if self.data_manager:
                 self.data_manager.stop()
@@ -319,7 +368,6 @@ class ZScoreIcebergBot:
         now = time.time()
         if now - self._last_report_sec < interval:
             return
-
         self._last_report_sec = now
 
         try:
@@ -396,9 +444,9 @@ class ZScoreIcebergBot:
                 )
 
             send_telegram_message("\n".join(lines))
+
         except Exception:
             logger.exception("Failed to send Telegram 15m report")
-
 
 if __name__ == "__main__":
     try:

@@ -1,0 +1,46 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info
+dist
+build
+venv
+env
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Logs (will be generated in container)
+*.log
+logs/
+
+# Excel files (will be generated in container)
+*.xlsx
+
+# Environment files (will be provided separately)
+.env.example
+
+# AWS
+*.pem
+*.ppk
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# Documentation
+README.md
+docs/
