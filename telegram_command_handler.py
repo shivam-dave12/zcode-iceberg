@@ -137,48 +137,45 @@ class TelegramCommandHandler:
     def _handle_start_command(self) -> None:
         """Handle START command"""
         try:
-            if self.bot_instance.running:
-                self._send_message("✅ Bot is already running")
+            if self.bot_running:
+                self._send_message("✅ Trading bot is already running")
                 return
             
-            self._send_message("🚀 Starting bot...")
+            self._send_message("🚀 Starting trading bot...")
+            logger.info("Starting trading bot from Telegram command...")
             
-            # Start bot in separate thread to avoid blocking
-            start_thread = threading.Thread(
-                target=self.bot_instance.start,
+            # Start bot in separate thread
+            self.bot_thread = threading.Thread(
+                target=self._run_bot,
                 daemon=False,
-                name="BotStartThread"
+                name="TradingBotThread"
             )
-            start_thread.start()
+            self.bot_thread.start()
             
-            time.sleep(2.0)
+            # Wait longer for bot to initialize (increased from 3s to 8s)
+            time.sleep(8.0)
             
-            if self.bot_instance.running:
-                self._send_message("✅ Bot started successfully")
+            if self.bot_running:
+                self._send_message("✅ Trading bot started successfully")
+                logger.info("Trading bot started successfully")
             else:
-                self._send_message("❌ Failed to start bot - check logs")
+                # Check if thread is still alive (bot might be starting)
+                if self.bot_thread and self.bot_thread.is_alive():
+                    # Give it more time
+                    time.sleep(5.0)
+                    if self.bot_running:
+                        self._send_message("✅ Trading bot started successfully (delayed)")
+                        logger.info("Trading bot started successfully (delayed)")
+                    else:
+                        self._send_message("⚠️ Bot thread running but status unclear - check logs")
+                        logger.warning("Bot thread alive but bot_running flag not set")
+                else:
+                    self._send_message("❌ Failed to start trading bot - check logs")
+                    logger.error("Failed to start trading bot")
                 
         except Exception as e:
             logger.error(f"Error handling START command: {e}", exc_info=True)
             self._send_message(f"❌ Error starting bot: {e}")
-    
-    def _handle_stop_command(self) -> None:
-        """Handle STOP command - graceful shutdown"""
-        try:
-            if not self.bot_instance.running:
-                self._send_message("⚠️ Bot is already stopped")
-                return
-            
-            self._send_message("🛑 Stopping bot...")
-            
-            # Stop bot
-            self.bot_instance.stop()
-            
-            self._send_message("✅ Bot stopped successfully")
-            
-        except Exception as e:
-            logger.error(f"Error handling STOP command: {e}", exc_info=True)
-            self._send_message(f"❌ Error stopping bot: {e}")
     
     def _handle_status_command(self) -> None:
         """Handle STATUS command - provide detailed status"""

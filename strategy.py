@@ -1714,60 +1714,66 @@ class ZScoreIcebergHunterStrategy:
                 )
 
         # Consider TP extension to FULL after 5 minutes
-        if pos.main_filled and not pos.tp_reduced:
-            elapsed_min_for_tp = (now_sec - pos.entry_time_sec) / 60.0
-            if elapsed_min_for_tp >= 5.0:
+        # ======================================================================
+        # 5) TP EXTENSION from HALF → FULL (after partial progress)
+        # ======================================================================
+        if (
+            not pos.tp_reduced
+            and elapsed_min >= config.DYNAMIC_TP_MINUTES
+            and config.ENABLE_TP_TIGHTENING
+        ):
+            # Check if we're >50% toward full TP
+            direction = 1.0 if pos.side == "long" else -1.0
+            current_profit = (current_price - pos.entry_price) * direction
+            full_tp_profit = (full_tp_price - pos.entry_price) * direction
+            
+            if full_tp_profit > 0:
+                progress = current_profit / full_tp_profit
+            else:
+                progress = 0.0
+            
+            if progress >= config.DYNAMIC_TP_REQUIRED_PROGRESS:
+                # We're >50% of the way to full TP → extend to full
                 logger.info(
                     f"Considering TP EXTENSION to FULL for {pos.trade_id} "
-                    f"(elapsed={elapsed_min_for_tp:.1f} min, full TP={pos.tp_price:.2f})"
+                    f"(elapsed={elapsed_min:.1f} min, progress={progress*100:.1f}%, "
+                    f"full TP={full_tp_price:.2f})"
                 )
-
-                if pos.quantity <= 0:
+                
+                # Cancel old HALF TP
+                cancel_ok = self.order_manager.cancel_order(pos.tp_order_id)
+                if not cancel_ok:
                     logger.error(
-                        f"Invalid quantity for TP extension on {pos.trade_id}"
+                        f"Failed to cancel HALF TP {pos.tp_order_id}; "
+                        f"keeping position with existing bracket."
                     )
-                    pos.tp_reduced = True
                     return
-
-                if pos.side == "long":
-                    tp_side = "SELL"
-                else:
-                    tp_side = "BUY"
-
-                try:
-                    if pos.tp_order_id:
-                        order_manager.cancel_order(pos.tp_order_id)
-                except Exception as e:
-                    logger.error(
-                        f"Error cancelling HALF TP {pos.tp_order_id}: {e}",
-                        exc_info=True,
-                    )
-
-                try:
-                    new_tp_order = order_manager.place_take_profit(
-                        side=tp_side,
-                        quantity=pos.quantity,
-                        trigger_price=pos.tp_price,
-                    )
-                    if new_tp_order and "order_id" in new_tp_order:
-                        pos.tp_order_id = new_tp_order["order_id"]
-                        pos.tp_reduced = True
-                        logger.info(
-                            f"New FULL TP placed for {pos.trade_id} "
-                            f"@ {pos.tp_price:.2f}, order_id={pos.tp_order_id}"
-                        )
-                    else:
-                        logger.error(
-                            f"Failed to place FULL TP for {pos.trade_id}; "
-                            f"leaving position without active TP."
-                        )
-                        pos.tp_reduced = True
-                except Exception as e:
-                    logger.error(
-                        f"Error placing FULL TP for {pos.trade_id}: {e}",
-                        exc_info=True,
-                    )
+                
+                # CRITICAL: Add buffer to allow CoinSwitch to process cancellation
+                logger.info("Waiting 1.0s for CoinSwitch to process TP cancellation...")
+                time.sleep(1.0)
+                
+                # Place new FULL TP
+                tp_side = "SELL" if pos.side == "long" else "BUY"
+                new_tp = self.order_manager.place_take_profit(
+                    side=tp_side,
+                    quantity=pos.quantity,
+                    trigger_price=full_tp_price,
+                )
+                
+                if new_tp and "order_id" in new_tp:
+                    pos.tp_order_id = new_tp["order_id"]
+                    pos.tp_price = full_tp_price
                     pos.tp_reduced = True
+                    logger.info(
+                        f"TP EXTENDED to FULL: new TP={full_tp_price:.2f}, "
+                        f"order_id={pos.tp_order_id}"
+                    )
+                else:
+                    logger.error(
+                        f"Failed to place FULL TP for {pos.trade_id}; "
+                        f"leaving position without active TP."
+                    )
 
         # --- Dynamic TP tightening based on stagnation + low volatility (NEW) ---
         if (
