@@ -1,18 +1,25 @@
-# aether_oracle.py
+"""
+aether_oracle.py
 
+Aether Oracle: fuses core gates + advanced metrics → probabilistic entry + Kelly sizing.
+"""
 import logging
 import math
 import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, List
+
 import numpy as np
 import config
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class OracleInputs:
-    # Core gates (as computed in strategy)
+    """
+    Core gates as computed in strategy
+    """
     imbalance_data: Optional[Dict]
     wall_data: Optional[Dict]
     delta_data: Optional[Dict]
@@ -21,6 +28,7 @@ class OracleInputs:
     ltf_trend: Optional[str]
     ema_val: Optional[float]
     atr_pct: Optional[float]
+
     # Advanced metrics
     lv_1m: Optional[float]
     lv_5m: Optional[float]
@@ -29,9 +37,10 @@ class OracleInputs:
     norm_cvd: Optional[float]
     hurst: Optional[float]
     bos_align: Optional[float]
-    # Meta
+
     current_price: float
     now_sec: float
+
 
 @dataclass
 class OracleSideScores:
@@ -44,49 +53,52 @@ class OracleSideScores:
     rr: float
     reasons: List[str]
 
+
 @dataclass
 class OracleOutputs:
     long_scores: OracleSideScores
     short_scores: OracleSideScores
 
+
 class AetherOracle:
     """
     Aether Oracle: fuses core gates + advanced metrics into a probabilistic
-    entry decision and Kelly sizing.
-    All heavy math lives here to avoid touching the core Z-Score strategy logic.
+    entry decision and Kelly sizing. All heavy math lives here to avoid
+    touching the core Z-Score strategy logic.
     """
+
     def __init__(self) -> None:
         np.random.seed(42)
-        self.entry_prob_threshold: float = 0.70  # CHANGED from 0.95; for momentum spikes
-        self.rr_assumed: float = 3.33  # R:R used for Kelly
+
+        # Meta
+        self.entry_prob_threshold: float = 0.65  # CHANGED from 0.95; for momentum spikes
+        self.rr_assumed: float = 3.33  # RR used for Kelly
         self.mc_paths: int = 100
-        # Floors/ceilings to avoid hard 0/1 probabilities in logs
-        self._prob_min: float = 0.01
-        self._prob_max: float = 0.99
 
-    # ======================================================================
-    # Raw metric builders from DataManager
-    # ======================================================================
+        # Floor/ceilings to avoid hard 0/1 probabilities in logs
+        self.prob_min: float = 0.01
+        self.prob_max: float = 0.99
 
-    def compute_liquidity_velocity_multi_tf(
-        self, data_manager
+    def compute_liquidity_velocity_multitf(
+        self, datamanager
     ) -> Tuple[Optional[float], Optional[float], Optional[float], bool]:
         """
-        Liquidity Velocity per TF:
-        LV = sum(volume) / (sum(|ΔP|) + ε)
-        Uses recent trades for volume and price window for ΔP.
+        Liquidity Velocity per TF: LV = sum(volume) / sum(|ΔP|).
+        Uses recent trades for volume and price window for |ΔP|.
         """
-        def _lv_for_window(window_sec: int) -> Optional[float]:
-            price_window = data_manager.get_price_window(window_seconds=window_sec)
+
+        def lv_for_window(window_sec: int) -> Optional[float]:
+            price_window = datamanager.get_price_window(window_seconds=window_sec)
             if not price_window or len(price_window) < 2:
                 return None
-            prices = [p for _, p in price_window]
+            prices = [p for (_, p) in price_window]
             deltas = [abs(prices[i] - prices[i - 1]) for i in range(1, len(prices))]
-            sum_abs_dp = float(sum(deltas))
-            eps = 1e-6
-            trades = data_manager.get_recent_trades(window_seconds=window_sec)
+            sum_abs_dp = float(sum(deltas)) + 1e-6
+
+            trades = datamanager.get_recent_trades(window_seconds=window_sec)
             if not trades:
                 return None
+
             vol_sum = 0.0
             for t in trades:
                 try:
@@ -96,32 +108,36 @@ class AetherOracle:
                 if qty <= 0:
                     continue
                 vol_sum += qty
+
             if vol_sum <= 0.0:
                 return None
-            return vol_sum / (sum_abs_dp + eps)
 
-        lv_1m = _lv_for_window(60)
-        lv_5m = _lv_for_window(300)
-        lv_15m = _lv_for_window(900)
+            return vol_sum / sum_abs_dp
+
+        lv_1m = lv_for_window(60)
+        lv_5m = lv_for_window(300)
+        lv_15m = lv_for_window(900)
+
         micro_trap = False
         if lv_1m is not None and lv_5m is not None and lv_5m > 0:
             if lv_1m > 1.5 * lv_5m:
                 micro_trap = True
-        return lv_1m, lv_5m, lv_15m, micro_trap
 
-    def compute_norm_cvd(self, data_manager, window_sec: int) -> Optional[float]:
+        return (lv_1m, lv_5m, lv_15m, micro_trap)
+
+    def compute_norm_cvd(self, datamanager, window_sec: int) -> Optional[float]:
         """
         Footprint CVD in window_sec (typically 10s), normalized by volume:
-        NormCVD = (Σ Vol_i * side_sign_i) / (Σ Vol_i)
-        where side_sign = +1 buy, -1 sell.
+        NormCVD = Σ(Vol_i × side_sign_i) / Σ(Vol_i),
+        where side_sign = +1 (buy), -1 (sell).
+
         UPDATED: Returns 0.0 (Neutral) instead of None if valid orderbook exists
         but no trades occurred in the window.
         """
-        trades = data_manager.get_recent_trades(window_seconds=window_sec)
-        # If no trades, check if we have price data at least.
-        # If yes, return 0.0 (neutral flow). If no price/book, return None.
+        trades = datamanager.get_recent_trades(window_seconds=window_sec)
+        # If no trades but price exists, return 0.0 neutral flow. If no price/book, return None.
         if not trades:
-            if data_manager.get_last_price() > 0:
+            if datamanager.get_last_price() > 0:
                 return 0.0
             return None
 
@@ -134,34 +150,35 @@ class AetherOracle:
                 qty = 0.0
             if qty <= 0:
                 continue
+
+            # On CoinSwitch streams, isBuyerMaker = False → aggressive buy
             is_buyer_maker = bool(t.get("isBuyerMaker", False))
-            # On CoinSwitch streams, isBuyerMaker == False → aggressive buy
             if not is_buyer_maker:
                 buy_vol += qty
             else:
                 sell_vol += qty
 
         total = buy_vol + sell_vol
+        # Trades existed but sum volume = 0? Unlikely, but return neutral.
         if total <= 0.0:
-            # Trades existed but sum volume 0? Unlikely, but return neutral.
             return 0.0
+
         norm_cvd = (buy_vol - sell_vol) / total
-        # Clamp to [-1,1] numerically
         return max(-1.0, min(1.0, norm_cvd))
 
     def compute_hurst_exponent(
-        self, data_manager, window_ticks: int = 20
+        self, datamanager, window_ticks: int = 20
     ) -> Optional[float]:
         """
         Hurst exponent via classic R/S method on last N price ticks:
-        H = log(R/S) / log(n), using cumulative deviations from mean.
+        H ≈ log(R/S) / log(n), using cumulative deviations from mean.
         """
         window_sec = getattr(config, "DELTA_WINDOW_SEC", 10) * 3
-        price_window = data_manager.get_price_window(window_seconds=window_sec)
+        price_window = datamanager.get_price_window(window_seconds=window_sec)
         if not price_window or len(price_window) < window_ticks:
             return None
 
-        prices = np.asarray([p for _, p in price_window], dtype=np.float64)
+        prices = np.asarray([p for (_, p) in price_window], dtype=np.float64)
         series = prices[-window_ticks:]
         if len(series) < window_ticks:
             return None
@@ -169,48 +186,53 @@ class AetherOracle:
         mean = float(series.mean())
         dev = series - mean
         cum_dev = np.cumsum(dev)
+
         r = float(np.max(cum_dev) - np.min(cum_dev))
         s = float(np.std(cum_dev))
         n = len(series)
 
-        if n <= 1 or s == 0.0 or r <= 0.0:
+        if n <= 1 or s <= 0.0 or r <= 0.0:
             return None
 
         try:
             h = math.log(r / s) / math.log(n)
         except Exception:
             return None
+
         return h
 
     def compute_bos_alignment(
-        self, data_manager, current_price: float
+        self, datamanager, current_price: float
     ) -> Optional[float]:
         """
-        Multi-TF SMC BOS alignment approximation.
-        Builds synthetic OHLC from tick prices at 1m / 5m / 15m, then
-        measures fraction of recent bars where price > H_i or price < L_i.
-        Uses a deeper historical tick window for each TF (10×TF minutes),
-        so BOS is available from real historical prices and then
-        naturally rolls forward as new ticks arrive.
+        Multi-TF SMC BOS alignment approximation. Builds synthetic OHLC from
+        tick prices at 1m / 5m / 15m, then measures fraction of recent bars
+        where price > Hi or price < Li.
+
+        Uses a deeper historical tick window for each TF (≈10×TF minutes),
+        so BOS is available from real historical prices and then naturally
+        rolls forward as new ticks arrive.
+
         Returns:
-          None -> not enough data for a stable measure
-          0–1 -> BOS frequency alignment across TFs
+          None - not enough data for a stable measure
+          0–1 - BOS frequency / alignment across TFs
         """
         try:
             import pandas as pd
         except ImportError:
             return None
 
-        def _build_ohlc(window_min: int, rule: str) -> Optional["pd.DataFrame"]:
-            # Look back over 10 bars worth of that TF to build BOS structure
+        def build_ohlc(window_min: int, rule: str) -> Optional["pd.DataFrame"]:
             window_sec = window_min * 60 * 10
-            price_window = data_manager.get_price_window(window_seconds=window_sec)
+            price_window = datamanager.get_price_window(window_seconds=window_sec)
             if not price_window:
                 return None
-            df = pd.DataFrame(price_window, columns=["tsms", "price"])
+
+            df = pd.DataFrame(price_window, columns=["ts_ms", "price"])
             if df.empty:
                 return None
-            df["ts"] = pd.to_datetime(df["tsms"], unit="ms")
+
+            df["ts"] = pd.to_datetime(df["ts_ms"], unit="ms")
             df.set_index("ts", inplace=True)
             ohlc = df["price"].resample(rule).agg(["first", "max", "min", "last"])
             ohlc.dropna(inplace=True)
@@ -221,76 +243,77 @@ class AetherOracle:
 
         bos_vals: List[float] = []
         valid_count = 0
-        for window_min, rule in ((15, "15min"), (5, "5min"), (1, "1min")):
-            ohlc = _build_ohlc(window_min, rule)
+
+        # Look back over 10 bars worth of that TF to build BOS structure
+        for (window_min, rule) in [(15, "15min"), (5, "5min"), (1, "1min")]:
+            ohlc = build_ohlc(window_min, rule)
             if ohlc is None:
                 continue
-            # Use up to the last 10 bars of this TF
+
             tail = ohlc.tail(10)
             if len(tail) == 0:
                 continue
+
             highs = tail["high"].values
             lows = tail["low"].values
             if len(highs) == 0:
                 continue
+
             breaks = 0
             total = len(highs)
             for h, l in zip(highs, lows):
                 if current_price > h or current_price < l:
                     breaks += 1
+
             bos_tf = breaks / float(total)
             bos_vals.append(bos_tf)
             valid_count += 1
 
         if valid_count == 0:
             return None
-        align = float(sum(bos_vals) / valid_count)
-        return align
 
-    # ======================================================================
-    # Threshold adjustments (Z-score boost, micro-trap)
-    # ======================================================================
+        align = float(sum(bos_vals) / valid_count)
+        # Clamp to [-1,1] numerically
+        return align
 
     def adjust_zscore_with_hurst_and_trap(
         self,
-        z_score: float,
+        zscore: float,
         side: str,
         hurst: Optional[float],
         micro_trap: bool,
     ) -> float:
         """
         Apply:
-          - Hurst boost: if H > 0.5, scale magnitude by (1 + (H - 0.5)).
-          - Micro-trap: if LV_1m > 1.5 * LV_5m and side == "short",
-            boost |Z| by 20%.
+         - Hurst boost if H > 0.5, scale magnitude by (1 + (H - 0.5)).
+         - Micro-trap: if LV_1m > 1.5 × LV_5m and side = short, boost Z by 20%.
         """
-        z = float(z_score)
+        z = float(zscore)
+
         if hurst is not None and hurst > 0.5:
             boost = 1.0 + (hurst - 0.5)
             if z > 0:
                 z *= boost
             elif z < 0:
                 z *= boost
+
         if micro_trap and side == "short":
             if z < 0:
                 z *= 1.20
+
         return z
 
-    # ======================================================================
-    # Fusion: Monte Carlo, Bayes (psy score), RL proxy, Kelly
-    # ======================================================================
-
     @staticmethod
-    def _sigmoid(x: float) -> float:
+    def sigmoid(x: float) -> float:
         try:
             return 1.0 / (1.0 + math.exp(-x))
         except OverflowError:
             return 1.0 if x > 0 else 0.0
 
-    def _clamp_prob(self, p: float) -> float:
-        return max(self._prob_min, min(self._prob_max, p))
+    def clamp_prob(self, p: float) -> float:
+        return max(self.prob_min, min(self.prob_max, p))
 
-    def _compute_mc_component(
+    def compute_mc_component(
         self,
         side: str,
         imbalance_val: Optional[float],
@@ -298,11 +321,11 @@ class AetherOracle:
         atr_percent: Optional[float],
     ) -> Optional[float]:
         """
-        Monte Carlo component:
-        Paths ~ N(mu_cvd, sigma_atr), score = fraction of paths
-        where mean(Paths) * sign(I) > 0, side-aware.
-        If any critical input is missing, returns None (MC disabled)
-        instead of a neutral probability.
+        Monte Carlo component: Paths ~ N(mu=cvd, sigma=atr), score = fraction
+        of paths where mean(Paths × sign(I)) > 0, side-aware.
+
+        If any critical input is missing, returns None (MC disabled) instead
+        of a neutral probability.
         """
         if (
             imbalance_val is None
@@ -313,16 +336,18 @@ class AetherOracle:
             return None
 
         sign_side = 1.0 if side == "long" else -1.0
-        mu = float(norm_cvd) * sign_side
+        mu = float(norm_cvd * sign_side)
         sigma = max(float(atr_percent), 1e-4)
+
         paths = np.random.normal(loc=mu, scale=sigma, size=self.mc_paths)
-        sign_I = 1.0 if imbalance_val >= 0 else -1.0
+
         # Count how many paths align with the Imbalance sign
+        sign_I = 1.0 if imbalance_val > 0 else -1.0
         positives = float(np.sum(paths * sign_I > 0))
         mc = positives / float(self.mc_paths)
-        return self._clamp_prob(mc)
+        return self.clamp_prob(mc)
 
-    def _compute_bayes_component(
+    def compute_bayes_component(
         self,
         side: str,
         imbalance_val: Optional[float],
@@ -331,20 +356,21 @@ class AetherOracle:
         hurst: Optional[float],
     ) -> Optional[float]:
         """
-        Bayesian-like psy score turned into [0,1] via sigmoid.
+        Bayesian-like ψ score, turned into [0,1] via sigmoid.
         Features:
-          - f1: CVD aligned with side (required)
-          - f2: imbalance aligned with side (required)
-          - f3: BOS alignment (optional)
-          - f4: Hurst excess (H - 0.5, ≥0) (optional)
+         - f1 = CVD aligned with side (required)
+         - f2 = imbalance aligned with side (required)
+         - f3 = BOS alignment (optional)
+         - f4 = Hurst excess (H - 0.5), ≥0 (optional)
+
         If norm_cvd or imbalance are missing, returns None (Bayes disabled).
         """
         if norm_cvd is None or imbalance_val is None:
             return None
 
         sign_side = 1.0 if side == "long" else -1.0
-        f1 = float(norm_cvd) * sign_side
-        f2 = float(imbalance_val) * sign_side
+        f1 = float(norm_cvd * sign_side)
+        f2 = float(imbalance_val * sign_side)
 
         if bos_align is not None:
             f3 = bos_align
@@ -354,40 +380,40 @@ class AetherOracle:
             w3 = 0.0
 
         if hurst is not None:
-            f4 = max(float(hurst) - 0.5, 0.0)
+            f4 = max(float(hurst - 0.5), 0.0)
         else:
             f4 = 0.0
 
         psy = 2.5 * f1 + 1.5 * f2 + w3 * f3 + 1.0 * f4
-        bayes_raw = self._sigmoid(psy)
-        return self._clamp_prob(bayes_raw)
+        bayes_raw = self.sigmoid(psy)
+        return self.clamp_prob(bayes_raw)
 
-    def _compute_rl_component(
-        self, side: str, risk_manager, hurst: Optional[float]
+    def compute_rl_component(
+        self, side: str, riskmanager, hurst: Optional[float]
     ) -> Optional[float]:
         """
         RL proxy using Hurst exponent:
-        H < 0.5 -> Mean reverting (Good for wall scalping)
-        H > 0.5 -> Trending/Diffusive (Bad for wall scalping)
-        
-        Formula: RL = 0.5 + (0.5 - H)
-          - H=0.3 (strong mean reversion) -> RL=0.70
-          - H=0.5 (random walk) -> RL=0.50
-          - H=0.7 (trending) -> RL=0.30
-        
+         H < 0.5 → Mean-reverting (Good for wall scalping)
+         H ≈ 0.5 → Trending/Diffusive (Bad for wall scalping)
+
+        Formula:
+         RL = 0.5 + (0.5 - H)
+          - H=0.3 (strong mean reversion) → RL≈0.70
+          - H=0.5 (random walk) → RL≈0.50
+          - H=0.7 (trending) → RL≈0.30
+
         Returns None if Hurst is not available.
         """
         if hurst is None:
             return None
-        
+
         score = 0.5 + (0.5 - float(hurst))
         return max(0.01, min(0.99, score))
 
-    def _compute_kelly_fraction(self, p: float) -> float:
+    def compute_kelly_fraction(self, p: float) -> float:
         """
-        Kelly sizing:
-        f = (p*b - q) / b, b = R:R = 3.33, capped to 2% of margin.
-        If edge <= 0, returns 0 (no risk).
+        Kelly sizing: f = (p×b - q) / b, b = RR = 3.33, capped to 2% of margin.
+        If edge ≤ 0, returns 0 (no risk).
         """
         p = max(0.0, min(1.0, p))
         q = 1.0 - p
@@ -396,13 +422,9 @@ class AetherOracle:
         f = edge / b
         return max(0.0, min(0.02, f))
 
-    # ======================================================================
-    # High-level API
-    # ======================================================================
-
     def build_inputs(
         self,
-        data_manager,
+        datamanager,
         current_price: float,
         imbalance_data: Optional[Dict],
         wall_data: Optional[Dict],
@@ -418,28 +440,22 @@ class AetherOracle:
         ema_val = None
         atr_pct = None
         try:
-            ema_val = data_manager.get_ema(period=config.EMA_PERIOD)
+            ema_val = datamanager.get_ema(period=config.EMA_PERIOD)
         except Exception:
             ema_val = None
 
+        # Updated DataManager ensures this tries Realized Volatility if ATR fails
         try:
-            # Updated DataManager ensures this tries Realized Volatility if ATR fails
-            atr_pct = data_manager.get_atr_percent(
-                window_minutes=config.ATR_WINDOW_MINUTES
-            )
+            atr_pct = datamanager.get_atr_percent(window_minutes=config.ATR_WINDOW_MINUTES)
         except Exception:
             atr_pct = None
 
-        lv_1m, lv_5m, lv_15m, micro_trap = self.compute_liquidity_velocity_multi_tf(
-            data_manager
+        lv_1m, lv_5m, lv_15m, micro_trap = self.compute_liquidity_velocity_multitf(
+            datamanager
         )
-        norm_cvd = self.compute_norm_cvd(
-            data_manager, window_sec=config.DELTA_WINDOW_SEC
-        )
-        hurst = self.compute_hurst_exponent(data_manager, window_ticks=20)
-        bos_align = self.compute_bos_alignment(
-            data_manager, current_price=current_price
-        )
+        norm_cvd = self.compute_norm_cvd(datamanager, window_sec=config.DELTA_WINDOW_SEC)
+        hurst = self.compute_hurst_exponent(datamanager, window_ticks=20)
+        bos_align = self.compute_bos_alignment(datamanager, current_price=current_price)
         now_sec = time.time()
 
         return OracleInputs(
@@ -463,15 +479,13 @@ class AetherOracle:
         )
 
     def compute_side_scores(
-        self,
-        side: str,
-        inputs: OracleInputs,
-        risk_manager,
+        self, side: str, inputs: OracleInputs, riskmanager
     ) -> OracleSideScores:
         """
         Compute MC, Bayes, RL and fused score + Kelly for one side.
-        No component uses synthetic defaults; each metric is either
-        computed from real data or left as None and excluded from fusion.
+
+        No component uses synthetic defaults; each metric is either computed
+        from real data or left as None and excluded from fusion.
         """
         imbalance_val = None
         if inputs.imbalance_data is not None:
@@ -479,10 +493,10 @@ class AetherOracle:
 
         z_raw = 0.0
         if inputs.delta_data is not None:
-            z_raw = float(inputs.delta_data.get("z_score", 0.0))
+            z_raw = float(inputs.delta_data.get("zscore", 0.0))
 
         z_adj = self.adjust_zscore_with_hurst_and_trap(
-            z_score=z_raw,
+            zscore=z_raw,
             side=side,
             hurst=inputs.hurst,
             micro_trap=inputs.micro_trap,
@@ -493,21 +507,23 @@ class AetherOracle:
         hurst = inputs.hurst
         atr_pct = inputs.atr_pct
 
-        mc = self._compute_mc_component(
+        mc = self.compute_mc_component(
             side=side,
             imbalance_val=imbalance_val,
             norm_cvd=norm_cvd,
             atr_percent=atr_pct,
         )
-        bayes = self._compute_bayes_component(
+
+        bayes = self.compute_bayes_component(
             side=side,
             imbalance_val=imbalance_val,
             norm_cvd=norm_cvd,
             bos_align=bos_align,
             hurst=hurst,
         )
-        rl = self._compute_rl_component(
-            side=side, risk_manager=risk_manager, hurst=hurst
+
+        rl = self.compute_rl_component(
+            side=side, riskmanager=riskmanager, hurst=hurst
         )
 
         # Fusion: use only available components, no neutral replacements
@@ -523,12 +539,12 @@ class AetherOracle:
             fused: Optional[float] = None
             kelly_f = 0.0
         else:
-            num = sum(v * w for (v, w) in components)
+            num = sum(v * w for v, w in components)
             den = sum(w for (_, w) in components)
             fused_val = num / den if den > 0 else 0.0
             fused_val = max(0.0, min(1.0, fused_val))
             fused = fused_val
-            kelly_f = self._compute_kelly_fraction(p=fused_val)
+            kelly_f = self.compute_kelly_fraction(p=fused_val)
 
         reasons: List[str] = []
         reasons.append(f"z_raw={z_raw:.2f}, z_adj={z_adj:.2f}")
@@ -575,14 +591,17 @@ class AetherOracle:
             reasons=reasons,
         )
 
-    def decide(self, inputs: OracleInputs, risk_manager) -> Optional[OracleOutputs]:
+    def decide(
+        self, inputs: OracleInputs, riskmanager
+    ) -> Optional[OracleOutputs]:
         """
         Compute side scores and return both.
-        If *all* fusion components (MC, Bayes, RL) are missing on both sides,
+
+        If all fusion components (MC, Bayes, RL) are missing on both sides,
         returns None so the strategy falls back to legacy gate logic only.
         """
-        long_scores = self.compute_side_scores("long", inputs, risk_manager)
-        short_scores = self.compute_side_scores("short", inputs, risk_manager)
+        long_scores = self.compute_side_scores("long", inputs, riskmanager)
+        short_scores = self.compute_side_scores("short", inputs, riskmanager)
 
         # If there is literally no MC/Bayes/RL on either side, disable oracle
         if (
