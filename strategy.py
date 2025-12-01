@@ -1249,11 +1249,11 @@ class ZScoreIcebergHunterStrategy:
         """
         Bracket entry:
         - Place main LIMIT order slightly beyond current price
-          (below for longs, above for shorts).
+        (below for longs, above for shorts).
         - Compute full TP and SL from margin-based price move.
         - Place HALF TP initially; extend to FULL if still in trade after 5min.
         - If kelly_margin is provided, override legacy BALANCE_USAGE_PERCENTAGE
-          sizing and use Kelly-based margin for this trade.
+        sizing and use Kelly-based margin for this trade.
         - Uses session-aware dynamic slippage and TP/SL ROI.
         """
         if self.current_position is not None:
@@ -1275,6 +1275,11 @@ class ZScoreIcebergHunterStrategy:
         position_margin = available * (config.BALANCE_USAGE_PERCENTAGE / 100.0)
         position_margin = max(position_margin, config.MIN_MARGIN_PER_TRADE)
         position_margin = min(position_margin, config.MAX_MARGIN_PER_TRADE)
+
+        if kelly_margin is not None:
+            position_margin = kelly_margin
+            position_margin = max(config.MIN_MARGIN_PER_TRADE, position_margin)
+            position_margin = min(config.MAX_MARGIN_PER_TRADE, position_margin)
 
         # --- Get session-aware dynamic parameters (NEW) ---
         dyn = self._get_dynamic_params(data_manager, current_price, now_sec)
@@ -1311,30 +1316,23 @@ class ZScoreIcebergHunterStrategy:
 
         # ------------------------------------------------------------------
         # TP/SL from margin-based price movement - EXACT ROE% calculation
-        # Uses rounded quantity to ensure exact 3% / 6% ROE on margin
+        # Uses EXACT prices (NO ROUNDING) to hit precise 5%/10%/3% ROE targets
         # ------------------------------------------------------------------
-
         # Target profit/loss in USDT based on margin ROE%
-        half_profit_usdt = position_margin * (profit_roi / 2.0)  # 3% for half TP
-        full_profit_usdt = position_margin * profit_roi          # 6% for full TP
-        loss_usdt = position_margin * abs(stop_roi)              # 3% for SL
+        half_profit_usdt = position_margin * (profit_roi / 2.0)  # 5% for half TP
+        full_profit_usdt = position_margin * profit_roi  # 10% for full TP
+        loss_usdt = position_margin * abs(stop_roi)  # 3% for SL
 
         if quantity <= 0:
             logger.error("Invalid quantity for TP/SL computation")
             return
 
-        # Calculate price moves needed to hit exact ROE% targets
+        # Calculate EXACT price moves needed to hit ROE% targets (NO ROUNDING)
         half_tp_move = half_profit_usdt / quantity
         full_tp_move = full_profit_usdt / quantity
         sl_move = loss_usdt / quantity
 
-        # Round price moves to tick size (1.0 for BTCUSDT)
-        tick = config.TICK_SIZE
-        half_tp_move = round(half_tp_move / tick) * tick
-        full_tp_move = round(full_tp_move / tick) * tick
-        sl_move = round(sl_move / tick) * tick
-
-        # Calculate TP/SL prices from rounded moves
+        # Calculate TP/SL prices from EXACT moves (NO ROUNDING)
         if side == "long":
             half_tp_price = limit_price + half_tp_move
             full_tp_price = limit_price + full_tp_move
@@ -1344,11 +1342,11 @@ class ZScoreIcebergHunterStrategy:
             full_tp_price = limit_price - full_tp_move
             sl_price = limit_price + sl_move
 
-        # Verify actual ROE% after rounding
+        # Verify actual ROE% (should be EXACT now)
         actual_half_profit = abs(half_tp_price - limit_price) * quantity
         actual_full_profit = abs(full_tp_price - limit_price) * quantity
         actual_loss = abs(sl_price - limit_price) * quantity
-        
+
         half_roe = (actual_half_profit / position_margin) * 100.0
         full_roe = (actual_full_profit / position_margin) * 100.0
         sl_roe = (actual_loss / position_margin) * 100.0
@@ -1357,7 +1355,6 @@ class ZScoreIcebergHunterStrategy:
             f"TP/SL ROE verification: Half TP={half_roe:.2f}%, "
             f"Full TP={full_roe:.2f}%, SL={sl_roe:.2f}%"
         )
-
 
         logger.info("-" * 80)
         logger.info(f"Z-SCORE ICEBERG ENTRY BRACKET {trade_id}")
@@ -1381,7 +1378,6 @@ class ZScoreIcebergHunterStrategy:
                 touch_data["ask_distance_ticks"],
             )
         )
-
         if oracle_fused is not None:
             logger.info(f"Aether Fused : {oracle_fused:.3f}")
 
@@ -1422,7 +1418,6 @@ class ZScoreIcebergHunterStrategy:
             price=limit_price,
             reduce_only=False,
         )
-
         if not main_order or "order_id" not in main_order:
             logger.error("Main LIMIT order placement failed")
             return
@@ -1441,7 +1436,6 @@ class ZScoreIcebergHunterStrategy:
             quantity=quantity,
             trigger_price=half_tp_price,
         )
-
         if not tp_order or "order_id" not in tp_order:
             logger.error("TP order placement failed; cancelling main order")
             try:
@@ -1467,7 +1461,6 @@ class ZScoreIcebergHunterStrategy:
             quantity=quantity,
             trigger_price=sl_price,
         )
-
         if not sl_order or "order_id" not in sl_order:
             logger.error("SL order placement failed; cancelling main + TP")
             try:
@@ -1515,6 +1508,7 @@ class ZScoreIcebergHunterStrategy:
         htf_trend_at_entry_safe = (
             htf_trend_at_entry if htf_trend_at_entry is not None else "UNKNOWN"
         )
+
         self.current_position = ZScorePosition(
             trade_id=trade_id,
             side=side,
@@ -1565,6 +1559,7 @@ class ZScoreIcebergHunterStrategy:
                 msg_lines.append(f"Aether fused: {oracle_fused:.3f}")
             if htf_trend_at_entry is not None:
                 msg_lines.append(f"HTF trend: {htf_trend_at_entry}")
+
             send_telegram_message("\n".join(msg_lines))
         except Exception as e:
             logger.error(
@@ -1581,7 +1576,7 @@ class ZScoreIcebergHunterStrategy:
         status = order_status.get("status", "").upper()
         return status in ("FILLED", "EXECUTED")
 
-    def manage_open_position(
+    def _manage_open_position(
         self, data_manager, order_manager, risk_manager, current_price: float, now_sec: float
     ) -> None:
         """
@@ -1633,8 +1628,8 @@ class ZScoreIcebergHunterStrategy:
         # ======================================================================
         # PERIODIC POSITION LOGGING (every 2 minutes)
         # ======================================================================
-        if now_sec - self.last_position_log_sec >= self.POSITION_LOG_INTERVAL_SEC:
-            self.last_position_log_sec = now_sec
+        if now_sec - self._last_position_log_sec >= self.POSITION_LOG_INTERVAL_SEC:
+            self._last_position_log_sec = now_sec
             direction = 1.0 if pos.side == "long" else -1.0
             upnl = (current_price - pos.entry_price) * direction * pos.quantity
             elapsed_min_log = (now_sec - pos.entry_time_sec) / 60.0
@@ -1700,9 +1695,9 @@ class ZScoreIcebergHunterStrategy:
         # ======================================================================
         # THROTTLED ORDER STATUS CHECKS (main/TP/SL fills)
         # ======================================================================
-        if now_sec - self.last_status_check_sec < self.ORDER_STATUS_CHECK_INTERVAL_SEC:
+        if now_sec - self._last_status_check_sec < self.ORDER_STATUS_CHECK_INTERVAL_SEC:
             return
-        self.last_status_check_sec = now_sec
+        self._last_status_check_sec = now_sec
 
         main_status: Optional[Dict] = None
         tp_status: Optional[Dict] = None
@@ -1724,7 +1719,7 @@ class ZScoreIcebergHunterStrategy:
         # MAIN FILL DETECTION
         # ======================================================================
         if not pos.main_filled and main_status is not None:
-            if self.is_filled(main_status):
+            if self._is_filled(main_status):
                 pos.main_filled = True
                 logger.info(f"✓ Main LIMIT filled for {pos.trade_id}")
 
@@ -1733,10 +1728,10 @@ class ZScoreIcebergHunterStrategy:
         # ======================================================================
         exit_reason: Optional[str] = None
         exit_order: Optional[Dict] = None
-        if self.is_filled(tp_status):
+        if self._is_filled(tp_status):
             exit_reason = "TP_HIT"
             exit_order = tp_status
-        elif self.is_filled(sl_status):
+        elif self._is_filled(sl_status):
             exit_reason = "SL_HIT"
             exit_order = sl_status
 
@@ -1749,7 +1744,7 @@ class ZScoreIcebergHunterStrategy:
                 )
                 return
 
-            self.finalize_exit(
+            self._finalize_exit(
                 order_manager=order_manager,
                 risk_manager=risk_manager,
                 exit_price_live=exit_price,
