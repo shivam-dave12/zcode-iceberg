@@ -1,22 +1,5 @@
 # Use specific Python version matching your VSCode
-FROM python:3.10.12-slim
-
-
-# Prevent Python from writing pyc files and buffering stdout/stderr
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-
-# Set timezone to IST (matching your local development)
-ENV TZ=Asia/Kolkata
-RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
-
-# Install system dependencies (needed for some Python packages)
-RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
-    && rm -rf /var/lib/apt/lists/*
-
-# Set working directory
+FROM 126919341356.dkr.ecr.ap-south-1.amazonaws.com/aham 
 WORKDIR /app
 
 # Copy requirements first (Docker layer caching optimization)
