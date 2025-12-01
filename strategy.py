@@ -125,7 +125,7 @@ class ZScoreIcebergHunterStrategy:
             return ("NEWYORK", True, is_weekend)
         return ("OFFSESSION", False, is_weekend)
 
-    def get_dynamic_params(self, datamanager, current_price, now_sec):
+    def get_dynamic_params(self, data_manager, current_price, now_sec):
         """
         Decide slippage_ticks, profit_roi, stop_roi based on:
          - Session (Asia/London/New York/off-session)
@@ -155,7 +155,7 @@ class ZScoreIcebergHunterStrategy:
 
         # Defaults = original config values
         try:
-            atr_pct = datamanager.get_atr_percent()
+            atr_pct = data_manager.get_atr_percent()
         except Exception:
             atr_pct = None  # ATR as fraction of price (e.g. 0.008 = 0.8%)
 
@@ -201,28 +201,28 @@ class ZScoreIcebergHunterStrategy:
             "reason": ",".join(reason_parts),
         }
 
-    def on_tick(self, datamanager, ordermanager, riskmanager) -> None:
+    def on_tick(self, data_manager, order_manager, risk_manager) -> None:
         """
         Main per-tick strategy entrypoint called from the main loop.
          - Manages existing position (TP/SL, timeout, TP adjustment).
          - If flat, evaluates entry gates and possibly opens a new bracket.
         """
         try:
-            current_price = datamanager.get_last_price()
+            current_price = data_manager.get_last_price()
             if current_price <= 0:
                 return
 
             now_sec = time.time()
 
             # 15-minute performance Telegram report (non-blocking, stats-only)
-            self.maybe_send_15m_report(now_sec, riskmanager, current_price)
+            self.maybe_send_15m_report(now_sec, risk_manager, current_price)
 
             # Manage open position first
             if self.current_position is not None:
                 self.manage_open_position(
-                    datamanager=datamanager,
-                    ordermanager=ordermanager,
-                    riskmanager=riskmanager,
+                    data_manager=data_manager,
+                    order_manager=order_manager,
+                    risk_manager=risk_manager,
                     current_price=current_price,
                     now_sec=now_sec,
                 )
@@ -235,34 +235,34 @@ class ZScoreIcebergHunterStrategy:
                     return
 
             # Risk / trading permission check
-            allowed, reason = riskmanager.check_trading_allowed()
+            allowed, reason = risk_manager.check_trading_allowed()
             if not allowed:
                 logger.debug(f"Trading not allowed: {reason}")
                 return
 
             # Core metrics
-            imbalance_data = self.compute_imbalance(datamanager)
+            imbalance_data = self.compute_imbalance(data_manager)
             wall_data = (
-                self.compute_wall_strength(datamanager, current_price, imbalance_data)
+                self.compute_wall_strength(data_manager, current_price, imbalance_data)
                 if imbalance_data is not None
                 else None
             )
-            delta_data = self.compute_delta_zscore(datamanager)
-            touch_data = self.compute_price_touch(datamanager, current_price)
+            delta_data = self.compute_delta_zscore(data_manager)
+            touch_data = self.compute_price_touch(data_manager, current_price)
 
             # Higher timeframe trend (5min EMA-based robust trend)
             htf_trend: Optional[str] = None
             try:
-                if hasattr(datamanager, "get_htf_trend"):
-                    htf_trend = datamanager.get_htf_trend()
+                if hasattr(data_manager, "get_htf_trend"):
+                    htf_trend = data_manager.get_htf_trend()
             except Exception as e:
                 logger.error(f"Error fetching HTF trend in on_tick: {e}", exc_info=True)
 
             # 1-minute trend (same robust 3-state logic as HTF)
             ltf_trend: Optional[str] = None
             try:
-                if hasattr(datamanager, "get_ltf_trend"):
-                    ltf_trend = datamanager.get_ltf_trend()
+                if hasattr(data_manager, "get_ltf_trend"):
+                    ltf_trend = data_manager.get_ltf_trend()
             except Exception as e:
                 logger.error(
                     f"Error fetching LTF (1m) trend in on_tick: {e}", exc_info=True
@@ -272,7 +272,7 @@ class ZScoreIcebergHunterStrategy:
             oracle_inputs: Optional[OracleInputs] = None
             try:
                 oracle_inputs = self.oracle.build_inputs(
-                    datamanager=datamanager,
+                    data_manager=data_manager,
                     current_price=current_price,
                     imbalance_data=imbalance_data,
                     wall_data=wall_data,
@@ -307,9 +307,9 @@ class ZScoreIcebergHunterStrategy:
 
             # Decision & entries
             self.try_entries_and_log(
-                datamanager=datamanager,
-                ordermanager=ordermanager,
-                riskmanager=riskmanager,
+                data_manager=data_manager,
+                order_manager=order_manager,
+                risk_manager=risk_manager,
                 current_price=current_price,
                 imbalance_data=imbalance_data,
                 wall_data=wall_data,
@@ -325,7 +325,7 @@ class ZScoreIcebergHunterStrategy:
             logger.error(f"Error in ZScore on_tick: {e}", exc_info=True)
 
     def maybe_send_15m_report(
-        self, now_sec: float, riskmanager, current_price: float
+        self, now_sec: float, risk_manager, current_price: float
     ) -> None:
         """
         Send a rich 15-minute performance report to Telegram:
@@ -338,7 +338,7 @@ class ZScoreIcebergHunterStrategy:
         # Initialize timer on first tick
         if self.last_report_sec == 0.0:
             self.last_report_sec = now_sec
-            self.last_report_total_trades = int(getattr(riskmanager, "total_trades", 0))
+            self.last_report_total_trades = int(getattr(risk_manager, "total_trades", 0))
             return
 
         if now_sec - self.last_report_sec < 900.0:
@@ -346,12 +346,12 @@ class ZScoreIcebergHunterStrategy:
 
         self.last_report_sec = now_sec
 
-        total_trades = int(getattr(riskmanager, "total_trades", 0))
-        winning_trades = int(getattr(riskmanager, "winning_trades", 0))
+        total_trades = int(getattr(risk_manager, "total_trades", 0))
+        winning_trades = int(getattr(risk_manager, "winning_trades", 0))
         losing_trades = int(
-            getattr(riskmanager, "losing_trades", max(0, total_trades - winning_trades))
+            getattr(risk_manager, "losing_trades", max(0, total_trades - winning_trades))
         )
-        realized_pnl = float(getattr(riskmanager, "realized_pnl", 0.0))
+        realized_pnl = float(getattr(risk_manager, "realized_pnl", 0.0))
 
         trades_since = max(0, total_trades - self.last_report_total_trades)
         self.last_report_total_trades = total_trades
@@ -397,7 +397,7 @@ class ZScoreIcebergHunterStrategy:
         self,
         now_sec: float,
         current_price: float,
-        datamanager,
+        data_manager,
         imbalance_data: Optional[Dict],
         wall_data: Optional[Dict],
         delta_data: Optional[Dict],
@@ -424,7 +424,7 @@ class ZScoreIcebergHunterStrategy:
         )
 
         # DataManager stats
-        stats = datamanager.stats
+        stats = data_manager.stats
         logger.info(
             "  DataManager Stats: ob_updates={}, trades={}, candles={}, prices={}".format(
                 stats.get("orderbook_updates", 0),
@@ -434,10 +434,10 @@ class ZScoreIcebergHunterStrategy:
             )
         )
 
-        bids, asks = datamanager.get_orderbook_snapshot()
+        bids, asks = data_manager.get_orderbook_snapshot()
         logger.info(f"  Raw Orderbook: bid_levels={len(bids)}, ask_levels={len(asks)}")
 
-        trades_20s = datamanager.get_recent_trades(window_seconds=20)
+        trades_20s = data_manager.get_recent_trades(window_seconds=20)
         logger.info(f"  Raw Trades (20s window): count={len(trades_20s)}")
 
         # Imbalance
@@ -532,7 +532,7 @@ class ZScoreIcebergHunterStrategy:
         # EMA snapshot
         ema_val: Optional[float] = None
         try:
-            ema_val = datamanager.get_ema(period=config.EMA_PERIOD)
+            ema_val = data_manager.get_ema(period=config.EMA_PERIOD)
         except Exception as e:
             logger.error(f"Error fetching EMA for decision log: {e}", exc_info=True)
 
@@ -563,7 +563,7 @@ class ZScoreIcebergHunterStrategy:
 
         # Session/volatility snapshot (NEW)
         try:
-            dyn = self.get_dynamic_params(datamanager, current_price, now_sec)
+            dyn = self.get_dynamic_params(data_manager, current_price, now_sec)
             logger.info(
                 "  Session/Vol: session={} major={} weekend={} atr_pct={} slip_ticks={} profit_roi={:.4f} stop_roi={:.4f} reason={}".format(
                     dyn["session"],
@@ -662,8 +662,8 @@ class ZScoreIcebergHunterStrategy:
 
         logger.info("-" * 80)
 
-    def compute_imbalance(self, datamanager) -> Optional[Dict]:
-        bids, asks = datamanager.get_orderbook_snapshot()
+    def compute_imbalance(self, data_manager) -> Optional[Dict]:
+        bids, asks = data_manager.get_orderbook_snapshot()
         if not bids or not asks:
             return None
         depth = min(config.WALL_DEPTH_LEVELS, len(bids), len(asks))
@@ -685,12 +685,12 @@ class ZScoreIcebergHunterStrategy:
         }
 
     def compute_wall_strength(
-        self, datamanager, current_price: float, imbalance_data: Optional[Dict]
+        self, data_manager, current_price: float, imbalance_data: Optional[Dict]
     ) -> Optional[Dict]:
         if imbalance_data is None:
             return None
 
-        bids, asks = datamanager.get_orderbook_snapshot()
+        bids, asks = data_manager.get_orderbook_snapshot()
         if not bids or not asks:
             return None
 
@@ -720,14 +720,14 @@ class ZScoreIcebergHunterStrategy:
             "short_wall_ok": ask_wall_strength >= config.MIN_WALL_VOLUME_MULT,
         }
 
-    def compute_delta_zscore(self, datamanager) -> Optional[Dict]:
+    def compute_delta_zscore(self, data_manager) -> Optional[Dict]:
         """
         Delta Z-score over the last DELTA_WINDOW_SEC using ONLY real trades.
          - Uses all available historical deltas in delta_population.
          - Z-pop guard: for pop_len < 50, sigma = max(0.3, std(pop)).
          - Returns None only if there are literally no trades in the window.
         """
-        trades = datamanager.get_recent_trades(window_seconds=config.DELTA_WINDOW_SEC)
+        trades = data_manager.get_recent_trades(window_seconds=config.DELTA_WINDOW_SEC)
         if not trades:
             return None
 
@@ -768,7 +768,7 @@ class ZScoreIcebergHunterStrategy:
         }
 
     def compute_price_touch(
-        self, datamanager, current_price: float
+        self, data_manager, current_price: float
     ) -> Optional[Dict]:
         """
         Compute touch distances in ticks between current price and nearest bid/ask.
@@ -777,7 +777,7 @@ class ZScoreIcebergHunterStrategy:
          - bid mistakenly above current price (stale / crossed book)
         are treated as "far" and will block the touch gate when dist > threshold.
         """
-        bids, asks = datamanager.get_orderbook_snapshot()
+        bids, asks = data_manager.get_orderbook_snapshot()
         if not bids or not asks:
             return None
 
@@ -798,9 +798,9 @@ class ZScoreIcebergHunterStrategy:
 
     def try_entries_and_log(
         self,
-        datamanager,
-        ordermanager,
-        riskmanager,
+        data_manager,
+        order_manager,
+        risk_manager,
         current_price: float,
         imbalance_data: Optional[Dict],
         wall_data: Optional[Dict],
@@ -830,7 +830,7 @@ class ZScoreIcebergHunterStrategy:
             self.log_decision_state(
                 now_sec=now_sec,
                 current_price=current_price,
-                datamanager=datamanager,
+                data_manager=data_manager,
                 imbalance_data=imbalance_data,
                 wall_data=wall_data,
                 delta_data=delta_data,
@@ -863,7 +863,7 @@ class ZScoreIcebergHunterStrategy:
         # 1m EMA trend filter (legacy)
         ema_val: Optional[float] = None
         try:
-            ema_val = datamanager.get_ema(period=config.EMA_PERIOD)
+            ema_val = data_manager.get_ema(period=config.EMA_PERIOD)
         except Exception as e:
             logger.error(f"Error fetching EMA for entry gates: {e}", exc_info=True)
 
@@ -1016,7 +1016,7 @@ class ZScoreIcebergHunterStrategy:
         oracle_outputs: Optional[OracleOutputs] = None
         if oracle_inputs is not None:
             try:
-                oracle_outputs = self.oracle.decide(oracle_inputs, riskmanager)
+                oracle_outputs = self.oracle.decide(oracle_inputs, risk_manager)
             except Exception as e:
                 logger.error(f"Error in Aether Oracle decide: {e}", exc_info=True)
                 oracle_outputs = None
@@ -1052,7 +1052,7 @@ class ZScoreIcebergHunterStrategy:
         self.log_decision_state(
             now_sec=now_sec,
             current_price=current_price,
-            datamanager=datamanager,
+            data_manager=data_manager,
             imbalance_data=imbalance_data,
             wall_data=wall_data,
             delta_data=delta_data,
@@ -1072,9 +1072,9 @@ class ZScoreIcebergHunterStrategy:
             # Fallback to legacy behavior if Oracle not available at all
             if long_ready:
                 self.enter_position(
-                    datamanager,
-                    ordermanager,
-                    riskmanager,
+                    data_manager,
+                    order_manager,
+                    risk_manager,
                     side="long",
                     current_price=current_price,
                     imbalance_data=imbalance_data,
@@ -1088,9 +1088,9 @@ class ZScoreIcebergHunterStrategy:
                 return
             if short_ready:
                 self.enter_position(
-                    datamanager,
-                    ordermanager,
-                    riskmanager,
+                    data_manager,
+                    order_manager,
+                    risk_manager,
                     side="short",
                     current_price=current_price,
                     imbalance_data=imbalance_data,
@@ -1107,9 +1107,9 @@ class ZScoreIcebergHunterStrategy:
         # With Oracle active: use Kelly sizing and fused score
         if long_ready:
             self.enter_position(
-                datamanager,
-                ordermanager,
-                riskmanager,
+                data_manager,
+                order_manager,
+                risk_manager,
                 side="long",
                 current_price=current_price,
                 imbalance_data=imbalance_data,
@@ -1118,7 +1118,7 @@ class ZScoreIcebergHunterStrategy:
                 touch_data=touch_data,
                 now_sec=now_sec,
                 kelly_margin=self.compute_kelly_margin(
-                    riskmanager, oracle_outputs.long_scores
+                    risk_manager, oracle_outputs.long_scores
                 ),
                 oracle_fused=oracle_outputs.long_scores.fused,
             )
@@ -1126,9 +1126,9 @@ class ZScoreIcebergHunterStrategy:
 
         if short_ready:
             self.enter_position(
-                datamanager,
-                ordermanager,
-                riskmanager,
+                data_manager,
+                order_manager,
+                risk_manager,
                 side="short",
                 current_price=current_price,
                 imbalance_data=imbalance_data,
@@ -1137,14 +1137,14 @@ class ZScoreIcebergHunterStrategy:
                 touch_data=touch_data,
                 now_sec=now_sec,
                 kelly_margin=self.compute_kelly_margin(
-                    riskmanager, oracle_outputs.short_scores
+                    risk_manager, oracle_outputs.short_scores
                 ),
                 oracle_fused=oracle_outputs.short_scores.fused,
             )
             return
 
     def compute_kelly_margin(
-        self, riskmanager, scores: OracleSideScores
+        self, risk_manager, scores: OracleSideScores
     ) -> Optional[float]:
         """
         Compute Kelly-based margin target, capped at 2% of available balance
@@ -1152,7 +1152,7 @@ class ZScoreIcebergHunterStrategy:
 
         Returns None if balance missing.
         """
-        balance_info = riskmanager.get_available_balance()
+        balance_info = risk_manager.get_available_balance()
         if not balance_info:
             logger.error("Cannot fetch balance for Kelly sizing")
             return None
@@ -1171,9 +1171,9 @@ class ZScoreIcebergHunterStrategy:
 
     def enter_position(
         self,
-        datamanager,
-        ordermanager,
-        riskmanager,
+        data_manager,
+        order_manager,
+        risk_manager,
         side: str,
         current_price: float,
         imbalance_data: Dict,
@@ -1196,7 +1196,7 @@ class ZScoreIcebergHunterStrategy:
         if self.current_position is not None:
             return
 
-        balance_info = riskmanager.get_available_balance()
+        balance_info = risk_manager.get_available_balance()
         if not balance_info:
             logger.error("Cannot fetch balance for entry")
             return
@@ -1209,7 +1209,7 @@ class ZScoreIcebergHunterStrategy:
             return
 
         # Session-aware dynamic parameters
-        dyn = self.get_dynamic_params(datamanager, current_price, now_sec)
+        dyn = self.get_dynamic_params(data_manager, current_price, now_sec)
         slippage_ticks = dyn["slippage_ticks"]
         profit_roi = dyn["profit_roi"]
         stop_roi = dyn["stop_roi"]
@@ -1344,7 +1344,7 @@ class ZScoreIcebergHunterStrategy:
         logger.info(f"SL Price       : {sl_price:.2f}")
 
         # 1) Place main LIMIT order
-        main_order = ordermanager.place_limit_order(
+        main_order = order_manager.place_limit_order(
             side=side_str,
             quantity=quantity,
             price=limit_price,
@@ -1362,7 +1362,7 @@ class ZScoreIcebergHunterStrategy:
         else:
             tp_side = "BUY"
 
-        tp_order = ordermanager.place_take_profit(
+        tp_order = order_manager.place_take_profit(
             side=tp_side,
             quantity=quantity,
             trigger_price=half_tp_price,
@@ -1370,7 +1370,7 @@ class ZScoreIcebergHunterStrategy:
         if not tp_order or "order_id" not in tp_order:
             logger.error("TP order placement failed; cancelling main order")
             try:
-                ordermanager.cancel_order(main_order_id)
+                order_manager.cancel_order(main_order_id)
             except Exception as e:
                 logger.error(
                     f"Error cancelling main order {main_order_id}: {e}", exc_info=True
@@ -1385,7 +1385,7 @@ class ZScoreIcebergHunterStrategy:
         else:
             sl_side = "BUY"
 
-        sl_order = ordermanager.place_stop_loss(
+        sl_order = order_manager.place_stop_loss(
             side=sl_side,
             quantity=quantity,
             trigger_price=sl_price,
@@ -1393,8 +1393,8 @@ class ZScoreIcebergHunterStrategy:
         if not sl_order or "order_id" not in sl_order:
             logger.error("SL order placement failed; cancelling main & TP")
             try:
-                ordermanager.cancel_order(tp_order_id)
-                ordermanager.cancel_order(main_order_id)
+                order_manager.cancel_order(tp_order_id)
+                order_manager.cancel_order(main_order_id)
             except Exception as e:
                 logger.error(
                     f"Error cancelling main/TP after SL failure: {e}", exc_info=True
@@ -1457,7 +1457,7 @@ class ZScoreIcebergHunterStrategy:
             entry_htf_trend=htf_trend_at_entry_safe,
         )
 
-        riskmanager.record_trade_opened()
+        risk_manager.record_trade_opened()
         logger.info("=" * 80)
 
     def is_filled(self, order_status: Optional[Dict]) -> bool:
@@ -1471,9 +1471,9 @@ class ZScoreIcebergHunterStrategy:
 
     def manage_open_position(
         self,
-        datamanager,
-        ordermanager,
-        riskmanager,
+        data_manager,
+        order_manager,
+        risk_manager,
         current_price: float,
         now_sec: float,
     ) -> None:
@@ -1509,11 +1509,11 @@ class ZScoreIcebergHunterStrategy:
                 )
                 try:
                     if pos.tp_order_id:
-                        ordermanager.cancel_order(pos.tp_order_id)
+                        order_manager.cancel_order(pos.tp_order_id)
                     if pos.sl_order_id:
-                        ordermanager.cancel_order(pos.sl_order_id)
+                        order_manager.cancel_order(pos.sl_order_id)
                     if pos.main_order_id:
-                        ordermanager.cancel_order(pos.main_order_id)
+                        order_manager.cancel_order(pos.main_order_id)
                 except Exception as e:
                     logger.error(
                         f"Error cancelling bracket for {pos.trade_id}: {e}",
@@ -1527,9 +1527,9 @@ class ZScoreIcebergHunterStrategy:
         if now_sec - self.last_status_check_sec >= self.ORDER_STATUS_CHECK_INTERVAL_SEC:
             self.last_status_check_sec = now_sec
 
-            main_status = ordermanager.get_order_status(pos.main_order_id)
-            tp_status = ordermanager.get_order_status(pos.tp_order_id)
-            sl_status = ordermanager.get_order_status(pos.sl_order_id)
+            main_status = order_manager.get_order_status(pos.main_order_id)
+            tp_status = order_manager.get_order_status(pos.tp_order_id)
+            sl_status = order_manager.get_order_status(pos.sl_order_id)
 
             # Check if main LIMIT was filled
             if not pos.main_filled and self.is_filled(main_status):
@@ -1549,7 +1549,7 @@ class ZScoreIcebergHunterStrategy:
 
             if exit_order is not None:
                 try:
-                    exit_price = ordermanager.extract_fill_price(exit_order)
+                    exit_price = order_manager.extract_fill_price(exit_order)
                 except Exception as e:
                     logger.error(
                         f"Failed to extract exit price for {pos.trade_id}: {e}",
@@ -1558,8 +1558,8 @@ class ZScoreIcebergHunterStrategy:
                     return
 
                 self.finalize_exit(
-                    ordermanager=ordermanager,
-                    riskmanager=riskmanager,
+                    order_manager=order_manager,
+                    risk_manager=risk_manager,
                     exit_price_live=exit_price,
                     exit_order=exit_order,
                     entry_order=main_status,
@@ -1587,14 +1587,14 @@ class ZScoreIcebergHunterStrategy:
 
                 try:
                     if pos.tp_order_id:
-                        ordermanager.cancel_order(pos.tp_order_id)
+                        order_manager.cancel_order(pos.tp_order_id)
                 except Exception as e:
                     logger.error(
                         f"Error cancelling HALF TP {pos.tp_order_id}: {e}", exc_info=True
                     )
 
                 try:
-                    new_tp_order = ordermanager.place_take_profit(
+                    new_tp_order = order_manager.place_take_profit(
                         side=tp_side,
                         quantity=pos.quantity,
                         trigger_price=pos.tp_price,
@@ -1628,7 +1628,7 @@ class ZScoreIcebergHunterStrategy:
             if elapsed_min_dyn >= config.DYNAMIC_TP_MINUTES:
                 atr_pct = None
                 try:
-                    atr_pct = datamanager.get_atr_percent()
+                    atr_pct = data_manager.get_atr_percent()
                 except Exception:
                     pass
 
@@ -1664,7 +1664,7 @@ class ZScoreIcebergHunterStrategy:
 
                     try:
                         if pos.tp_order_id:
-                            ordermanager.cancel_order(pos.tp_order_id)
+                            order_manager.cancel_order(pos.tp_order_id)
                     except Exception as e:
                         logger.error(
                             f"Error cancelling old TP {pos.tp_order_id} for {pos.trade_id}: {e}",
@@ -1672,7 +1672,7 @@ class ZScoreIcebergHunterStrategy:
                         )
 
                     try:
-                        new_tp_order_dyn = ordermanager.place_take_profit(
+                        new_tp_order_dyn = order_manager.place_take_profit(
                             side=tp_side_dyn,
                             quantity=pos.quantity,
                             trigger_price=new_tp_price,
@@ -1708,8 +1708,8 @@ class ZScoreIcebergHunterStrategy:
 
     def finalize_exit(
         self,
-        ordermanager,
-        riskmanager,
+        order_manager,
+        risk_manager,
         exit_price_live: float,
         exit_order: Optional[Dict],
         entry_order: Optional[Dict],
@@ -1748,20 +1748,20 @@ class ZScoreIcebergHunterStrategy:
         logger.info(f"P/L (USDT): {pnl_usdt_real:.2f}")
         logger.info("=" * 80)
 
-        riskmanager.update_trade_stats(pnl_usdt_real)
+        risk_manager.update_trade_stats(pnl_usdt_real)
 
         # Telegram trade-exit notification (rich)
         try:
-            total_trades = int(getattr(riskmanager, "total_trades", 0))
-            winning_trades = int(getattr(riskmanager, "winning_trades", 0))
+            total_trades = int(getattr(risk_manager, "total_trades", 0))
+            winning_trades = int(getattr(risk_manager, "winning_trades", 0))
             losing_trades = int(
                 getattr(
-                    riskmanager,
+                    risk_manager,
                     "losing_trades",
                     max(0, total_trades - winning_trades),
                 )
             )
-            realized_pnl = float(getattr(riskmanager, "realized_pnl", 0.0))
+            realized_pnl = float(getattr(risk_manager, "realized_pnl", 0.0))
 
             if total_trades > 0:
                 win_rate = (winning_trades / total_trades) * 100.0
