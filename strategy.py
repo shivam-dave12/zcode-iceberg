@@ -1581,19 +1581,14 @@ class ZScoreIcebergHunterStrategy:
         status = order_status.get("status", "").upper()
         return status in ("FILLED", "EXECUTED")
 
-    def _manage_open_position(
-        self,
-        data_manager,
-        order_manager,
-        risk_manager,
-        current_price: float,
-        now_sec: float,
+    def manage_open_position(
+        self, data_manager, order_manager, risk_manager, current_price: float, now_sec: float
     ) -> None:
         """
         Manage an open position by tracking main/TP/SL status.
         - If main LIMIT is not filled within ENTRY_FILL_TIMEOUT_SEC, cancel main, TP, SL.
         - Start with HALF TP at entry; after 5 minutes, if still in trade and TP not hit,
-          extend TP to FULL target stored in pos.tp_price.
+        extend TP to FULL target stored in pos.tp_price.
         - Dynamic TP tightening if trade stagnates in low volatility (session-aware).
         - No market close orders are sent; exits are via TP/SL.
         """
@@ -1601,25 +1596,114 @@ class ZScoreIcebergHunterStrategy:
         if pos is None:
             return
 
-        # Periodic position snapshot (REDUCED TO 30s)
-        if now_sec - self._last_position_log_sec >= self.POSITION_LOG_INTERVAL_SEC:
-            self._last_position_log_sec = now_sec
+        elapsed_min = (now_sec - pos.entry_time_sec) / 60.0
+        if elapsed_min >= config.MAX_HOLD_MINUTES:
+            if not hasattr(pos, "max_hold_logged"):
+                pos.max_hold_logged = True
+                logger.info(
+                    f"Max hold {config.MAX_HOLD_MINUTES}min reached for {pos.trade_id} - "
+                    f"leaving exit to TP/SL (no forced market close)."
+                )
+
+        # ======================================================================
+        # TIMEOUT: Cancel bracket if main LIMIT not filled in 60s
+        # ======================================================================
+        if not pos.main_filled:
+            elapsed = now_sec - pos.entry_time_sec
+            if elapsed >= self.ENTRY_FILL_TIMEOUT_SEC:
+                logger.info(
+                    f"Main LIMIT not filled in {self.ENTRY_FILL_TIMEOUT_SEC:.0f}s "
+                    f"for trade {pos.trade_id} - cancelling main, TP, and SL."
+                )
+                try:
+                    if pos.tp_order_id:
+                        order_manager.cancel_order(pos.tp_order_id)
+                    if pos.sl_order_id:
+                        order_manager.cancel_order(pos.sl_order_id)
+                    if pos.main_order_id:
+                        order_manager.cancel_order(pos.main_order_id)
+                except Exception as e:
+                    logger.error(
+                        f"Error cancelling bracket for {pos.trade_id}: {e}", exc_info=True
+                    )
+                self.current_position = None
+                self.last_exit_time_min = now_sec / 60.0
+                return
+
+        # ======================================================================
+        # PERIODIC POSITION LOGGING (every 2 minutes)
+        # ======================================================================
+        if now_sec - self.last_position_log_sec >= self.POSITION_LOG_INTERVAL_SEC:
+            self.last_position_log_sec = now_sec
             direction = 1.0 if pos.side == "long" else -1.0
-            u_pnl = (current_price - pos.entry_price) * direction * pos.quantity
-            elapsed_min = (now_sec - pos.entry_time_sec) / 60.0
+            upnl = (current_price - pos.entry_price) * direction * pos.quantity
+            elapsed_min_log = (now_sec - pos.entry_time_sec) / 60.0
             logger.info(
                 f"[POSITION] {pos.trade_id} {pos.side.upper()} qty={pos.quantity:.6f} "
                 f"entry={pos.entry_price:.2f} cur={current_price:.2f} "
-                f"uPnL≈{u_pnl:.2f} USDT, elapsed={elapsed_min:.1f} min"
+                f"uPnL≈{upnl:.2f} USDT, elapsed={elapsed_min_log:.1f} min"
             )
 
-        # Throttled TP/SL status checks
-        if now_sec - self._last_status_check_sec < self.ORDER_STATUS_CHECK_INTERVAL_SEC:
+        # ======================================================================
+        # TP EXTENSION: Switch from HALF to FULL after 5 minutes (NON-THROTTLED)
+        # ======================================================================
+        if pos.main_filled and not pos.tp_reduced:
+            elapsed_min_for_tp = (now_sec - pos.entry_time_sec) / 60.0
+            if elapsed_min_for_tp >= 5.0:
+                logger.info(
+                    f"Considering TP EXTENSION to FULL for {pos.trade_id} "
+                    f"(elapsed={elapsed_min_for_tp:.1f} min), full TP={pos.tp_price:.2f}"
+                )
+                if pos.quantity <= 0:
+                    logger.error(f"Invalid quantity for TP extension on {pos.trade_id}")
+                    pos.tp_reduced = True
+                    return
+
+                if pos.side == "long":
+                    tp_side = "SELL"
+                else:
+                    tp_side = "BUY"
+
+                try:
+                    if pos.tp_order_id:
+                        order_manager.cancel_order(pos.tp_order_id)
+                except Exception as e:
+                    logger.error(
+                        f"Error cancelling HALF TP {pos.tp_order_id}: {e}", exc_info=True
+                    )
+
+                try:
+                    new_tp_order = order_manager.place_take_profit(
+                        side=tp_side,
+                        quantity=pos.quantity,
+                        trigger_price=pos.tp_price,
+                    )
+                    if new_tp_order and "order_id" in new_tp_order:
+                        pos.tp_order_id = new_tp_order["order_id"]
+                        pos.tp_reduced = True
+                        logger.info(
+                            f"✓ New FULL TP placed for {pos.trade_id} @ {pos.tp_price:.2f}, "
+                            f"order_id={pos.tp_order_id}"
+                        )
+                    else:
+                        logger.error(
+                            f"Failed to place FULL TP for {pos.trade_id} - "
+                            f"leaving position without active TP."
+                        )
+                        pos.tp_reduced = True
+                except Exception as e:
+                    logger.error(
+                        f"Error placing FULL TP for {pos.trade_id}: {e}", exc_info=True
+                    )
+                    pos.tp_reduced = True
+
+        # ======================================================================
+        # THROTTLED ORDER STATUS CHECKS (main/TP/SL fills)
+        # ======================================================================
+        if now_sec - self.last_status_check_sec < self.ORDER_STATUS_CHECK_INTERVAL_SEC:
             return
+        self.last_status_check_sec = now_sec
 
-        self._last_status_check_sec = now_sec
-
-        # Fetch main/TP/SL statuses once (OPTIMIZED)
         main_status: Optional[Dict] = None
         tp_status: Optional[Dict] = None
         sl_status: Optional[Dict] = None
@@ -1632,66 +1716,40 @@ class ZScoreIcebergHunterStrategy:
                 sl_status = order_manager.get_order_status(pos.sl_order_id)
         except Exception as e:
             logger.error(
-                f"Error fetching order status for {pos.trade_id}: {e}",
-                exc_info=True,
+                f"Error fetching order status for {pos.trade_id}: {e}", exc_info=True
             )
             return
 
-        # Main fill detection (FIXED - checks both FILLED and EXECUTED)
+        # ======================================================================
+        # MAIN FILL DETECTION
+        # ======================================================================
         if not pos.main_filled and main_status is not None:
-            if self._is_filled(main_status):
+            if self.is_filled(main_status):
                 pos.main_filled = True
-                logger.info(f"Main LIMIT filled for {pos.trade_id}")
+                logger.info(f"✓ Main LIMIT filled for {pos.trade_id}")
 
-        # Timeout for main LIMIT not filled
-        if not pos.main_filled:
-            elapsed = now_sec - pos.entry_time_sec
-            if elapsed >= self.ENTRY_FILL_TIMEOUT_SEC:
-                logger.info(
-                    f"Main LIMIT not filled in {self.ENTRY_FILL_TIMEOUT_SEC:.0f}s "
-                    f"for trade {pos.trade_id}; cancelling main, TP, and SL."
-                )
-                try:
-                    if pos.tp_order_id:
-                        order_manager.cancel_order(pos.tp_order_id)
-                    if pos.sl_order_id:
-                        order_manager.cancel_order(pos.sl_order_id)
-                    if pos.main_order_id:
-                        order_manager.cancel_order(pos.main_order_id)
-                except Exception as e:
-                    logger.error(
-                        f"Error cancelling bracket for {pos.trade_id}: {e}",
-                        exc_info=True,
-                    )
-                self.current_position = None
-                self.last_exit_time_min = now_sec / 60.0
-                return
-
-            # If main not filled yet, nothing more to manage
-            return
-
-        # Check TP/SL fills (FIXED - supports EXECUTED status)
+        # ======================================================================
+        # TP/SL EXIT DETECTION
+        # ======================================================================
         exit_reason: Optional[str] = None
         exit_order: Optional[Dict] = None
-        if self._is_filled(tp_status):
+        if self.is_filled(tp_status):
             exit_reason = "TP_HIT"
             exit_order = tp_status
-        elif self._is_filled(sl_status):
+        elif self.is_filled(sl_status):
             exit_reason = "SL_HIT"
             exit_order = sl_status
 
         if exit_order is not None:
-            # Exit logic
             try:
                 exit_price = order_manager.extract_fill_price(exit_order)
             except Exception as e:
                 logger.error(
-                    f"Failed to extract exit price for {pos.trade_id}: {e}",
-                    exc_info=True,
+                    f"Failed to extract exit price for {pos.trade_id}: {e}", exc_info=True
                 )
                 return
 
-            self._finalize_exit(
+            self.finalize_exit(
                 order_manager=order_manager,
                 risk_manager=risk_manager,
                 exit_price_live=exit_price,
@@ -1700,91 +1758,17 @@ class ZScoreIcebergHunterStrategy:
                 reason=exit_reason,
                 now_sec=now_sec,
             )
-            return
 
-        # Time stop (max hold) - LOG ONLY ONCE (FIXED SPAM)
-        elapsed_min = (now_sec - pos.entry_time_sec) / 60.0
-        if elapsed_min >= config.MAX_HOLD_MINUTES:
-            # Only log the first time we hit max hold
-            if not hasattr(pos, '_max_hold_logged'):
-                pos._max_hold_logged = True
-                logger.info(
-                    f"Max hold {config.MAX_HOLD_MINUTES}min reached for {pos.trade_id}; "
-                    f"leaving exit to TP/SL (no forced market close)."
-                )
-
-        # Consider TP extension to FULL after 5 minutes
         # ======================================================================
-        # 5) TP EXTENSION from HALF → FULL (after partial progress)
+        # DYNAMIC TP TIGHTENING (session/volatility aware) - OPTIONAL
         # ======================================================================
-        if (
-            not pos.tp_reduced
-            and elapsed_min >= config.DYNAMIC_TP_MINUTES
-            and config.ENABLE_TP_TIGHTENING
-        ):
-            # Check if we're >50% toward full TP
-            direction = 1.0 if pos.side == "long" else -1.0
-            current_profit = (current_price - pos.entry_price) * direction
-            full_tp_profit = (full_tp_price - pos.entry_price) * direction
-            
-            if full_tp_profit > 0:
-                progress = current_profit / full_tp_profit
-            else:
-                progress = 0.0
-            
-            if progress >= config.DYNAMIC_TP_REQUIRED_PROGRESS:
-                # We're >50% of the way to full TP → extend to full
-                logger.info(
-                    f"Considering TP EXTENSION to FULL for {pos.trade_id} "
-                    f"(elapsed={elapsed_min:.1f} min, progress={progress*100:.1f}%, "
-                    f"full TP={full_tp_price:.2f})"
-                )
-                
-                # Cancel old HALF TP
-                cancel_ok = self.order_manager.cancel_order(pos.tp_order_id)
-                if not cancel_ok:
-                    logger.error(
-                        f"Failed to cancel HALF TP {pos.tp_order_id}; "
-                        f"keeping position with existing bracket."
-                    )
-                    return
-                
-                # CRITICAL: Add buffer to allow CoinSwitch to process cancellation
-                logger.info("Waiting 1.0s for CoinSwitch to process TP cancellation...")
-                time.sleep(1.0)
-                
-                # Place new FULL TP
-                tp_side = "SELL" if pos.side == "long" else "BUY"
-                new_tp = self.order_manager.place_take_profit(
-                    side=tp_side,
-                    quantity=pos.quantity,
-                    trigger_price=full_tp_price,
-                )
-                
-                if new_tp and "order_id" in new_tp:
-                    pos.tp_order_id = new_tp["order_id"]
-                    pos.tp_price = full_tp_price
-                    pos.tp_reduced = True
-                    logger.info(
-                        f"TP EXTENDED to FULL: new TP={full_tp_price:.2f}, "
-                        f"order_id={pos.tp_order_id}"
-                    )
-                else:
-                    logger.error(
-                        f"Failed to place FULL TP for {pos.trade_id}; "
-                        f"leaving position without active TP."
-                    )
-
-        # --- Dynamic TP tightening based on stagnation + low volatility (NEW) ---
         if (
             getattr(config, "ENABLE_TP_TIGHTENING", False)
             and pos.main_filled
             and pos.tp_reduced  # only after full TP extension logic
         ):
             elapsed_min_dyn = (now_sec - pos.entry_time_sec) / 60.0
-
             if elapsed_min_dyn >= config.DYNAMIC_TP_MINUTES:
-                # Need ATR for current volatility and current unrealized ROI
                 atr_pct = None
                 try:
                     atr_pct = data_manager.get_atr_percent()
@@ -1792,20 +1776,16 @@ class ZScoreIcebergHunterStrategy:
                     pass
 
                 direction = 1.0 if pos.side == "long" else -1.0
-                u_pnl_price = (
-                    (current_price - pos.entry_price) * direction * pos.quantity
+                upnl_price = (current_price - pos.entry_price) * direction * pos.quantity
+                upnl_roi = (
+                    upnl_price / pos.margin_used if pos.margin_used > 0 else 0.0
                 )
-                u_pnl_roi = (
-                    u_pnl_price / pos.margin_used if pos.margin_used > 0 else 0.0
-                )
-
                 full_tp_roi = config.PROFIT_TARGET_ROI
 
                 if (
                     atr_pct is not None
-                    and atr_pct <= config.DYNAMIC_TP_MIN_ATR_PCT
-                    and u_pnl_roi
-                    >= full_tp_roi * config.DYNAMIC_TP_REQUIRED_PROGRESS
+                    and atr_pct < config.DYNAMIC_TP_MIN_ATR_PCT
+                    and upnl_roi < full_tp_roi * config.DYNAMIC_TP_REQUIRED_PROGRESS
                 ):
                     new_tp_roi = config.DYNAMIC_TP_NEAR_ROI
                     new_profit_usdt = pos.margin_used * new_tp_roi
@@ -1821,13 +1801,12 @@ class ZScoreIcebergHunterStrategy:
                         tp_side_dyn = "BUY"
 
                     logger.info(
-                        f"Dynamic TP tightening for {pos.trade_id}: "
-                        f"elapsed={elapsed_min_dyn:.1f}m, atr={atr_pct}, "
-                        f"uROI={u_pnl_roi:.4f}, new_tp_roi={new_tp_roi:.4f}, "
-                        f"new_tp_price={new_tp_price:.2f}"
+                        f"Dynamic TP tightening for {pos.trade_id} "
+                        f"(elapsed={elapsed_min_dyn:.1f}m, atr={atr_pct}, "
+                        f"uROI={upnl_roi:.4f}, new_tp_roi={new_tp_roi:.4f}, "
+                        f"new_tp_price={new_tp_price:.2f})"
                     )
 
-                    # Cancel old TP and place new one
                     try:
                         if pos.tp_order_id:
                             order_manager.cancel_order(pos.tp_order_id)
@@ -1846,8 +1825,8 @@ class ZScoreIcebergHunterStrategy:
                         if new_tp_order_dyn and "order_id" in new_tp_order_dyn:
                             pos.tp_order_id = new_tp_order_dyn["order_id"]
                             logger.info(
-                                f"New tightened TP placed for {pos.trade_id}: "
-                                f"{new_tp_price:.2f}, order_id={pos.tp_order_id}"
+                                f"New tightened TP placed for {pos.trade_id} @ {new_tp_price:.2f}, "
+                                f"order_id={pos.tp_order_id}"
                             )
                         else:
                             logger.error(
