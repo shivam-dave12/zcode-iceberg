@@ -111,7 +111,7 @@ WALL_DEPTH_LEVELS = 20
 IMBALANCE_THRESHOLD = 0.65
 
 # Delta Z-score threshold (aggressor pressure)
-DELTA_Z_THRESHOLD = 2.5
+DELTA_Z_THRESHOLD = 2.1
 
 # Taker delta window (seconds)
 DELTA_WINDOW_SEC = 10
