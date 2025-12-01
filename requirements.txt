@@ -1,0 +1,25 @@
+# Core dependencies
+numpy==1.24.3
+pandas==2.0.3
+requests==2.31.0
+
+# Machine Learning (for LSTM trend models)
+torch==2.0.1
+
+# WebSocket & Real-time Data
+python-socketio==5.9.0
+websocket-client==1.6.1
+
+# Excel Logging
+openpyxl==3.1.2
+
+# Cryptography (for API signatures)
+cryptography==41.0.3
+
+# Telegram Bot
+python-telegram-bot==20.4
+
+# Utilities
+python-dotenv==1.0.0
+pytz==2023.3
+
