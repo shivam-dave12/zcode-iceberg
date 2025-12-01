@@ -320,7 +320,7 @@ class OrderManager:
                 symbol=config.SYMBOL,
                 side=side.upper(),
                 order_type="TAKE_PROFIT_MARKET",
-                quantity=0,
+                quantity=quantity,
                 trigger_price=trigger_price,
                 exchange=config.EXCHANGE,
                 reduce_only=True,
@@ -335,7 +335,7 @@ class OrderManager:
                     "symbol": config.SYMBOL,
                     "side": side,
                     "type": "TAKE_PROFIT",
-                    "quantity": 0,
+                    "quantity": quantity,
                     "trigger_price": trigger_price,
                     "status": response["data"].get("status", "UNKNOWN"),
                     "timestamp": datetime.now().isoformat(),
@@ -472,5 +472,3 @@ if __name__ == "__main__":
     print(f"Statistics: {om.get_order_statistics()}")
     open_orders = om.get_open_orders()
     print(f"Open orders: {len(open_orders)}")
-
-
