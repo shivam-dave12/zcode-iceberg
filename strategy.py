@@ -1364,7 +1364,7 @@ class ZScoreIcebergHunterStrategy:
 
         tp_order = order_manager.place_take_profit(
             side=tp_side,
-            quantity=quantity,
+            quantity=0,
             trigger_price=half_tp_price,
         )
         if not tp_order or "order_id" not in tp_order:
@@ -1387,7 +1387,7 @@ class ZScoreIcebergHunterStrategy:
 
         sl_order = order_manager.place_stop_loss(
             side=sl_side,
-            quantity=quantity,
+            quantity=0,
             trigger_price=sl_price,
         )
         if not sl_order or "order_id" not in sl_order:
@@ -1596,7 +1596,7 @@ class ZScoreIcebergHunterStrategy:
                 try:
                     new_tp_order = order_manager.place_take_profit(
                         side=tp_side,
-                        quantity=pos.quantity,
+                        quantity=0,
                         trigger_price=pos.tp_price,
                     )
                     if new_tp_order and "order_id" in new_tp_order:
@@ -1674,7 +1674,7 @@ class ZScoreIcebergHunterStrategy:
                     try:
                         new_tp_order_dyn = order_manager.place_take_profit(
                             side=tp_side_dyn,
-                            quantity=pos.quantity,
+                            quantity=0,
                             trigger_price=new_tp_price,
                         )
                         if new_tp_order_dyn and "order_id" in new_tp_order_dyn:
