@@ -87,12 +87,18 @@ class ZScoreIcebergBot:
         self._last_stream_check_sec: float = 0.0
         self._last_report_sec: float = 0.0
 
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+        # Only set signal handlers if running standalone (not from controller)
+        if controller is None:
+            signal.signal(signal.SIGINT, self._signal_handler)
+            signal.signal(signal.SIGTERM, self._signal_handler)
+            logger.info("Signal handlers registered (standalone mode)")
+        else:
+            logger.info("Running under controller - signal handlers skipped")
 
         logger.info("Z-Score bot initialized\n")
 
     def _signal_handler(self, signum, frame) -> None:
+        """Only used in standalone mode"""
         logger.info("\n" + "=" * 80)
         logger.info("SHUTDOWN SIGNAL RECEIVED")
         logger.info("=" * 80)
