@@ -196,15 +196,30 @@ class TelegramBotController:
             )
             self.bot_thread.start()
             
-            # Wait for bot to initialize
-            time.sleep(3.0)
+            # Wait for bot to initialize with multiple checks
+            max_wait = 15.0  # Maximum 15 seconds
+            check_interval = 0.5  # Check every 0.5 seconds
+            elapsed = 0.0
             
-            if self.bot_running:
-                self._send_message("✅ Trading bot started successfully")
-                logger.info("Trading bot started successfully")
+            while elapsed < max_wait:
+                time.sleep(check_interval)
+                elapsed += check_interval
+                
+                if self.bot_running:
+                    self._send_message("✅ Trading bot started successfully")
+                    logger.info("Trading bot started successfully")
+                    return
+            
+            # Timeout - but bot might still be starting
+            if self.bot_thread.is_alive():
+                self._send_message(
+                    "⚠️ Bot is starting (taking longer than expected)...\n"
+                    "Send 'Status' in a few seconds to verify"
+                )
+                logger.warning("Bot thread alive but bot_running flag not set yet")
             else:
                 self._send_message("❌ Failed to start trading bot - check logs")
-                logger.error("Failed to start trading bot")
+                logger.error("Failed to start trading bot - thread not alive")
                 
         except Exception as e:
             logger.error(f"Error handling START command: {e}", exc_info=True)
@@ -285,8 +300,11 @@ class TelegramBotController:
             # Import here to avoid circular imports
             from main import ZScoreIcebergBot
             
-            self.bot_instance = ZScoreIcebergBot(controller=self)
+            # Set flag immediately so controller knows we're starting
             self.bot_running = True
+            logger.info("Bot thread started, initializing bot instance...")
+            
+            self.bot_instance = ZScoreIcebergBot(controller=self)
             
             # Start the bot (this blocks until bot stops)
             self.bot_instance.start()
@@ -298,7 +316,7 @@ class TelegramBotController:
             self.bot_running = False
             self.bot_instance = None
             logger.info("Bot thread finished")
-    
+   
     def _stop_bot(self) -> None:
         """Stop the running bot"""
         try:
