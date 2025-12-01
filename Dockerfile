@@ -36,5 +36,5 @@ RUN mkdir -p /app/logs
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD python -c "import sys; sys.exit(0)"
 
-# Run the bot
-CMD ["python", "-u", "main.py"]
+# Run the Telegram controller (not main.py directly)
+CMD ["python", "-u", "telegram_bot_controller.py"]
