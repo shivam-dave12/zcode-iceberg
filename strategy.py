@@ -2,7 +2,6 @@
 Z-Score Imbalance Iceberg Hunter Strategy - 2025 Real Version
 
 DETAILED LOGGING VERSION:
-
 - Logs raw orderbook/trade/touch counts
 - Logs all calculated values (imbalance, wall strength, delta, Z-score, touch distances)
 - Logs gate evaluation with actual thresholds
@@ -15,7 +14,6 @@ from typing import Optional, Dict, List, Tuple
 from datetime import datetime
 from collections import deque
 import logging
-
 import numpy as np
 
 import config
@@ -60,13 +58,14 @@ class ZScoreIcebergHunterStrategy:
     """
 
     DECISION_LOG_INTERVAL_SEC = 60.0
-    POSITION_LOG_INTERVAL_SEC = 10.0
+    POSITION_LOG_INTERVAL_SEC = 120.0
     ORDER_STATUS_CHECK_INTERVAL_SEC = 10.0  # Throttle TP/SL status polling
     ENTRY_FILL_TIMEOUT_SEC = 60.0  # Cancel bracket if main not filled in 60s
 
     def __init__(self, excel_logger: Optional[ZScoreExcelLogger] = None) -> None:
         self.current_position: Optional[ZScorePosition] = None
         self.last_exit_time_min: float = 0.0
+
         self.excel_logger = excel_logger
         self.trade_seq = 0
 
@@ -106,12 +105,121 @@ class ZScoreIcebergHunterStrategy:
             f"Trend Filter: EMA{config.EMA_PERIOD} "
             f"(long if price>EMA, short if price<EMA)"
         )
+        logger.info("=" * 80)
+
+    # ======================================================================
+    # SESSION + VOLATILITY HELPERS (NEW)
+    # ======================================================================
+
+    def _get_session_label(self, now_utc=None):
+        """
+        Return ('ASIA' | 'LONDON' | 'NEW_YORK' | 'OFF_SESSION', is_major_session: bool, is_weekend: bool)
+        based on UTC time and weekday.
+        """
+        if now_utc is None:
+            now_utc = datetime.utcnow()
+
+        hour = now_utc.hour
+        weekday = now_utc.weekday()  # 0=Mon ... 6=Sun
+        is_weekend = weekday >= 5
+
+        asia_start, asia_end = config.ASIA_SESSION_UTC
+        london_start, london_end = config.LONDON_SESSION_UTC
+        ny_start, ny_end = config.NEW_YORK_SESSION_UTC
+
+        if asia_start <= hour < asia_end:
+            return "ASIA", True, is_weekend
+        if london_start <= hour < london_end:
+            return "LONDON", True, is_weekend
+        if ny_start <= hour < ny_end:
+            return "NEW_YORK", True, is_weekend
+        return "OFF_SESSION", False, is_weekend
+
+    def _get_dynamic_params(self, data_manager, current_price, now_sec):
+        """
+        Decide slippage_ticks, profit_roi, stop_roi based on:
+        - Session (Asia/London/New York/off-session)
+        - Weekend flag
+        - Current ATR% from DataManager
+        Returns dict with values + a short text reason string.
+        """
+        # Defaults: original config values
+        slippage_ticks = config.SLIPPAGE_TICKS_ASSUMED
+        profit_roi = config.PROFIT_TARGET_ROI
+        stop_roi = config.STOP_LOSS_ROI
+        reason_parts = []
+
+        if not getattr(config, "ENABLE_SESSION_DYNAMIC_PARAMS", False):
+            return {
+                "slippage_ticks": slippage_ticks,
+                "profit_roi": profit_roi,
+                "stop_roi": stop_roi,
+                "atr_pct": None,
+                "session": "DISABLED",
+                "is_major": False,
+                "is_weekend": False,
+                "reason": "session_dynamics_disabled",
+            }
+
+        session, is_major, is_weekend = self._get_session_label()
+
+        # ATR as fraction of price (e.g. 0.008 == 0.8%)
+        try:
+            atr_pct = data_manager.get_atr_percent()
+        except Exception:
+            atr_pct = None
+
+        # Major sessions: allow standard 10%/3% RR with 1–2 ticks slippage
+        if is_major and not is_weekend:
+            slippage_ticks = config.SESSION_SLIPPAGE_TICKS
+            profit_roi = config.SESSION_PROFIT_TARGET_ROI
+            stop_roi = config.SESSION_STOP_LOSS_ROI
+            reason_parts.append("major_session_standard_rr")
+
+        else:
+            # Off-session or weekend: adjust by ATR
+            reason_parts.append("off_session_or_weekend")
+
+            if atr_pct is not None:
+                if atr_pct >= config.MIN_ATR_PCT_FOR_FULL_TP:
+                    # Enough realized volatility: keep full TP but tighten slippage a bit
+                    slippage_ticks = config.OFFSESSION_SLIPPAGE_TICKS_BASE
+                    profit_roi = config.OFFSESSION_FULL_TP_ROI
+                    reason_parts.append("atr_ok_fullish_tp")
+                elif atr_pct >= config.VERY_LOW_ATR_PCT:
+                    # Low vol: near TP, still 1 tick slippage
+                    slippage_ticks = config.OFFSESSION_SLIPPAGE_TICKS_BASE
+                    profit_roi = config.OFFSESSION_NEAR_TP_ROI
+                    reason_parts.append("low_atr_near_tp")
+                else:
+                    # Very low vol: minimal slippage and near TP
+                    slippage_ticks = config.OFFSESSION_SLIPPAGE_TICKS_LOW_VOL
+                    profit_roi = config.OFFSESSION_NEAR_TP_ROI
+                    reason_parts.append("very_low_atr_min_slip_near_tp")
+            else:
+                # No ATR available; stay conservative off-session
+                slippage_ticks = config.OFFSESSION_SLIPPAGE_TICKS_BASE
+                profit_roi = config.OFFSESSION_NEAR_TP_ROI
+                reason_parts.append("no_atr_fallback_near_tp")
+
+        return {
+            "slippage_ticks": slippage_ticks,
+            "profit_roi": profit_roi,
+            "stop_roi": stop_roi,
+            "atr_pct": atr_pct,
+            "session": session,
+            "is_major": is_major,
+            "is_weekend": is_weekend,
+            "reason": ",".join(reason_parts),
+        }
 
     # ======================================================================
     # Main tick handler
     # ======================================================================
 
-    def on_tick(self, data_manager, order_manager, risk_manager) -> None:
+    def on_tick(
+        self, data_manager, order_manager, risk_manager
+    ) -> None:
         """
         Main per-tick strategy entrypoint called from the main loop.
         - Manages existing position (TP/SL + timeout + TP adjustment).
@@ -251,7 +359,6 @@ class ZScoreIcebergHunterStrategy:
         - Trades taken, wins, losses, win rate
         - Realized P&L
         - Open-position snapshot (if any)
-
         Does not affect trading logic.
         """
         # Initialize timer on first tick
@@ -308,6 +415,7 @@ class ZScoreIcebergHunterStrategy:
             "",
             f"Open position: {pos_summary}",
         ]
+
         try:
             send_telegram_message("\n".join(msg_lines))
         except Exception as e:
@@ -337,12 +445,13 @@ class ZScoreIcebergHunterStrategy:
     ) -> None:
         if now_sec - self._last_decision_log_sec < self.DECISION_LOG_INTERVAL_SEC:
             return
+
         self._last_decision_log_sec = now_sec
 
         logger.info("-" * 80)
         logger.info(
             "Z-DECISION SNAPSHOT @ {} | price={:.2f}".format(
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
                 current_price,
             )
         )
@@ -350,7 +459,7 @@ class ZScoreIcebergHunterStrategy:
         # DataManager stats
         stats = data_manager.stats
         logger.info(
-            " DataManager Stats: ob_updates={}, trades={}, candles={}, prices={}".format(
+            "  DataManager Stats: ob_updates={}, trades={}, candles={}, prices={}".format(
                 stats.get("orderbook_updates", 0),
                 stats.get("trades_received", 0),
                 stats.get("candles_received", 0),
@@ -360,27 +469,27 @@ class ZScoreIcebergHunterStrategy:
 
         bids, asks = data_manager.get_orderbook_snapshot()
         logger.info(
-            " Raw Orderbook: bid_levels={}, ask_levels={}".format(
+            "  Raw Orderbook: bid_levels={}, ask_levels={}".format(
                 len(bids), len(asks)
             )
         )
 
         trades_20s = data_manager.get_recent_trades(window_seconds=20)
-        logger.info(f" Raw Trades (20s window): count={len(trades_20s)}")
+        logger.info(f"  Raw Trades (20s window): count={len(trades_20s)}")
 
         # Imbalance
         if imbalance_data is None:
-            logger.info(" Imbalance : MISSING (no book or <20 levels)")
+            logger.info("  Imbalance       : MISSING (no book or <20 levels)")
         else:
             logger.info(
-                " Imbalance : {:.3f} (total_bid={:.2f}, total_ask={:.2f})".format(
+                "  Imbalance       : {:.3f} (total_bid={:.2f}, total_ask={:.2f})".format(
                     imbalance_data["imbalance"],
                     imbalance_data["total_bid"],
                     imbalance_data["total_ask"],
                 )
             )
             logger.info(
-                " → long_ok={} (need ≥{:.2f}), short_ok={} (need ≤{:.2f})".format(
+                "    → long_ok={} (need ≥{:.2f}), short_ok={} (need ≤{:.2f})".format(
                     imbalance_data["long_ok"],
                     config.IMBALANCE_THRESHOLD,
                     imbalance_data["short_ok"],
@@ -390,10 +499,10 @@ class ZScoreIcebergHunterStrategy:
 
         # Wall strength
         if wall_data is None:
-            logger.info(" Wall Strength : MISSING (depends on imbalance/orderbook)")
+            logger.info("  Wall Strength   : MISSING (depends on imbalance/orderbook)")
         else:
             logger.info(
-                " Wall Strength : bid={:.2f} (vol={:.2f}), "
+                "  Wall Strength   : bid={:.2f} (vol={:.2f}), "
                 "ask={:.2f} (vol={:.2f})".format(
                     wall_data["bid_wall_strength"],
                     wall_data["bid_vol_zone"],
@@ -402,7 +511,7 @@ class ZScoreIcebergHunterStrategy:
                 )
             )
             logger.info(
-                " → long_wall_ok={} (need ≥{:.2f}), short_wall_ok={} (need ≥{:.2f})".format(
+                "    → long_wall_ok={} (need ≥{:.2f}), short_wall_ok={} (need ≥{:.2f})".format(
                     wall_data["long_wall_ok"],
                     config.MIN_WALL_VOLUME_MULT,
                     wall_data["short_wall_ok"],
@@ -413,11 +522,11 @@ class ZScoreIcebergHunterStrategy:
         # Delta Z-score
         if delta_data is None:
             logger.info(
-                f" Delta Z-score : MISSING (no trades in last {config.DELTA_WINDOW_SEC}s)"
+                f"  Delta Z-score   : MISSING (no trades in last {config.DELTA_WINDOW_SEC}s)"
             )
         else:
             logger.info(
-                " Delta Z-score : delta={:.2f} (buy={:.2f}, sell={:.2f}), z={:.2f}".format(
+                "  Delta Z-score   : delta={:.2f} (buy={:.2f}, sell={:.2f}), z={:.2f}".format(
                     delta_data["delta"],
                     delta_data["buy_vol"],
                     delta_data["sell_vol"],
@@ -425,7 +534,7 @@ class ZScoreIcebergHunterStrategy:
                 )
             )
             logger.info(
-                " → pop_size={}, long_z_ok={} (need ≥{:.2f}), "
+                "    → pop_size={}, long_z_ok={} (need ≥{:.2f}), "
                 "short_z_ok={} (need ≤{:.2f})".format(
                     len(self._delta_population),
                     delta_data["long_ok"],
@@ -437,10 +546,10 @@ class ZScoreIcebergHunterStrategy:
 
         # Touch distances
         if touch_data is None:
-            logger.info(" Touch ticks : MISSING (no orderbook snapshot)")
+            logger.info("  Touch ticks     : MISSING (no orderbook snapshot)")
         else:
             logger.info(
-                " Touch ticks : bid_dist={:.2f} (nearest_bid={:.2f}), "
+                "  Touch ticks     : bid_dist={:.2f} (nearest_bid={:.2f}), "
                 "ask_dist={:.2f} (nearest_ask={:.2f})".format(
                     touch_data["bid_distance_ticks"],
                     touch_data["nearest_bid"],
@@ -449,7 +558,7 @@ class ZScoreIcebergHunterStrategy:
                 )
             )
             logger.info(
-                " → long_touch_ok={} (need ≤{} ticks), "
+                "    → long_touch_ok={} (need ≤{} ticks), "
                 "short_touch_ok={} (need ≤{} ticks)".format(
                     touch_data["long_touch_ok"],
                     config.PRICE_TOUCH_THRESHOLD_TICKS,
@@ -467,37 +576,55 @@ class ZScoreIcebergHunterStrategy:
 
         if ema_val is None:
             logger.info(
-                f" Trend EMA{config.EMA_PERIOD} : MISSING (not enough price history)"
+                f"  Trend EMA{config.EMA_PERIOD}   : MISSING (not enough price history)"
             )
         else:
             long_trend_ok = current_price > ema_val
             short_trend_ok = current_price < ema_val
             logger.info(
-                f" Trend EMA{config.EMA_PERIOD} : ema={ema_val:.2f}, "
+                f"  Trend EMA{config.EMA_PERIOD}   : ema={ema_val:.2f}, "
                 f"price={current_price:.2f}"
             )
             logger.info(
-                f" → long_trend_ok={long_trend_ok}, short_trend_ok={short_trend_ok}"
+                f"    → long_trend_ok={long_trend_ok}, short_trend_ok={short_trend_ok}"
             )
 
         # HTF / LTF trend
         if htf_trend is None:
             logger.info(
-                f" HTF Trend {config.HTF_TREND_INTERVAL}min : MISSING (insufficient data)"
+                f"  HTF Trend {config.HTF_TREND_INTERVAL}min : MISSING (insufficient data)"
             )
         else:
-            logger.info(f" HTF Trend {config.HTF_TREND_INTERVAL}min : {htf_trend}")
+            logger.info(f"  HTF Trend {config.HTF_TREND_INTERVAL}min : {htf_trend}")
 
         if ltf_trend is None:
-            logger.info(" LTF Trend 1min : MISSING (insufficient data)")
+            logger.info("  LTF Trend 1min  : MISSING (insufficient data)")
         else:
-            logger.info(f" LTF Trend 1min : {ltf_trend}")
+            logger.info(f"  LTF Trend 1min  : {ltf_trend}")
+
+        # Session + volatility snapshot (NEW)
+        try:
+            dyn = self._get_dynamic_params(data_manager, current_price, now_sec)
+            logger.info(
+                "  Session/Vol: session=%s major=%s weekend=%s atr_pct=%s "
+                "slip_ticks=%s profit_roi=%.4f stop_roi=%.4f reason=%s",
+                dyn["session"],
+                dyn["is_major"],
+                dyn["is_weekend"],
+                f"{dyn['atr_pct']:.4f}" if dyn["atr_pct"] is not None else "None",
+                dyn["slippage_ticks"],
+                dyn["profit_roi"],
+                dyn["stop_roi"],
+                dyn["reason"],
+            )
+        except Exception as e:
+            logger.error(f"Error logging session/vol snapshot: {e}", exc_info=True)
 
         # Oracle inputs
         if oracle_inputs is not None:
-            logger.info(" AETHER ORACLE INPUTS:")
+            logger.info("  AETHER ORACLE INPUTS:")
             logger.info(
-                "  LV 1m={:.4f}, LV 5m={:.4f}, LV 15m={:.4f}, micro_trap={}".format(
+                "    LV 1m={:.4f}, LV 5m={:.4f}, LV 15m={:.4f}, micro_trap={}".format(
                     oracle_inputs.lv_1m if oracle_inputs.lv_1m is not None else float("nan"),
                     oracle_inputs.lv_5m if oracle_inputs.lv_5m is not None else float("nan"),
                     oracle_inputs.lv_15m if oracle_inputs.lv_15m is not None else float("nan"),
@@ -505,14 +632,14 @@ class ZScoreIcebergHunterStrategy:
                 )
             )
             logger.info(
-                "  norm_cvd={:.4f} hurst={:.4f} bos_align={}".format(
+                "    norm_cvd={:.4f} hurst={:.4f} bos_align={}".format(
                     oracle_inputs.norm_cvd if oracle_inputs.norm_cvd is not None else float("nan"),
                     oracle_inputs.hurst if oracle_inputs.hurst is not None else float("nan"),
                     "MISSING" if oracle_inputs.bos_align is None else f"{oracle_inputs.bos_align:.4f}",
                 )
             )
             logger.info(
-                "  ema_val={:.2f} atr_pct={}".format(
+                "    ema_val={:.2f} atr_pct={}".format(
                     oracle_inputs.ema_val if oracle_inputs.ema_val is not None else float("nan"),
                     "MISSING"
                     if oracle_inputs.atr_pct is None
@@ -524,7 +651,7 @@ class ZScoreIcebergHunterStrategy:
             ls = oracle_outputs.long_scores
             ss = oracle_outputs.short_scores
             logger.info(
-                " AETHER ORACLE LONG : mc={} bayes={} rl={} fused={} kelly_f={:.4f} rr={:.2f}".format(
+                "  AETHER ORACLE LONG : mc={} bayes={} rl={} fused={} kelly_f={:.4f} rr={:.2f}".format(
                     "MISSING" if ls.mc is None else f"{ls.mc:.3f}",
                     "MISSING" if ls.bayes is None else f"{ls.bayes:.3f}",
                     "MISSING" if ls.rl is None else f"{ls.rl:.3f}",
@@ -534,7 +661,7 @@ class ZScoreIcebergHunterStrategy:
                 )
             )
             logger.info(
-                " AETHER ORACLE SHORT: mc={} bayes={} rl={} fused={} kelly_f={:.4f} rr={:.2f}".format(
+                "  AETHER ORACLE SHORT: mc={} bayes={} rl={} fused={} kelly_f={:.4f} rr={:.2f}".format(
                     "MISSING" if ss.mc is None else f"{ss.mc:.3f}",
                     "MISSING" if ss.bayes is None else f"{ss.bayes:.3f}",
                     "MISSING" if ss.rl is None else f"{ss.rl:.3f}",
@@ -546,17 +673,17 @@ class ZScoreIcebergHunterStrategy:
 
         # Final readiness
         if long_ready:
-            logger.info(" LONG ENTRY STATE : READY (all gates + oracle passed)")
+            logger.info("  LONG ENTRY STATE  : READY (all gates + oracle passed)")
         else:
             logger.info(
-                " LONG ENTRY STATE : BLOCKED | " + " | ".join(long_reasons_block)
+                "  LONG ENTRY STATE  : BLOCKED | " + " | ".join(long_reasons_block)
             )
 
         if short_ready:
-            logger.info(" SHORT ENTRY STATE : READY (all gates + oracle passed)")
+            logger.info("  SHORT ENTRY STATE : READY (all gates + oracle passed)")
         else:
             logger.info(
-                " SHORT ENTRY STATE : BLOCKED | " + " | ".join(short_reasons_block)
+                "  SHORT ENTRY STATE : BLOCKED | " + " | ".join(short_reasons_block)
             )
 
         logger.info("-" * 80)
@@ -581,6 +708,7 @@ class ZScoreIcebergHunterStrategy:
             return None
 
         imbalance = (total_bid - total_ask) / (total_bid + total_ask)
+
         return {
             "imbalance": imbalance,
             "long_ok": imbalance >= config.IMBALANCE_THRESHOLD,
@@ -631,7 +759,6 @@ class ZScoreIcebergHunterStrategy:
     def _compute_delta_z_score(self, data_manager) -> Optional[Dict]:
         """
         Delta Z-score over the last DELTA_WINDOW_SEC using ONLY real trades.
-
         - Uses all available historical deltas in _delta_population.
         - Z-pop guard: for pop_len < 50, sigma = max(0.3, std(pop)).
         - Returns None only if there are literally no trades in the window.
@@ -659,7 +786,6 @@ class ZScoreIcebergHunterStrategy:
 
         pop = list(self._delta_population)
         pop_len = len(pop)
-
         mean_delta = sum(pop) / pop_len
 
         if pop_len < 50:
@@ -804,6 +930,7 @@ class ZScoreIcebergHunterStrategy:
         # ------------------------------------------------------------------
         # Multi-timeframe trend sync (HTF + LTF 3-state)
         # ------------------------------------------------------------------
+
         def _norm_dir(label: Optional[str]) -> str:
             if not label:
                 return "UNKNOWN"
@@ -903,6 +1030,7 @@ class ZScoreIcebergHunterStrategy:
                     f"trend price={current_price:.2f} <= "
                     f"EMA{config.EMA_PERIOD}={ema_val:.2f}"
                 )
+
         if not short_conds["ema_trend"]:
             if ema_val is None:
                 short_reasons_block.append("trend_ema_missing")
@@ -921,6 +1049,7 @@ class ZScoreIcebergHunterStrategy:
                     f"mtf_trend_sync htf={htf_trend}, ltf={ltf_trend} "
                     f"(need both UP or HTF RANGE + LTF UP/RANGE)"
                 )
+
         if not short_conds["mtf_trend"]:
             if htf_trend is None or ltf_trend is None:
                 short_reasons_block.append("mtf_trend_sync_missing")
@@ -933,12 +1062,11 @@ class ZScoreIcebergHunterStrategy:
         # ------------------------------------------------------------------
         # Aether Oracle fusion layer
         # ------------------------------------------------------------------
+
         oracle_outputs: Optional[OracleOutputs] = None
         if oracle_inputs is not None:
             try:
-                oracle_outputs = self._oracle.decide(
-                    oracle_inputs, risk_manager
-                )
+                oracle_outputs = self._oracle.decide(oracle_inputs, risk_manager)
             except Exception as e:
                 logger.error(f"Error in Aether Oracle decide: {e}", exc_info=True)
                 oracle_outputs = None
@@ -947,7 +1075,8 @@ class ZScoreIcebergHunterStrategy:
             # Long side
             if (
                 oracle_outputs.long_scores.fused is not None
-                and oracle_outputs.long_scores.fused < self._oracle.entry_prob_threshold
+                and oracle_outputs.long_scores.fused
+                < self._oracle.entry_prob_threshold
             ):
                 if long_ready:
                     long_ready = False
@@ -960,7 +1089,8 @@ class ZScoreIcebergHunterStrategy:
             # Short side
             if (
                 oracle_outputs.short_scores.fused is not None
-                and oracle_outputs.short_scores.fused < self._oracle.entry_prob_threshold
+                and oracle_outputs.short_scores.fused
+                < self._oracle.entry_prob_threshold
             ):
                 if short_ready:
                     short_ready = False
@@ -1084,7 +1214,6 @@ class ZScoreIcebergHunterStrategy:
 
         kelly_f = scores.kelly_f
         target_margin = available * kelly_f
-
         target_margin = max(config.MIN_MARGIN_PER_TRADE, target_margin)
         target_margin = min(config.MAX_MARGIN_PER_TRADE, target_margin)
 
@@ -1095,6 +1224,7 @@ class ZScoreIcebergHunterStrategy:
             kelly_f,
             target_margin,
         )
+
         return target_margin
 
     # ======================================================================
@@ -1119,11 +1249,12 @@ class ZScoreIcebergHunterStrategy:
         """
         Bracket entry:
         - Place main LIMIT order slightly beyond current price
-          (below for longs, above for shorts).
+        (below for longs, above for shorts).
         - Compute full TP and SL from margin-based price move.
         - Place HALF TP initially; extend to FULL if still in trade after 5min.
         - If kelly_margin is provided, override legacy BALANCE_USAGE_PERCENTAGE
-          sizing and use Kelly-based margin for this trade.
+        sizing and use Kelly-based margin for this trade.
+        - Uses session-aware dynamic slippage and TP/SL ROI.
         """
         if self.current_position is not None:
             return
@@ -1141,19 +1272,22 @@ class ZScoreIcebergHunterStrategy:
             return
 
         # Position margin: Kelly-based if present, otherwise config percentage
-        if kelly_margin is not None:
-            position_margin = kelly_margin
-        else:
-            position_margin = available * (config.BALANCE_USAGE_PERCENTAGE / 100.0)
-            position_margin = max(position_margin, config.MIN_MARGIN_PER_TRADE)
-            position_margin = min(position_margin, config.MAX_MARGIN_PER_TRADE)
+        position_margin = available * (config.BALANCE_USAGE_PERCENTAGE / 100.0)
+        position_margin = max(position_margin, config.MIN_MARGIN_PER_TRADE)
+        position_margin = min(position_margin, config.MAX_MARGIN_PER_TRADE)
+
+        # --- Get session-aware dynamic parameters (NEW) ---
+        dyn = self._get_dynamic_params(data_manager, current_price, now_sec)
+        slippage_ticks = dyn["slippage_ticks"]
+        profit_roi = dyn["profit_roi"]
+        stop_roi = dyn["stop_roi"]
 
         # Limit price: slightly better than current (slippage-aware)
         tick = config.TICK_SIZE
         if side == "long":
-            limit_price = current_price - (config.SLIPPAGE_TICKS_ASSUMED * tick)
+            limit_price = current_price - (slippage_ticks * tick)
         else:
-            limit_price = current_price + (config.SLIPPAGE_TICKS_ASSUMED * tick)
+            limit_price = current_price + (slippage_ticks * tick)
 
         if limit_price <= 0:
             logger.error(f"Computed invalid limit_price={limit_price:.2f}")
@@ -1176,40 +1310,47 @@ class ZScoreIcebergHunterStrategy:
         side_str = "BUY" if side == "long" else "SELL"
 
         # ------------------------------------------------------------------
-        # TP/SL from margin-based price movement (your Excel logic)
-        #
-        # profit_usdt   = margin * PROFIT_TARGET_ROI
-        # loss_usdt     = margin * |STOP_LOSS_ROI|
-        # qty           = (margin * leverage) / entry_price
-        # price_move_tp = profit_usdt / qty
-        # price_move_sl = loss_usdt / qty
-        # Long:  TP = entry + move_tp, SL = entry - move_sl
-        # Short: TP = entry - move_tp, SL = entry + move_sl
+        # TP/SL from margin-based price movement - EXACT ROE% calculation
+        # Uses EXACT prices (NO ROUNDING) to hit precise 5%/10%/3% ROE targets
         # ------------------------------------------------------------------
-        profit_usdt = position_margin * config.PROFIT_TARGET_ROI
-        loss_usdt = position_margin * abs(config.STOP_LOSS_ROI)
+        # Target profit/loss in USDT based on margin ROE%
+        half_profit_usdt = position_margin * (profit_roi / 2.0)  # 5% for half TP
+        full_profit_usdt = position_margin * profit_roi  # 10% for full TP
+        loss_usdt = position_margin * abs(stop_roi)  # 3% for SL
 
         if quantity <= 0:
             logger.error("Invalid quantity for TP/SL computation")
             return
 
-        price_move_tp = profit_usdt / quantity
-        price_move_sl = loss_usdt / quantity
+        # Calculate price moves needed to hit ROE% targets
+        half_tp_move = half_profit_usdt / quantity
+        full_tp_move = full_profit_usdt / quantity
+        sl_move = loss_usdt / quantity
 
+        # Calculate TP/SL prices and round to tick size for exchange
+        tick = config.TICKSIZE
         if side == "long":
-            full_tp_price = limit_price + price_move_tp
-            sl_price = limit_price - price_move_sl
+            half_tp_price = round((limit_price + half_tp_move) / tick) * tick
+            full_tp_price = round((limit_price + full_tp_move) / tick) * tick
+            sl_price = round((limit_price - sl_move) / tick) * tick
         else:
-            full_tp_price = limit_price - price_move_tp
-            sl_price = limit_price + price_move_sl
+            half_tp_price = round((limit_price - half_tp_move) / tick) * tick
+            full_tp_price = round((limit_price - full_tp_move) / tick) * tick
+            sl_price = round((limit_price + sl_move) / tick) * tick
 
-        # Initial HALF TP uses half the profit on margin
-        half_profit_usdt = profit_usdt * 0.5
-        half_move_tp = half_profit_usdt / quantity
-        if side == "long":
-            half_tp_price = limit_price + half_move_tp
-        else:
-            half_tp_price = limit_price - half_move_tp
+        # Verify actual ROE% after rounding to tick size
+        actual_half_profit = abs(half_tp_price - limit_price) * quantity
+        actual_full_profit = abs(full_tp_price - limit_price) * quantity
+        actual_loss = abs(sl_price - limit_price) * quantity
+
+        half_roe = (actual_half_profit / position_margin) * 100.0
+        full_roe = (actual_full_profit / position_margin) * 100.0
+        sl_roe = (actual_loss / position_margin) * 100.0
+
+        logger.info(
+            f"TP/SL ROE verification: Half TP={half_roe:.2f}%, "
+            f"Full TP={full_roe:.2f}%, SL={sl_roe:.2f}%"
+        )
 
         logger.info("-" * 80)
         logger.info(f"Z-SCORE ICEBERG ENTRY BRACKET {trade_id}")
@@ -1217,6 +1358,8 @@ class ZScoreIcebergHunterStrategy:
         logger.info(f"Side         : {side.upper()}")
         logger.info(f"Current Price: {current_price:.2f}")
         logger.info(f"Limit Price  : {limit_price:.2f}")
+        logger.info(f"Session      : {dyn['session']} (major={dyn['is_major']}, weekend={dyn['is_weekend']})")
+        logger.info(f"Dynamic Params: slip={slippage_ticks} ticks, TP_ROI={profit_roi*100:.2f}%, SL_ROI={stop_roi*100:.2f}%")
         logger.info(f"Imbalance    : {imbalance_data['imbalance']:.3f}")
         logger.info(
             "Wall Strength: bid={:.2f}, ask={:.2f}".format(
@@ -1252,12 +1395,12 @@ class ZScoreIcebergHunterStrategy:
 
         if ema_val is None:
             logger.info(
-                f"EMA{config.EMA_PERIOD} : MISSING (not enough history)"
+                f"EMA{config.EMA_PERIOD}      : MISSING (not enough history)"
             )
         else:
             trend_dir = "UP" if current_price > ema_val else "DOWN"
             logger.info(
-                f"EMA{config.EMA_PERIOD} : {ema_val:.2f} | trend={trend_dir}"
+                f"EMA{config.EMA_PERIOD}      : {ema_val:.2f} | trend={trend_dir}"
             )
 
         logger.info(
@@ -1274,28 +1417,40 @@ class ZScoreIcebergHunterStrategy:
         if not main_order or "order_id" not in main_order:
             logger.error("Main LIMIT order placement failed")
             return
+
         main_order_id = main_order["order_id"]
         logger.info(f"Main LIMIT order id: {main_order_id}")
 
-        # 2) Place HALF TP and SL as separate orders
+        # 2) Place HALF TP (initial take-profit)
         if side == "long":
             tp_side = "SELL"
-            sl_side = "SELL"
         else:
             tp_side = "BUY"
-            sl_side = "BUY"
 
         tp_order = order_manager.place_take_profit(
             side=tp_side,
-            quantity=quantity / 2.0,
+            quantity=quantity,
             trigger_price=half_tp_price,
         )
         if not tp_order or "order_id" not in tp_order:
-            logger.error("Initial HALF TP order placement failed; cancelling main")
-            order_manager.cancel_order(main_order_id)
+            logger.error("TP order placement failed; cancelling main order")
+            try:
+                order_manager.cancel_order(main_order_id)
+            except Exception as e:
+                logger.error(
+                    f"Error cancelling main order {main_order_id}: {e}",
+                    exc_info=True,
+                )
             return
+
         tp_order_id = tp_order["order_id"]
-        logger.info(f"Initial HALF TP order id: {tp_order_id}")
+        logger.info(f"Initial HALF TP order id: {tp_order_id} @ {half_tp_price:.2f}")
+
+        # 3) Place SL (stop-loss)
+        if side == "long":
+            sl_side = "SELL"
+        else:
+            sl_side = "BUY"
 
         sl_order = order_manager.place_stop_loss(
             side=sl_side,
@@ -1303,12 +1458,19 @@ class ZScoreIcebergHunterStrategy:
             trigger_price=sl_price,
         )
         if not sl_order or "order_id" not in sl_order:
-            logger.error("SL order placement failed; cancelling main+TP")
-            order_manager.cancel_order(main_order_id)
-            order_manager.cancel_order(tp_order_id)
+            logger.error("SL order placement failed; cancelling main + TP")
+            try:
+                order_manager.cancel_order(tp_order_id)
+                order_manager.cancel_order(main_order_id)
+            except Exception as e:
+                logger.error(
+                    f"Error cancelling main/TP after SL failure: {e}",
+                    exc_info=True,
+                )
             return
+
         sl_order_id = sl_order["order_id"]
-        logger.info(f"SL order id: {sl_order_id}")
+        logger.info(f"SL order id: {sl_order_id} @ {sl_price:.2f}")
 
         # Reward/Risk logging with FULL TP
         reward = 0.0
@@ -1322,21 +1484,27 @@ class ZScoreIcebergHunterStrategy:
 
         if risk > 0 and reward > 0:
             rr = reward / risk
-            logger.info(f"RR (FULL TP): {reward:.2f}/{risk:.2f} = {rr:.2f}:1")
+            logger.info(
+                f"RR FULL TP   : reward={reward:.2f}, risk={risk:.2f}, RR={rr:.2f}:1"
+            )
         else:
-            logger.info("RR: N/A (check TP/SL configuration)")
+            logger.info("RR FULL TP   : N/A (check TP/SL configuration)")
 
         logger.info(
             f"Initial HALF TP: {half_tp_price:.2f} "
-            f"(+{config.PROFIT_TARGET_ROI * 50:.2f}% on margin)"
+            f"({profit_roi * 50:.2f}% on margin)"
         )
         logger.info(
-            f"FULL TP target: {full_tp_price:.2f} "
-            f"(+{config.PROFIT_TARGET_ROI * 100:.2f}% on margin)"
+            f"FULL TP target : {full_tp_price:.2f} "
+            f"({profit_roi * 100:.2f}% on margin)"
         )
-        logger.info(f"SL Price      : {sl_price:.2f}")
+        logger.info(f"SL Price       : {sl_price:.2f}")
 
         # Store position
+        htf_trend_at_entry_safe = (
+            htf_trend_at_entry if htf_trend_at_entry is not None else "UNKNOWN"
+        )
+
         self.current_position = ZScorePosition(
             trade_id=trade_id,
             side=side,
@@ -1360,78 +1528,173 @@ class ZScoreIcebergHunterStrategy:
             main_order_id=main_order_id,
             main_filled=False,
             tp_reduced=False,
-            entry_htf_trend=htf_trend_at_entry or "UNKNOWN",
+            entry_htf_trend=htf_trend_at_entry_safe,
         )
 
+        # Record trade opened in risk manager
         risk_manager.record_trade_opened()
 
         # Telegram trade-entry notification (rich)
         try:
+            atr_str = f"{dyn['atr_pct']*100:.2f}%" if dyn['atr_pct'] else "N/A"
             msg_lines = [
                 "✅ Z-Score trade OPENED",
                 f"Trade ID: {trade_id}",
                 f"Symbol: {config.SYMBOL}",
                 f"Side: {side.upper()} | Qty: {quantity:.6f} BTC",
-                f"Limit price: {limit_price:.2f} | Current: {current_price:.2f}",
+                f"Limit price: {limit_price:.2f} (Current: {current_price:.2f})",
+                f"Session: {dyn['session']} (ATR: {atr_str})",
                 f"Margin: {position_margin:.2f} USDT | Lev: {config.LEVERAGE}x",
-                f"TP½: {half_tp_price:.2f} | TP full: {full_tp_price:.2f} | SL: {sl_price:.2f}",
-                f"Imbalance: {imbalance_data['imbalance']:.3f} | "
-                f"Z-score: {delta_data['z_score']:.2f} | "
-                f"Walls bid/ask: {wall_data['bid_wall_strength']:.1f}/"
-                f"{wall_data['ask_wall_strength']:.1f}",
+                f"TP (half): {half_tp_price:.2f} | TP (full): {full_tp_price:.2f}",
+                f"SL: {sl_price:.2f}",
+                f"Imbalance: {imbalance_data['imbalance']:.3f}",
+                f"Z-score: {delta_data['z_score']:.2f}",
+                f"Walls (bid/ask): {wall_data['bid_wall_strength']:.1f} / {wall_data['ask_wall_strength']:.1f}",
             ]
             if oracle_fused is not None:
                 msg_lines.append(f"Aether fused: {oracle_fused:.3f}")
             if htf_trend_at_entry is not None:
                 msg_lines.append(f"HTF trend: {htf_trend_at_entry}")
+
             send_telegram_message("\n".join(msg_lines))
         except Exception as e:
-            logger.error(f"Failed to send Telegram entry notification: {e}", exc_info=True)
+            logger.error(
+                f"Failed to send Telegram entry notification: {e}", exc_info=True
+            )
+
+    # ======================================================================
+    # Position management (TP/SL, timeouts, TP extension and tightening)
+    # ======================================================================
+    def _is_filled(self, order_status: Optional[Dict]) -> bool:
+        """Check if order status indicates filled/executed state."""
+        if order_status is None:
+            return False
+        status = order_status.get("status", "").upper()
+        return status in ("FILLED", "EXECUTED")
 
     def _manage_open_position(
-        self,
-        data_manager,
-        order_manager,
-        risk_manager,
-        current_price: float,
-        now_sec: float,
+        self, data_manager, order_manager, risk_manager, current_price: float, now_sec: float
     ) -> None:
         """
         Manage an open position by tracking main/TP/SL status.
-        - If main LIMIT is not filled within ENTRY_FILL_TIMEOUT_SEC,
-          cancel main, TP, SL.
-        - Start with HALF TP at entry; after 5 minutes, if still in trade
-          and TP not hit, extend TP to FULL target stored in pos.tp_price.
+        - If main LIMIT is not filled within ENTRY_FILL_TIMEOUT_SEC, cancel main, TP, SL.
+        - Start with HALF TP at entry; after 5 minutes, if still in trade and TP not hit,
+        extend TP to FULL target stored in pos.tp_price.
+        - Dynamic TP tightening if trade stagnates in low volatility (session-aware).
         - No market close orders are sent; exits are via TP/SL.
         """
         pos = self.current_position
         if pos is None:
             return
 
-        # Throttle order-status polling to avoid hitting rate limits
+        elapsed_min = (now_sec - pos.entry_time_sec) / 60.0
+        if elapsed_min >= config.MAX_HOLD_MINUTES:
+            if not hasattr(pos, "max_hold_logged"):
+                pos.max_hold_logged = True
+                logger.info(
+                    f"Max hold {config.MAX_HOLD_MINUTES}min reached for {pos.trade_id} - "
+                    f"leaving exit to TP/SL (no forced market close)."
+                )
+
+        # ======================================================================
+        # TIMEOUT: Cancel bracket if main LIMIT not filled in 60s
+        # ======================================================================
+        if not pos.main_filled:
+            elapsed = now_sec - pos.entry_time_sec
+            if elapsed >= self.ENTRY_FILL_TIMEOUT_SEC:
+                logger.info(
+                    f"Main LIMIT not filled in {self.ENTRY_FILL_TIMEOUT_SEC:.0f}s "
+                    f"for trade {pos.trade_id} - cancelling main, TP, and SL."
+                )
+                try:
+                    if pos.tp_order_id:
+                        order_manager.cancel_order(pos.tp_order_id)
+                    if pos.sl_order_id:
+                        order_manager.cancel_order(pos.sl_order_id)
+                    if pos.main_order_id:
+                        order_manager.cancel_order(pos.main_order_id)
+                except Exception as e:
+                    logger.error(
+                        f"Error cancelling bracket for {pos.trade_id}: {e}", exc_info=True
+                    )
+                self.current_position = None
+                self.last_exit_time_min = now_sec / 60.0
+                return
+
+        # ======================================================================
+        # PERIODIC POSITION LOGGING (every 2 minutes)
+        # ======================================================================
+        if now_sec - self._last_position_log_sec >= self.POSITION_LOG_INTERVAL_SEC:
+            self._last_position_log_sec = now_sec
+            direction = 1.0 if pos.side == "long" else -1.0
+            upnl = (current_price - pos.entry_price) * direction * pos.quantity
+            elapsed_min_log = (now_sec - pos.entry_time_sec) / 60.0
+            logger.info(
+                f"[POSITION] {pos.trade_id} {pos.side.upper()} qty={pos.quantity:.6f} "
+                f"entry={pos.entry_price:.2f} cur={current_price:.2f} "
+                f"uPnL≈{upnl:.2f} USDT, elapsed={elapsed_min_log:.1f} min"
+            )
+
+        # ======================================================================
+        # TP EXTENSION: Switch from HALF to FULL after 5 minutes (NON-THROTTLED)
+        # ======================================================================
+        if pos.main_filled and not pos.tp_reduced:
+            elapsed_min_for_tp = (now_sec - pos.entry_time_sec) / 60.0
+            if elapsed_min_for_tp >= 5.0:
+                logger.info(
+                    f"Considering TP EXTENSION to FULL for {pos.trade_id} "
+                    f"(elapsed={elapsed_min_for_tp:.1f} min), full TP={pos.tp_price:.2f}"
+                )
+                if pos.quantity <= 0:
+                    logger.error(f"Invalid quantity for TP extension on {pos.trade_id}")
+                    pos.tp_reduced = True
+                    return
+
+                if pos.side == "long":
+                    tp_side = "SELL"
+                else:
+                    tp_side = "BUY"
+
+                try:
+                    if pos.tp_order_id:
+                        order_manager.cancel_order(pos.tp_order_id)
+                except Exception as e:
+                    logger.error(
+                        f"Error cancelling HALF TP {pos.tp_order_id}: {e}", exc_info=True
+                    )
+
+                try:
+                    new_tp_order = order_manager.place_take_profit(
+                        side=tp_side,
+                        quantity=pos.quantity,
+                        trigger_price=pos.tp_price,
+                    )
+                    if new_tp_order and "order_id" in new_tp_order:
+                        pos.tp_order_id = new_tp_order["order_id"]
+                        pos.tp_reduced = True
+                        logger.info(
+                            f"✓ New FULL TP placed for {pos.trade_id} @ {pos.tp_price:.2f}, "
+                            f"order_id={pos.tp_order_id}"
+                        )
+                    else:
+                        logger.error(
+                            f"Failed to place FULL TP for {pos.trade_id} - "
+                            f"leaving position without active TP."
+                        )
+                        pos.tp_reduced = True
+                except Exception as e:
+                    logger.error(
+                        f"Error placing FULL TP for {pos.trade_id}: {e}", exc_info=True
+                    )
+                    pos.tp_reduced = True
+
+        # ======================================================================
+        # THROTTLED ORDER STATUS CHECKS (main/TP/SL fills)
+        # ======================================================================
         if now_sec - self._last_status_check_sec < self.ORDER_STATUS_CHECK_INTERVAL_SEC:
             return
         self._last_status_check_sec = now_sec
 
-        def _is_filled(order: Optional[Dict]) -> bool:
-            if not order:
-                return False
-            status = str(order.get("status", "")).upper()
-            exec_qty_str = (
-                order.get("exec_quantity")
-                or order.get("executed_qty")
-                or order.get("cum_exec_qty")
-            )
-            try:
-                exec_qty = float(exec_qty_str) if exec_qty_str is not None else 0.0
-            except Exception:
-                exec_qty = 0.0
-            return (
-                status in ("EXECUTED", "FILLED", "PARTIALLY_EXECUTED")
-                and exec_qty > 0
-            )
-
-        # Fetch main/TP/SL statuses once
         main_status: Optional[Dict] = None
         tp_status: Optional[Dict] = None
         sl_status: Optional[Dict] = None
@@ -1444,127 +1707,132 @@ class ZScoreIcebergHunterStrategy:
                 sl_status = order_manager.get_order_status(pos.sl_order_id)
         except Exception as e:
             logger.error(
-                f"Error fetching order status for {pos.trade_id}: {e}",
-                exc_info=True,
+                f"Error fetching order status for {pos.trade_id}: {e}", exc_info=True
             )
             return
 
-        # Main fill detection
+        # ======================================================================
+        # MAIN FILL DETECTION
+        # ======================================================================
         if not pos.main_filled and main_status is not None:
-            if _is_filled(main_status):
+            if self._is_filled(main_status):
                 pos.main_filled = True
-                logger.info(f"Main LIMIT filled for {pos.trade_id}")
+                logger.info(f"✓ Main LIMIT filled for {pos.trade_id}")
 
-        # Timeout for main
-        if not pos.main_filled:
-            elapsed = now_sec - pos.entry_time_sec
-            if elapsed >= self.ENTRY_FILL_TIMEOUT_SEC:
-                logger.info(
-                    f"Main LIMIT not filled in {self.ENTRY_FILL_TIMEOUT_SEC:.0f}s "
-                    f"for trade {pos.trade_id}; cancelling main, TP, and SL."
-                )
-                try:
-                    if pos.tp_order_id:
-                        order_manager.cancel_order(pos.tp_order_id)
-                    if pos.sl_order_id:
-                        order_manager.cancel_order(pos.sl_order_id)
-                    if pos.main_order_id:
-                        order_manager.cancel_order(pos.main_order_id)
-                except Exception as e:
-                    logger.error(
-                        f"Error cancelling bracket for {pos.trade_id}: {e}",
-                        exc_info=True,
-                    )
-                self.current_position = None
-                self.last_exit_time_min = now_sec / 60.0
-                return
-
-        # Check TP/SL fills
+        # ======================================================================
+        # TP/SL EXIT DETECTION
+        # ======================================================================
         exit_reason: Optional[str] = None
         exit_order: Optional[Dict] = None
-        if _is_filled(tp_status):
-            exit_reason = "TP HIT (exchange TP)"
+        if self._is_filled(tp_status):
+            exit_reason = "TP_HIT"
             exit_order = tp_status
-        elif _is_filled(sl_status):
-            exit_reason = "SL HIT (exchange SL)"
+        elif self._is_filled(sl_status):
+            exit_reason = "SL_HIT"
             exit_order = sl_status
 
-        if exit_order is None:
-            # Consider TP extension to FULL after 5 minutes
-            if pos.main_filled and not pos.tp_reduced:
-                elapsed_min = (now_sec - pos.entry_time_sec) / 60.0
-                if elapsed_min >= 5.0:
-                    logger.info(
-                        f"Considering TP EXTENSION to FULL for {pos.trade_id} "
-                        f"(elapsed={elapsed_min:.1f} min, full TP={pos.tp_price:.2f})"
+        if exit_order is not None:
+            try:
+                exit_price = order_manager.extract_fill_price(exit_order)
+            except Exception as e:
+                logger.error(
+                    f"Failed to extract exit price for {pos.trade_id}: {e}", exc_info=True
+                )
+                return
+
+            self._finalize_exit(
+                order_manager=order_manager,
+                risk_manager=risk_manager,
+                exit_price_live=exit_price,
+                exit_order=exit_order,
+                entry_order=main_status,
+                reason=exit_reason,
+                now_sec=now_sec,
+            )
+
+        # ======================================================================
+        # DYNAMIC TP TIGHTENING (session/volatility aware) - OPTIONAL
+        # ======================================================================
+        if (
+            getattr(config, "ENABLE_TP_TIGHTENING", False)
+            and pos.main_filled
+            and pos.tp_reduced  # only after full TP extension logic
+        ):
+            elapsed_min_dyn = (now_sec - pos.entry_time_sec) / 60.0
+            if elapsed_min_dyn >= config.DYNAMIC_TP_MINUTES:
+                atr_pct = None
+                try:
+                    atr_pct = data_manager.get_atr_percent()
+                except Exception:
+                    pass
+
+                direction = 1.0 if pos.side == "long" else -1.0
+                upnl_price = (current_price - pos.entry_price) * direction * pos.quantity
+                upnl_roi = (
+                    upnl_price / pos.margin_used if pos.margin_used > 0 else 0.0
+                )
+                full_tp_roi = config.PROFIT_TARGET_ROI
+
+                if (
+                    atr_pct is not None
+                    and atr_pct < config.DYNAMIC_TP_MIN_ATR_PCT
+                    and upnl_roi < full_tp_roi * config.DYNAMIC_TP_REQUIRED_PROGRESS
+                ):
+                    new_tp_roi = config.DYNAMIC_TP_NEAR_ROI
+                    new_profit_usdt = pos.margin_used * new_tp_roi
+                    new_move_tp = (
+                        new_profit_usdt / pos.quantity if pos.quantity > 0 else 0.0
                     )
-                    if pos.quantity <= 0:
-                        logger.error(
-                            f"Invalid quantity for TP extension on {pos.trade_id}"
-                        )
-                        pos.tp_reduced = True
-                        return
 
                     if pos.side == "long":
-                        tp_side = "SELL"
+                        new_tp_price = pos.entry_price + new_move_tp
+                        tp_side_dyn = "SELL"
                     else:
-                        tp_side = "BUY"
+                        new_tp_price = pos.entry_price - new_move_tp
+                        tp_side_dyn = "BUY"
+
+                    logger.info(
+                        f"Dynamic TP tightening for {pos.trade_id} "
+                        f"(elapsed={elapsed_min_dyn:.1f}m, atr={atr_pct}, "
+                        f"uROI={upnl_roi:.4f}, new_tp_roi={new_tp_roi:.4f}, "
+                        f"new_tp_price={new_tp_price:.2f})"
+                    )
 
                     try:
                         if pos.tp_order_id:
                             order_manager.cancel_order(pos.tp_order_id)
                     except Exception as e:
                         logger.error(
-                            f"Error cancelling HALF TP {pos.tp_order_id}: {e}",
+                            f"Error cancelling old TP {pos.tp_order_id} for {pos.trade_id}: {e}",
                             exc_info=True,
                         )
 
                     try:
-                        new_tp_order = order_manager.place_take_profit(
-                            side=tp_side,
+                        new_tp_order_dyn = order_manager.place_take_profit(
+                            side=tp_side_dyn,
                             quantity=pos.quantity,
-                            trigger_price=pos.tp_price,
+                            trigger_price=new_tp_price,
                         )
-                        if new_tp_order and "order_id" in new_tp_order:
-                            pos.tp_order_id = new_tp_order["order_id"]
-                            pos.tp_reduced = True
+                        if new_tp_order_dyn and "order_id" in new_tp_order_dyn:
+                            pos.tp_order_id = new_tp_order_dyn["order_id"]
                             logger.info(
-                                f"New FULL TP placed for {pos.trade_id} "
-                                f"@ {pos.tp_price:.2f}, order_id={pos.tp_order_id}"
+                                f"New tightened TP placed for {pos.trade_id} @ {new_tp_price:.2f}, "
+                                f"order_id={pos.tp_order_id}"
                             )
                         else:
                             logger.error(
-                                f"Failed to place FULL TP for {pos.trade_id}; "
-                                f"leaving position without active TP."
+                                f"Failed to place tightened TP for {pos.trade_id} "
+                                f"at {new_tp_price:.2f}"
                             )
-                            pos.tp_reduced = True
                     except Exception as e:
                         logger.error(
-                            f"Error placing FULL TP for {pos.trade_id}: {e}",
+                            f"Error placing tightened TP for {pos.trade_id}: {e}",
                             exc_info=True,
                         )
-                        pos.tp_reduced = True
-            return
 
-        # Exit logic
-        try:
-            exit_price = order_manager.extract_fill_price(exit_order)
-        except Exception as e:
-            logger.error(
-                f"Failed to extract exit price for {pos.trade_id}: {e}",
-                exc_info=True,
-            )
-            return
-
-        self._finalize_exit(
-            order_manager=order_manager,
-            risk_manager=risk_manager,
-            exit_price_live=exit_price,
-            exit_order=exit_order,
-            entry_order=main_status,
-            reason=exit_reason,
-            now_sec=now_sec,
-        )
+    # ======================================================================
+    # Finalize exit
+    # ======================================================================
 
     def _finalize_exit(
         self,
@@ -1595,17 +1863,18 @@ class ZScoreIcebergHunterStrategy:
 
         pnl_gross = (exit_price_real - pos.entry_price) * direction * pos.quantity
         pnl_usdt_real = pnl_gross - total_fees
+
         duration_min = (now_sec - pos.entry_time_sec) / 60.0
 
         logger.info("=" * 80)
         logger.info(f"EXITING Z-SCORE POSITION {pos.trade_id}")
-        logger.info(f"Reason : {reason}")
-        logger.info(f"Side   : {pos.side.upper()}")
-        logger.info(f"Entry Price: {pos.entry_price:.2f}")
-        logger.info(f"Exit Price : {exit_price_real:.2f}")
-        logger.info(f"Quantity   : {pos.quantity:.6f}")
-        logger.info(f"Fees (USDT): {total_fees:.4f}")
-        logger.info(f"P&L (USDT) : {pnl_usdt_real:.2f}")
+        logger.info(f"Reason       : {reason}")
+        logger.info(f"Side         : {pos.side.upper()}")
+        logger.info(f"Entry Price  : {pos.entry_price:.2f}")
+        logger.info(f"Exit Price   : {exit_price_real:.2f}")
+        logger.info(f"Quantity     : {pos.quantity:.6f}")
+        logger.info(f"Fees (USDT)  : {total_fees:.4f}")
+        logger.info(f"P&L (USDT)   : {pnl_usdt_real:.2f}")
         logger.info("=" * 80)
 
         # Update risk statistics
@@ -1654,9 +1923,11 @@ class ZScoreIcebergHunterStrategy:
                 win_rate = 0.0
 
             outcome = (
-                "WIN" if pnl_usdt_real > 0 else
-                "LOSS" if pnl_usdt_real < 0 else
-                "BREAKEVEN"
+                "WIN"
+                if pnl_usdt_real > 0
+                else "LOSS"
+                if pnl_usdt_real < 0
+                else "BREAKEVEN"
             )
 
             msg_lines = [
@@ -1676,8 +1947,10 @@ class ZScoreIcebergHunterStrategy:
             ]
             send_telegram_message("\n".join(msg_lines))
         except Exception as e:
-            logger.error(f"Failed to send Telegram exit notification: {e}", exc_info=True)
+            logger.error(
+                f"Failed to send Telegram exit notification: {e}", exc_info=True
+            )
 
-        # Reset state
+        # Clear current position
         self.current_position = None
         self.last_exit_time_min = now_sec / 60.0

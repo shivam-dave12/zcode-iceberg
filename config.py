@@ -41,7 +41,7 @@ LEVERAGE = 25
 BALANCE_USAGE_PERCENTAGE = 30  # Use 30% of margin per trade
 
 # Per-trade margin bounds (USDT)
-MIN_MARGIN_PER_TRADE = 4       # Minimum margin (USDT)
+MIN_MARGIN_PER_TRADE = 4  # Minimum margin (USDT)
 MAX_MARGIN_PER_TRADE = 10_000  # Safety cap (USDT)
 
 # Legacy HF fields kept for compatibility with other modules (not used directly
@@ -57,8 +57,8 @@ TAKE_PROFIT_PERCENTAGE = 0.10
 # Strategy operates on tick / depth data; candles are only for HTF/LTF trend,
 # ATR, and Oracle features.
 TIMEFRAME = "tick"
-CANDLE_INTERVAL = 1           # Used for orderbook pair name only
-CANDLE_LIMIT = 200            # Not used directly by strategy
+CANDLE_INTERVAL = 1  # Used for orderbook pair name only
+CANDLE_LIMIT = 200  # Not used directly by strategy
 MIN_CANDLES_FOR_TRADING = 50  # Not used by current strategy logic
 
 # Core tick loop sleep in main.py
@@ -83,12 +83,10 @@ MAX_DAILY_LOSS = 2_000  # Daily loss cap (USDT)
 # ============================================================================
 
 LOG_LEVEL = "INFO"
-
 ENABLE_EXCEL_LOGGING = True
 EXCEL_LOG_FILE = "zscore_iceberg_hunter_log.xlsx"
-
-ENABLE_TRADING = True          # Hard on/off switch for live order placement
-AUTO_CLOSE_ON_ERROR = True     # Emergency flat on critical failure
+ENABLE_TRADING = True  # Hard on/off switch for live order placement
+AUTO_CLOSE_ON_ERROR = True  # Emergency flat on critical failure
 EMERGENCY_STOP_ENABLED = True  # Global kill-switch support
 
 # API rate limits – used by infrastructure layers, not strategy math directly.
@@ -107,13 +105,13 @@ TICK_SIZE = 1.0
 WALL_DEPTH_LEVELS = 20
 
 # Imbalance threshold:
-# imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)
-# bid share = (imbalance + 1) / 2
-# IMBALANCE_THRESHOLD = 0.65 ≈ 82% bid share
+#   imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)
+#   bid share = (imbalance + 1) / 2
+#   IMBALANCE_THRESHOLD = 0.65 ≈ 82% bid share
 IMBALANCE_THRESHOLD = 0.65
 
 # Delta Z-score threshold (aggressor pressure)
-DELTA_Z_THRESHOLD = 2.8
+DELTA_Z_THRESHOLD = 2.5
 
 # Taker delta window (seconds)
 DELTA_WINDOW_SEC = 10
@@ -128,8 +126,8 @@ PRICE_TOUCH_THRESHOLD_TICKS = 4
 MIN_WALL_VOLUME_MULT = 4.2
 
 # Exit thresholds (ROI on margin)
-PROFIT_TARGET_ROI = 0.10   # +10.0% on margin
-STOP_LOSS_ROI = -0.03      # -3.0% on margin
+PROFIT_TARGET_ROI = 0.10  # +10.0% on margin
+STOP_LOSS_ROI = -0.03  # -3.0% on margin
 
 # Wall degradation exit (fraction of entry wall volume)
 WALL_DEGRADE_EXIT = 0.0005
@@ -138,7 +136,7 @@ WALL_DEGRADE_EXIT = 0.0005
 MAX_HOLD_MINUTES = 10
 
 # Entry slippage assumption (ticks)
-SLIPPAGE_TICKS_ASSUMED = 2
+SLIPPAGE_TICKS_ASSUMED = 1
 
 # Population statistics window for Z-score (seconds) – used by strategy.py
 Z_SCORE_POPULATION_SEC = 360
@@ -164,7 +162,7 @@ MAX_ATR_PERCENT = 0.015
 HTF_TREND_INTERVAL = 5  # 5-minute chart
 
 # EMA span for HTF trend calculation (smoother, more robust)
-HTF_EMA_SPAN = 34       # Was 25
+HTF_EMA_SPAN = 34  # Was 25
 
 # Number of HTF bars to analyze for trend (REDUCED for quicker response)
 HTF_LOOKBACK_BARS = 24  # Was 48; ~2hrs for quicker response
@@ -202,6 +200,41 @@ MAKER_FEE_RATE = 0.0003
 TAKER_FEE_RATE = 0.00065
 
 # ============================================================================
+# SESSION + VOLATILITY-AWARE DYNAMIC PARAMETERS (NEW)
+# ============================================================================
+
+# Session windows in UTC hours: (start_hour, end_hour) — 24h clock, 
+# inclusive of start, exclusive of end
+ASIA_SESSION_UTC = (0, 8)        # 00:00–08:00 UTC
+LONDON_SESSION_UTC = (8, 16)     # 08:00–16:00 UTC
+NEW_YORK_SESSION_UTC = (16, 24)  # 16:00–24:00 UTC
+
+# Dynamic behaviour switches
+ENABLE_SESSION_DYNAMIC_PARAMS = True
+ENABLE_TP_TIGHTENING = True
+
+# Session-mode defaults (major sessions: Asia, London, New York)
+SESSION_SLIPPAGE_TICKS = 1           # 1–2 ticks in major sessions
+SESSION_PROFIT_TARGET_ROI = 0.10     # 10% TP
+SESSION_STOP_LOSS_ROI = -0.03        # -3% SL
+
+# Off-session / low-volatility bounds
+MIN_ATR_PCT_FOR_FULL_TP = 0.005      # 0.5% ATR ~ enough juice for full 10% RR
+VERY_LOW_ATR_PCT = 0.002             # Very quiet conditions; use near TP and minimal slippage
+
+OFFSESSION_SLIPPAGE_TICKS_LOW_VOL = 0  # Minimal slippage when ATR is very low
+OFFSESSION_SLIPPAGE_TICKS_BASE = 1     # Base slippage for off-session
+
+OFFSESSION_FULL_TP_ROI = 0.08        # Example: cap at 8% in dead hours (optional)
+OFFSESSION_NEAR_TP_ROI = 0.06        # Example: 6% TP when ATR is extremely low
+
+# TP tightening after stagnation (must be <= MAX_HOLD_MINUTES to be reachable)
+DYNAMIC_TP_MINUTES = 60              # Check for TP tightening after 60 min
+DYNAMIC_TP_NEAR_ROI = 0.06           # e.g. tighten to 6% when >50% TP is already reached
+DYNAMIC_TP_REQUIRED_PROGRESS = 0.5   # 50% of full TP before tightening
+DYNAMIC_TP_MIN_ATR_PCT = 0.003       # Consider "no volatility" below this ATR%
+
+# ============================================================================
 # DISPLAY
 # ============================================================================
 
@@ -234,4 +267,11 @@ print(f"    EMA Span: {HTF_EMA_SPAN}")
 print(f"    Lookback Bars: {HTF_LOOKBACK_BARS}")
 print(f"    Min Trend Slope: {MIN_TREND_SLOPE * 100:.2f}%")
 print(f"    Consistency Threshold: {CONSISTENCY_THRESHOLD * 100:.0f}%")
+print("")
+print("  SESSION + VOLATILITY DYNAMICS:")
+print(f"    Enabled: {ENABLE_SESSION_DYNAMIC_PARAMS}")
+print(f"    Asia: {ASIA_SESSION_UTC[0]}:00–{ASIA_SESSION_UTC[1]}:00 UTC")
+print(f"    London: {LONDON_SESSION_UTC[0]}:00–{LONDON_SESSION_UTC[1]}:00 UTC")
+print(f"    New York: {NEW_YORK_SESSION_UTC[0]}:00–{NEW_YORK_SESSION_UTC[1]}:00 UTC")
+print(f"    TP Tightening: {ENABLE_TP_TIGHTENING} (after {DYNAMIC_TP_MINUTES}min)")
 print("=" * 80 + "\n")
