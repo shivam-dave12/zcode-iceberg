@@ -489,7 +489,7 @@ class ZScoreIcebergHunterStrategy:
                 )
             )
             logger.info(
-                "    â†’ long_ok={} (need â‰¥{:.2f}), short_ok={} (need â‰¤{:.2f})".format(
+                "    → long_ok={} (need ≥{:.2f}), short_ok={} (need ≤{:.2f})".format(
                     imbalance_data["long_ok"],
                     config.IMBALANCE_THRESHOLD,
                     imbalance_data["short_ok"],
@@ -511,7 +511,7 @@ class ZScoreIcebergHunterStrategy:
                 )
             )
             logger.info(
-                "    â†’ long_wall_ok={} (need â‰¥{:.2f}), short_wall_ok={} (need â‰¥{:.2f})".format(
+                "    → long_wall_ok={} (need ≥{:.2f}), short_wall_ok={} (need ≤{:.2f})".format(
                     wall_data["long_wall_ok"],
                     config.MIN_WALL_VOLUME_MULT,
                     wall_data["short_wall_ok"],
@@ -534,8 +534,8 @@ class ZScoreIcebergHunterStrategy:
                 )
             )
             logger.info(
-                "    â†’ pop_size={}, long_z_ok={} (need â‰¥{:.2f}), "
-                "short_z_ok={} (need â‰¤{:.2f})".format(
+                "    → pop_size={}, long_z_ok={} (need ≥{:.2f}), "
+                "short_z_ok={} (need ≤{:.2f})".format(
                     len(self._delta_population),
                     delta_data["long_ok"],
                     config.DELTA_Z_THRESHOLD,
@@ -558,8 +558,8 @@ class ZScoreIcebergHunterStrategy:
                 )
             )
             logger.info(
-                "    â†’ long_touch_ok={} (need â‰¤{} ticks), "
-                "short_touch_ok={} (need â‰¤{} ticks)".format(
+                "    → long_touch_ok={} (need ≤{} ticks), "
+                "short_touch_ok={} (need ≤{} ticks)".format(
                     touch_data["long_touch_ok"],
                     config.PRICE_TOUCH_THRESHOLD_TICKS,
                     touch_data["short_touch_ok"],
@@ -586,7 +586,7 @@ class ZScoreIcebergHunterStrategy:
                 f"price={current_price:.2f}"
             )
             logger.info(
-                f"    â†’ long_trend_ok={long_trend_ok}, short_trend_ok={short_trend_ok}"
+                f"    → long_trend_ok={long_trend_ok}, short_trend_ok={short_trend_ok}"
             )
 
         # HTF / LTF trend
@@ -1305,7 +1305,7 @@ class ZScoreIcebergHunterStrategy:
         if quantity <= 0 or quantity < 0.001:
             logger.warning(
                 f"Quantity raw={raw_quantity:.6f} too small after rounding "
-                f"â†’ {quantity:.6f}"
+                f"→ {quantity:.6f}"
             )
             return
 
@@ -1541,7 +1541,7 @@ class ZScoreIcebergHunterStrategy:
         try:
             atr_str = f"{dyn['atr_pct']*100:.2f}%" if dyn['atr_pct'] else "N/A"
             msg_lines = [
-                "âœ… Z-Score trade OPENED",
+                "✅ Z-Score trade OPENED",
                 f"Trade ID: {trade_id}",
                 f"Symbol: {config.SYMBOL}",
                 f"Side: {side.upper()} | Qty: {quantity:.6f} BTC",
@@ -1635,7 +1635,7 @@ class ZScoreIcebergHunterStrategy:
             logger.info(
                 f"[POSITION] {pos.trade_id} {pos.side.upper()} qty={pos.quantity:.6f} "
                 f"entry={pos.entry_price:.2f} cur={current_price:.2f} "
-                f"uPnLâ‰ˆ{upnl:.2f} USDT, elapsed={elapsed_min_log:.1f} min"
+                f"uPnL≈{upnl:.2f} USDT, elapsed={elapsed_min_log:.1f} min"
             )
 
         # ======================================================================
@@ -1676,7 +1676,7 @@ class ZScoreIcebergHunterStrategy:
                         pos.tp_order_id = new_tp_order["order_id"]
                         pos.tp_reduced = True
                         logger.info(
-                            f"âœ“ New FULL TP placed for {pos.trade_id} @ {pos.tp_price:.2f}, "
+                            f"✓ New FULL TP placed for {pos.trade_id} @ {pos.tp_price:.2f}, "
                             f"order_id={pos.tp_order_id}"
                         )
                     else:
@@ -1720,7 +1720,7 @@ class ZScoreIcebergHunterStrategy:
         if not pos.main_filled and main_status is not None:
             if self._is_filled(main_status):
                 pos.main_filled = True
-                logger.info(f"âœ“ Main LIMIT filled for {pos.trade_id}")
+                logger.info(f"✓ Main LIMIT filled for {pos.trade_id}")
 
         # ======================================================================
         # TP/SL EXIT DETECTION
@@ -1934,7 +1934,7 @@ class ZScoreIcebergHunterStrategy:
             )
 
             msg_lines = [
-                "âŒ Z-Score trade EXITED",
+                "❌ Z-Score trade EXITED",
                 f"Trade ID: {pos.trade_id}",
                 f"Reason: {reason}",
                 f"Side: {pos.side.upper()} | Qty: {pos.quantity:.6f} BTC",
