@@ -44,7 +44,7 @@ class RiskManager:
         self._balance_cache_ttl_sec: float = 5.0
         self._last_429_log: float = 0.0
 
-        logger.info("✓ RiskManager initialized")
+        logger.info("âœ“ RiskManager initialized")
 
     # ======================================================================
     # Trading permissions
@@ -208,10 +208,10 @@ class RiskManager:
 
         if pnl > 0:
             self.winning_trades += 1
-            logger.info(f"✓ Winning trade: ${pnl:.2f}")
+            logger.info(f"âœ“ Winning trade: ${pnl:.2f}")
         else:
             self.losing_trades += 1
-            logger.info(f"✗ Losing trade: ${pnl:.2f}")
+            logger.info(f"âœ— Losing trade: ${pnl:.2f}")
 
         logger.info(
             f"Daily stats: trades={self.daily_trades}, "

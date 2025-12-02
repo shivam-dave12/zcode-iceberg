@@ -1,4 +1,4 @@
-# aether_oracle.py
+#  aether_oracle.py
 
 import logging
 import math
@@ -73,8 +73,8 @@ class AetherOracle:
     ) -> Tuple[Optional[float], Optional[float], Optional[float], bool]:
         """
         Liquidity Velocity per TF:
-        LV = sum(volume) / (sum(|ΔP|) + ε)
-        Uses recent trades for volume and price window for ΔP.
+        LV = sum(volume) / (sum(|Î”P|) + Îµ)
+        Uses recent trades for volume and price window for Î”P.
         """
         def _lv_for_window(window_sec: int) -> Optional[float]:
             price_window = data_manager.get_price_window(window_seconds=window_sec)
@@ -112,7 +112,7 @@ class AetherOracle:
     def compute_norm_cvd(self, data_manager, window_sec: int) -> Optional[float]:
         """
         Footprint CVD in window_sec (typically 10s), normalized by volume:
-        NormCVD = (Σ Vol_i * side_sign_i) / (Σ Vol_i)
+        NormCVD = (Î£ Vol_i * side_sign_i) / (Î£ Vol_i)
         where side_sign = +1 buy, -1 sell.
         UPDATED: Returns 0.0 (Neutral) instead of None if valid orderbook exists
         but no trades occurred in the window.
@@ -135,7 +135,7 @@ class AetherOracle:
             if qty <= 0:
                 continue
             is_buyer_maker = bool(t.get("isBuyerMaker", False))
-            # On CoinSwitch streams, isBuyerMaker == False → aggressive buy
+            # On CoinSwitch streams, isBuyerMaker == False â†’ aggressive buy
             if not is_buyer_maker:
                 buy_vol += qty
             else:
@@ -189,12 +189,12 @@ class AetherOracle:
         Multi-TF SMC BOS alignment approximation.
         Builds synthetic OHLC from tick prices at 1m / 5m / 15m, then
         measures fraction of recent bars where price > H_i or price < L_i.
-        Uses a deeper historical tick window for each TF (10×TF minutes),
+        Uses a deeper historical tick window for each TF (10Ã—TF minutes),
         so BOS is available from real historical prices and then
         naturally rolls forward as new ticks arrive.
         Returns:
           None -> not enough data for a stable measure
-          0–1 -> BOS frequency alignment across TFs
+          0â€“1 -> BOS frequency alignment across TFs
         """
         try:
             import pandas as pd
@@ -336,7 +336,7 @@ class AetherOracle:
           - f1: CVD aligned with side (required)
           - f2: imbalance aligned with side (required)
           - f3: BOS alignment (optional)
-          - f4: Hurst excess (H - 0.5, ≥0) (optional)
+          - f4: Hurst excess (H - 0.5, â‰¥0) (optional)
         If norm_cvd or imbalance are missing, returns None (Bayes disabled).
         """
         if norm_cvd is None or imbalance_val is None:

@@ -101,11 +101,11 @@ class ZScoreDataManager:
         self._price_window: deque = deque(maxlen=50000)
         self._last_price: float = 0.0
 
-        # Native 5‑minute HTF candles: list of (ts_ms, close)
+        # Native 5â€‘minute HTF candles: list of (ts_ms, close)
         self._htf_5m_closes: deque = deque(maxlen=1000)
-        # Native 1‑minute LTF candles: list of (ts_ms, close)
+        # Native 1â€‘minute LTF candles: list of (ts_ms, close)
         self._ltf_1m_closes: deque = deque(maxlen=3000)
-        # Native 15‑minute BOS candles (for BOS alignment / 15m structure)
+        # Native 15â€‘minute BOS candles (for BOS alignment / 15m structure)
         self._bos_15m_closes: deque = deque(maxlen=1000)
 
         # LSTM models + training state
@@ -133,7 +133,7 @@ class ZScoreDataManager:
         self.stats: Dict = {
             "orderbook_updates": 0,
             "trades_received": 0,
-            "candles_received": 0,  # 1‑minute candles
+            "candles_received": 0,  # 1â€‘minute candles
             "prices_recorded": 0,
             "last_update": None,
         }
@@ -159,7 +159,7 @@ class ZScoreDataManager:
             logger.info(f"Subscribing TRADES: {config.SYMBOL}")
             self.ws.subscribe_trades(config.SYMBOL, callback=self._on_trade)
 
-            # 1‑minute CANDLESTICKS (for EMA/ATR + LTF LSTM)
+            # 1â€‘minute CANDLESTICKS (for EMA/ATR + LTF LSTM)
             logger.info(
                 f"Subscribing CANDLESTICKS 1m: {config.SYMBOL}_{config.CANDLE_INTERVAL}"
             )
@@ -169,7 +169,7 @@ class ZScoreDataManager:
                 callback=self._on_candlestick_1m,
             )
 
-            # 5‑minute CANDLESTICKS (HTF LSTM)
+            # 5â€‘minute CANDLESTICKS (HTF LSTM)
             logger.info(f"Subscribing CANDLESTICKS 5m: {config.SYMBOL}_5")
             self.ws.subscribe_candlestick(
                 pair=config.SYMBOL,
@@ -177,7 +177,7 @@ class ZScoreDataManager:
                 callback=self._on_candlestick_5m,
             )
 
-            # 15‑minute CANDLESTICKS (BOS / structure)
+            # 15â€‘minute CANDLESTICKS (BOS / structure)
             logger.info(f"Subscribing CANDLESTICKS 15m: {config.SYMBOL}_15")
             self.ws.subscribe_candlestick(
                 pair=config.SYMBOL,
@@ -220,7 +220,7 @@ class ZScoreDataManager:
         interval: str = "1",
     ) -> None:
         """
-        Warm up 1‑minute price history using REST /trade/api/v2/futures/klines.
+        Warm up 1â€‘minute price history using REST /trade/api/v2/futures/klines.
         This feeds _price_window for EMA/ATR and _ltf_1m_closes for LSTM.
         """
         try:
@@ -304,7 +304,7 @@ class ZScoreDataManager:
 
     def _warmup_htf_klines_5m(self) -> None:
         """
-        Warm up native 5‑minute HTF candles from REST.
+        Warm up native 5â€‘minute HTF candles from REST.
         Populates _htf_5m_closes with enough bars for LSTM training.
         """
         try:
@@ -380,7 +380,7 @@ class ZScoreDataManager:
 
     def _warmup_bos_klines_15m(self) -> None:
         """
-        Warm up native 15‑minute BOS candles from REST for BOS alignment.
+        Warm up native 15â€‘minute BOS candles from REST for BOS alignment.
         Populates _bos_15m_closes with sufficient history.
         """
         try:
@@ -530,7 +530,7 @@ class ZScoreDataManager:
             logger.error(f"Error in _on_trade: {e}", exc_info=True)
 
     def _on_candlestick_1m(self, data) -> None:
-        """Handle 1‑minute candlestick updates (for EMA/ATR and LTF LSTM)."""
+        """Handle 1â€‘minute candlestick updates (for EMA/ATR and LTF LSTM)."""
         try:
             if isinstance(data, dict):
                 close_str = data.get("c")
@@ -559,7 +559,7 @@ class ZScoreDataManager:
             logger.error(f"Error in _on_candlestick_1m: {e}", exc_info=True)
 
     def _on_candlestick_5m(self, data) -> None:
-        """Handle 5‑minute candlestick updates (native HTF stream)."""
+        """Handle 5â€‘minute candlestick updates (native HTF stream)."""
         try:
             if isinstance(data, dict):
                 close_str = data.get("c")
@@ -586,7 +586,7 @@ class ZScoreDataManager:
             logger.error(f"Error in _on_candlestick_5m: {e}", exc_info=True)
 
     def _on_candlestick_15m(self, data) -> None:
-        """Handle 15‑minute candlestick updates (BOS / structure)."""
+        """Handle 15â€‘minute candlestick updates (BOS / structure)."""
         try:
             if isinstance(data, dict):
                 close_str = data.get("c")
@@ -633,7 +633,7 @@ class ZScoreDataManager:
             self._recent_trades.popleft()
 
     def _append_htf_5m_close(self, ts_ms: int, close_price: float) -> None:
-        """Append a native 5‑minute close into the HTF buffer."""
+        """Append a native 5â€‘minute close into the HTF buffer."""
         self._htf_5m_closes.append((ts_ms, close_price))
 
         # Keep only enough HTF history for robust LSTM training
@@ -647,7 +647,7 @@ class ZScoreDataManager:
             self._htf_5m_closes.popleft()
 
     def _append_bos_15m_close(self, ts_ms: int, close_price: float) -> None:
-        """Append a native 15‑minute close into the BOS buffer."""
+        """Append a native 15â€‘minute close into the BOS buffer."""
         self._bos_15m_closes.append((ts_ms, close_price))
 
         bos_interval_min = 15
@@ -660,7 +660,7 @@ class ZScoreDataManager:
             self._bos_15m_closes.popleft()
 
     def _append_ltf_1m_close(self, ts_ms: int, close_price: float) -> None:
-        """Append a native 1‑minute close into the LTF buffer for 1m trend."""
+        """Append a native 1â€‘minute close into the LTF buffer for 1m trend."""
         self._ltf_1m_closes.append((ts_ms, close_price))
 
         ltf_span = getattr(config, "LTF_EMA_SPAN", getattr(config, "EMA_PERIOD", 20))
@@ -773,7 +773,7 @@ class ZScoreDataManager:
 
     def get_atr_percent(self, window_minutes: int = None) -> Optional[float]:
         """
-        Compute ATR over 1‑minute bars for the last `window_minutes`.
+        Compute ATR over 1â€‘minute bars for the last `window_minutes`.
         If OHLC is too sparse, falls back to realized volatility percent.
         """
         if window_minutes is None:
