@@ -402,7 +402,7 @@ class ZScoreIcebergHunterStrategy:
             pos_summary = "None"
 
         msg_lines = [
-            "ðŸ“Š Z-Score 15m Performance Report",
+            "📊 Z-Score 15m Performance Report",
             f"Time (UTC): {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}",
             f"Symbol: {config.SYMBOL}",
             f"Current price: {current_price:.2f}",
