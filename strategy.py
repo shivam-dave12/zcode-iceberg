@@ -87,7 +87,6 @@ class ZScoreIcebergHunterStrategy:
         # 15-minute performance report state (Telegram)
         self._last_report_sec: float = 0.0
         self._last_report_total_trades: int = 0
-        self._last_tp_modification_sec: float = 0.0  # Track last TP change
 
         logger.info("=" * 80)
         logger.info("Z-SCORE IMBALANCE ICEBERG HUNTER STRATEGY INITIALIZED")
@@ -403,7 +402,7 @@ class ZScoreIcebergHunterStrategy:
             pos_summary = "None"
 
         msg_lines = [
-            "📊 Z-Score 15m Performance Report",
+            "ðŸ“Š Z-Score 15m Performance Report",
             f"Time (UTC): {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}",
             f"Symbol: {config.SYMBOL}",
             f"Current price: {current_price:.2f}",
@@ -1323,45 +1322,37 @@ class ZScoreIcebergHunterStrategy:
         full_profit_usdt = position_margin * profit_roi  # 10% for full TP
         loss_usdt = position_margin * abs(stop_roi)  # 3% for SL
 
-        # Calculate EXACT quantity BEFORE rounding
-        notional = position_margin * config.LEVERAGE
-        quantity_exact = notional / limit_price
+        if quantity <= 0:
+            logger.error("Invalid quantity for TP/SL computation")
+            return
 
-        # Calculate EXACT price moves needed (NO ROUNDING)
-        half_tp_move_exact = half_profit_usdt / quantity_exact
-        full_tp_move_exact = full_profit_usdt / quantity_exact
-        sl_move_exact = loss_usdt / quantity_exact
+        # Calculate EXACT price moves needed to hit ROE% targets (NO ROUNDING)
+        half_tp_move = half_profit_usdt / quantity
+        full_tp_move = full_profit_usdt / quantity
+        sl_move = loss_usdt / quantity
 
-        # Calculate EXACT TP/SL prices (NO ROUNDING)
+        # Calculate TP/SL prices from EXACT moves (NO ROUNDING)
         if side == "long":
-            half_tp_price_exact = limit_price + half_tp_move_exact
-            full_tp_price_exact = limit_price + full_tp_move_exact
-            sl_price_exact = limit_price - sl_move_exact
+            half_tp_price = limit_price + half_tp_move
+            full_tp_price = limit_price + full_tp_move
+            sl_price = limit_price - sl_move
         else:
-            half_tp_price_exact = limit_price - half_tp_move_exact
-            full_tp_price_exact = limit_price - full_tp_move_exact
-            sl_price_exact = limit_price + sl_move_exact
+            half_tp_price = limit_price - half_tp_move
+            full_tp_price = limit_price - full_tp_move
+            sl_price = limit_price + sl_move
 
-        # NOW round to exchange constraints
-        tick_size = config.TICK_SIZE  # e.g., 0.1
-        half_tp_price = round(half_tp_price_exact / tick_size) * tick_size
-        full_tp_price = round(full_tp_price_exact / tick_size) * tick_size
-        sl_price = round(sl_price_exact / tick_size) * tick_size
-
-        # Round quantity last
-        quantity = round(quantity_exact / 0.001) * 0.001
-
-        # Verify actual ROE (should be exact now)
+        # Verify actual ROE% (should be EXACT now)
         actual_half_profit = abs(half_tp_price - limit_price) * quantity
         actual_full_profit = abs(full_tp_price - limit_price) * quantity
         actual_loss = abs(sl_price - limit_price) * quantity
+
         half_roe = (actual_half_profit / position_margin) * 100.0
         full_roe = (actual_full_profit / position_margin) * 100.0
         sl_roe = (actual_loss / position_margin) * 100.0
 
         logger.info(
-            f"TP/SL ROE verification: Half TP={half_roe:.4f}%, "
-            f"Full TP={full_roe:.4f}%, SL={sl_roe:.4f}%"
+            f"TP/SL ROE verification: Half TP={half_roe:.2f}%, "
+            f"Full TP={full_roe:.2f}%, SL={sl_roe:.2f}%"
         )
 
         logger.info("-" * 80)
@@ -1667,31 +1658,14 @@ class ZScoreIcebergHunterStrategy:
                 else:
                     tp_side = "BUY"
 
-                old_tp_order_id = pos.tp_order_id
-                
-                # STEP 1: Cancel old HALF TP with robust error handling
                 try:
-                    if old_tp_order_id:
-                        order_manager.cancel_order(old_tp_order_id)
-                        pos.tp_order_id = None  # Clear immediately to prevent stale reference
-                        logger.info(f"Cancelled HALF TP {old_tp_order_id} for {pos.trade_id}")
-                        time.sleep(0.5)  # Give exchange time to process cancellation
+                    if pos.tp_order_id:
+                        order_manager.cancel_order(pos.tp_order_id)
                 except Exception as e:
-                    error_msg = str(e).lower()
-                    # Gracefully handle "already cancelled" state
-                    if "cancelled" in error_msg or "canceled" in error_msg or "cannot be cancelled" in error_msg:
-                        logger.warning(
-                            f"HALF TP {old_tp_order_id} already cancelled for {pos.trade_id} - proceeding with new TP"
-                        )
-                        pos.tp_order_id = None  # Clear the stale order_id
-                    else:
-                        logger.error(
-                            f"Error cancelling HALF TP {old_tp_order_id}: {e}", exc_info=True
-                        )
-                        # Don't set tp_reduced=True yet; allow retry on next tick
-                        return
+                    logger.error(
+                        f"Error cancelling HALF TP {pos.tp_order_id}: {e}", exc_info=True
+                    )
 
-                # STEP 2: Place new FULL TP with "already exists" handling
                 try:
                     new_tp_order = order_manager.place_take_profit(
                         side=tp_side,
@@ -1700,7 +1674,7 @@ class ZScoreIcebergHunterStrategy:
                     )
                     if new_tp_order and "order_id" in new_tp_order:
                         pos.tp_order_id = new_tp_order["order_id"]
-                        pos.tp_reduced = True  # Mark success
+                        pos.tp_reduced = True
                         logger.info(
                             f"✓ New FULL TP placed for {pos.trade_id} @ {pos.tp_price:.2f}, "
                             f"order_id={pos.tp_order_id}"
@@ -1710,32 +1684,12 @@ class ZScoreIcebergHunterStrategy:
                             f"Failed to place FULL TP for {pos.trade_id} - "
                             f"leaving position without active TP."
                         )
-                        pos.tp_reduced = True  # Mark as attempted to prevent infinite retries
+                        pos.tp_reduced = True
                 except Exception as e:
-                    error_msg = str(e).lower()
-                    # Handle "TP already exists" case (race condition from previous attempt)
-                    if "already exists" in error_msg or "take profit order already exists" in error_msg:
-                        logger.warning(
-                            f"FULL TP already exists for {pos.trade_id} - marking as complete"
-                        )
-                        pos.tp_reduced = True  # Mark success since TP is already in place
-                        # Try to fetch the existing TP order_id from open orders
-                        try:
-                            open_orders = order_manager.get_open_orders()
-                            for order in open_orders:
-                                if (order.get("type", "").upper() in ["TAKEPROFIT", "TAKE_PROFIT_MARKET"] 
-                                    and order.get("symbol") == config.SYMBOL):
-                                    pos.tp_order_id = order.get("order_id")
-                                    logger.info(f"Retrieved existing TP order_id: {pos.tp_order_id}")
-                                    break
-                        except Exception as fetch_err:
-                            logger.error(f"Could not retrieve existing TP order_id: {fetch_err}")
-                    else:
-                        logger.error(
-                            f"Error placing FULL TP for {pos.trade_id}: {e}", exc_info=True
-                        )
-                        pos.tp_reduced = True  # Mark as attempted to prevent infinite retries
-
+                    logger.error(
+                        f"Error placing FULL TP for {pos.trade_id}: {e}", exc_info=True
+                    )
+                    pos.tp_reduced = True
 
         # ======================================================================
         # THROTTLED ORDER STATUS CHECKS (main/TP/SL fills)
@@ -1809,11 +1763,6 @@ class ZScoreIcebergHunterStrategy:
         ):
             elapsed_min_dyn = (now_sec - pos.entry_time_sec) / 60.0
             if elapsed_min_dyn >= config.DYNAMIC_TP_MINUTES:
-                time_since_last_tp_change = now_sec - self._last_tp_modification_sec
-
-                if time_since_last_tp_change < 60.0:    
-                    return
-
                 atr_pct = None
                 try:
                     atr_pct = data_manager.get_atr_percent()
@@ -1852,30 +1801,15 @@ class ZScoreIcebergHunterStrategy:
                         f"new_tp_price={new_tp_price:.2f})"
                     )
 
-                    old_tp_order_id = pos.tp_order_id
-                    
-                    # Step 1: Cancel old TP (with error handling for already-cancelled)
                     try:
-                        if old_tp_order_id:
-                            order_manager.cancel_order(old_tp_order_id)
-                            pos.tp_order_id = None  # Clear immediately to prevent re-cancel
-                            time.sleep(0.5)  # Give exchange time to process cancel
+                        if pos.tp_order_id:
+                            order_manager.cancel_order(pos.tp_order_id)
                     except Exception as e:
-                        error_msg = str(e).lower()
-                        # Ignore "already cancelled" errors
-                        if "cancelled" in error_msg or "canceled" in error_msg:
-                            logger.warning(
-                                f"TP order {old_tp_order_id} already cancelled for {pos.trade_id}"
-                            )
-                            pos.tp_order_id = None
-                        else:
-                            logger.error(
-                                f"Error cancelling old TP {old_tp_order_id} for {pos.trade_id}: {e}",
-                                exc_info=True,
-                            )
-                            return  # Don't proceed if cancel failed unexpectedly
+                        logger.error(
+                            f"Error cancelling old TP {pos.tp_order_id} for {pos.trade_id}: {e}",
+                            exc_info=True,
+                        )
 
-                    # Step 2: Place new TP
                     try:
                         new_tp_order_dyn = order_manager.place_take_profit(
                             side=tp_side_dyn,
@@ -1884,7 +1818,6 @@ class ZScoreIcebergHunterStrategy:
                         )
                         if new_tp_order_dyn and "order_id" in new_tp_order_dyn:
                             pos.tp_order_id = new_tp_order_dyn["order_id"]
-                            self._last_tp_modification_sec = now_sec  # Update throttle timer
                             logger.info(
                                 f"New tightened TP placed for {pos.trade_id} @ {new_tp_price:.2f}, "
                                 f"order_id={pos.tp_order_id}"
@@ -1895,17 +1828,10 @@ class ZScoreIcebergHunterStrategy:
                                 f"at {new_tp_price:.2f}"
                             )
                     except Exception as e:
-                        error_msg = str(e).lower()
-                        # If "TP already exists", check if it's a duplicate from the previous attempt
-                        if "already exists" in error_msg:
-                            logger.warning(
-                                f"TP order already exists for {pos.trade_id} - skipping placement"
-                            )
-                        else:
-                            logger.error(
-                                f"Error placing tightened TP for {pos.trade_id}: {e}",
-                                exc_info=True,
-                            )
+                        logger.error(
+                            f"Error placing tightened TP for {pos.trade_id}: {e}",
+                            exc_info=True,
+                        )
 
     # ======================================================================
     # Finalize exit
