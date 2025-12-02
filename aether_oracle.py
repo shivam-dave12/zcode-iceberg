@@ -1,4 +1,4 @@
-#  aether_oracle.py
+# aether_oracle.py
 
 import logging
 import math
@@ -135,7 +135,7 @@ class AetherOracle:
             if qty <= 0:
                 continue
             is_buyer_maker = bool(t.get("isBuyerMaker", False))
-            # On CoinSwitch streams, isBuyerMaker == False → aggressive buy
+            # On CoinSwitch streams, isBuyerMaker == False â†’ aggressive buy
             if not is_buyer_maker:
                 buy_vol += qty
             else:
@@ -336,7 +336,7 @@ class AetherOracle:
           - f1: CVD aligned with side (required)
           - f2: imbalance aligned with side (required)
           - f3: BOS alignment (optional)
-          - f4: Hurst excess (H - 0.5, ≥0) (optional)
+          - f4: Hurst excess (H - 0.5, â‰¥0) (optional)
         If norm_cvd or imbalance are missing, returns None (Bayes disabled).
         """
         if norm_cvd is None or imbalance_val is None:
