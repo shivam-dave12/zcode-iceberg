@@ -7,7 +7,7 @@ UPDATED: Robust Volatility (ATR/Realized) calculation to prevent MISSING data
 
 import time
 import logging
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Deque  # Add Tuple if missing
 from collections import deque
 from datetime import datetime
 import numpy as np
@@ -986,4 +986,52 @@ class ZScoreDataManager:
 
         except Exception as e:
             logger.error(f"Error computing LTF LSTM trend: {e}", exc_info=True)
+            return None
+
+    # ======================================================================
+    # Oracle Metric Wrappers (Called by Strategy)
+    # ======================================================================
+
+    def compute_liquidity_velocity_multi_tf(self) -> Tuple[Optional[float], Optional[float], Optional[float], bool]:
+        """
+        Wrapper for oracle's LV computation.
+        Returns: (lv_1m, lv_5m, lv_15m, micro_trap)
+        """
+        try:
+            return self._oracle.compute_liquidity_velocity_multi_tf(self)
+        except Exception as e:
+            logger.error(f"Error computing LV multi-TF: {e}", exc_info=True)
+            return (None, None, None, False)
+
+    def compute_norm_cvd(self, window_sec: int = 10) -> Optional[float]:
+        """
+        Wrapper for oracle's normalized CVD computation.
+        Returns: Normalized CVD in [-1, 1] or None
+        """
+        try:
+            return self._oracle.compute_norm_cvd(self, window_sec=window_sec)
+        except Exception as e:
+            logger.error(f"Error computing norm CVD: {e}", exc_info=True)
+            return None
+
+    def compute_hurst_exponent(self, window_ticks: int = 20) -> Optional[float]:
+        """
+        Wrapper for oracle's Hurst exponent computation.
+        Returns: Hurst value or None
+        """
+        try:
+            return self._oracle.compute_hurst_exponent(self, window_ticks=window_ticks)
+        except Exception as e:
+            logger.error(f"Error computing Hurst: {e}", exc_info=True)
+            return None
+
+    def compute_bos_alignment(self, current_price: float) -> Optional[float]:
+        """
+        Wrapper for oracle's BOS alignment computation.
+        Returns: BOS alignment score (0-1) or None
+        """
+        try:
+            return self._oracle.compute_bos_alignment(self, current_price)
+        except Exception as e:
+            logger.error(f"Error computing BOS alignment: {e}", exc_info=True)
             return None
