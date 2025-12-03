@@ -134,7 +134,7 @@ class ZScoreIcebergBot:
 
             logger.info("Fetching available USDT futures balance...")
             # Fetching available USDT futures balance...
-            balance_info = risk_manager.get_available_balance()
+            balance_info = self.risk_manager.get_available_balance()
             if balance_info:
                 available = float(balance_info.get("available", 0.0))
                 logger.info(f"Initial Balance: {available:.2f} USDT")
