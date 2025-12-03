@@ -836,8 +836,9 @@ class ZScoreDataManager:
             if len(X_list) == 0:
                 return
 
-            X = torch.tensor(np.asarray(X_list), dtype=torch.float32).clone().detach()
-            y = torch.tensor(np.asarray(y_list), dtype=torch.long).clone().detach()
+            # Create tensors with proper gradient handling
+            X = torch.tensor(np.asarray(X_list), dtype=torch.float32).requires_grad_(False)
+            y = torch.tensor(np.asarray(y_list), dtype=torch.long)
 
             # Initialize model
             self._htf_lstm = TrendLSTM(
@@ -846,11 +847,13 @@ class ZScoreDataManager:
             criterion = nn.CrossEntropyLoss()
             optimizer = optim.Adam(self._htf_lstm.parameters(), lr=0.001)
 
-            # Train
+            # Train - use detached copy in each iteration
             self._htf_lstm.train()
             for epoch in range(20):
                 optimizer.zero_grad()
-                outputs = self._htf_lstm(X.clone())
+                # Create fresh detached copy for each iteration
+                X_batch = X.detach().clone()
+                outputs = self._htf_lstm(X_batch)
                 loss = criterion(outputs, y)
                 loss.backward()
                 optimizer.step()
@@ -982,8 +985,9 @@ class ZScoreDataManager:
             if len(X_list) == 0:
                 return
 
-            X = torch.tensor(np.asarray(X_list), dtype=torch.float32).clone().detach()
-            y = torch.tensor(np.asarray(y_list), dtype=torch.long).clone().detach()
+            # Create tensors with proper gradient handling
+            X = torch.tensor(np.asarray(X_list), dtype=torch.float32).requires_grad_(False)
+            y = torch.tensor(np.asarray(y_list), dtype=torch.long)
 
             self._ltf_lstm = TrendLSTM(
                 input_dim=1, hidden_dim=16, num_layers=1, num_classes=3
@@ -994,7 +998,9 @@ class ZScoreDataManager:
             self._ltf_lstm.train()
             for epoch in range(20):
                 optimizer.zero_grad()
-                outputs = self._ltf_lstm(X.clone())
+                # Create fresh detached copy for each iteration
+                X_batch = X.detach().clone()
+                outputs = self._ltf_lstm(X_batch)
                 loss = criterion(outputs, y)
                 loss.backward()
                 optimizer.step()

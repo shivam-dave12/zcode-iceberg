@@ -1157,9 +1157,9 @@ class ZScoreIcebergHunterStrategy:
         if oracle_inputs:
             logger.info("-" * 80)
             logger.info(f"CVD                : {oracle_inputs.norm_cvd:.3f}" if oracle_inputs.norm_cvd is not None else "CVD                : N/A")
-            logger.info(f"LV 1m              : {oracle_inputs.lv_1m:.2f if oracle_inputs.lv_1m else 'N/A'}")
-            logger.info(f"Hurst              : {oracle_inputs.hurst:.3f if oracle_inputs.hurst else 'N/A'}")
-            logger.info(f"BOS Align          : {oracle_inputs.bos_align:.3f if oracle_inputs.bos_align else 'N/A'}")
+            logger.info(f"LV 1m              : {oracle_inputs.lv_1m:.2f}" if oracle_inputs.lv_1m is not None else "LV 1m              : N/A")
+            logger.info(f"Hurst              : {oracle_inputs.hurst:.3f}" if oracle_inputs.hurst is not None else "Hurst              : N/A")
+            logger.info(f"BOS Align          : {oracle_inputs.bos_align:.3f}" if oracle_inputs.bos_align is not None else "BOS Align          : N/A")
             logger.info(f"HTF Trend          : {oracle_inputs.htf_trend or 'N/A'}")
             logger.info(f"LTF Trend          : {oracle_inputs.ltf_trend or 'N/A'}")
         
