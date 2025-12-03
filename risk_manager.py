@@ -91,29 +91,17 @@ class RiskManager:
     # Balance management
     # ======================================================================
 
-    def get_available_balance(self) -> Optional[Dict]:
-        """
-        Get available USDT futures wallet balance via new API.
+def get_available_balance(self) -> Optional[Dict]:
+    """Get available balance with global rate limiting"""
+    now = time.time()
+    
+    # GLOBAL RATE LIMIT - 1 call per 3 seconds MAX
+    if hasattr(self, '_last_balance_time') and now - self._last_balance_time < 3.0:
+        logger.debug("Balance rate limited - using cache")
+        return getattr(self, '_cached_balance', None)
+    
+    self._last_balance_time = now
 
-        - Uses a short cache (10 seconds) to respect rate limits.
-        - On 429 Too Many Requests, backs off exponentially and
-          returns last cached value if all retries fail.
-        """
-        now = time.time()
-
-        if (
-            self._balance_cache is not None
-            and (now - self._last_balance_fetch) < self._balance_cache_ttl_sec
-        ):
-            return self._balance_cache
-
-        # ═══════════════════════════════════════════════════════════════
-        # FIX: Exponential backoff on 429 errors
-        # ═══════════════════════════════════════════════════════════════
-        max_retries = 3
-        backoff_base = 2.0
-
-        for attempt in range(max_retries):
             try:
                 response = self.api.get_wallet_balance()
 

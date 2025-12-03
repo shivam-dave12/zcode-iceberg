@@ -1166,7 +1166,6 @@ class ZScoreIcebergHunterStrategy:
             target_margin, quantity = risk_manager.calculate_position_size_regime_aware(
                 entry_price=current_price,
                 vol_regime=vol_regime,
-                balance_available=available,
             )
             if quantity <= 0:
                 logger.warning("Computed quantity <= 0; skipping entry")
