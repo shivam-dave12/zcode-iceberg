@@ -1,0 +1,10 @@
+# requirements-linux.txt
+numpy==1.24.3
+pandas==2.0.3
+scipy==1.11.1
+torch==2.0.1+cpu  # CPU-only version (smaller, faster install)
+requests==2.31.0
+websocket-client==1.6.1
+openpyxl==3.1.2
+python-dateutil==2.8.2
+

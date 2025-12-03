@@ -1,0 +1,12 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Secrets
+.env
+
+# Logs
+*.log
+
+# Generated Excel reports
+zscore_iceberg_hunter_*.xlsx
