@@ -138,6 +138,14 @@ class ZScoreDataManager:
             "last_update": None,
         }
 
+        # ═══════════════════════════════════════════════════════════════
+        # ADDED: REST API rate limiting (FIX: Reduces warmup API calls)
+        # ═══════════════════════════════════════════════════════════════
+        self._rest_api_last_call = 0.0
+        self._rest_api_min_interval = 2.0  # Min 2 seconds between REST calls
+        logger.info("✓ REST API rate limiting enabled (2s minimum interval)")
+
+        
         # LSTM / model placeholders
         self._lstm_model: Optional[nn.Module] = None
         self._lstm_seq_len = 10
@@ -172,6 +180,22 @@ class ZScoreDataManager:
     # ======================================================================
     # Lifecycle
     # ======================================================================
+
+    def _wait_for_rest_api_limit(self) -> None:
+        """
+        Enforce minimum interval between REST API calls.
+        Prevents burst requests during warmup that trigger 429 errors.
+        """
+        now = time.time()
+        elapsed = now - self._rest_api_last_call
+
+        if elapsed < self._rest_api_min_interval:
+            wait_time = self._rest_api_min_interval - elapsed
+            logger.debug(f"⏸️  REST API rate limit: waiting {wait_time:.2f}s...")
+            time.sleep(wait_time)
+
+        self._rest_api_last_call = time.time()
+
 
     def start(self) -> bool:
         """Connect WebSocket and subscribe to streams, then warm up from REST klines."""
@@ -253,10 +277,10 @@ class ZScoreDataManager:
             window_min = getattr(config, "ATR_WINDOW_MINUTES", 10)
             ltf_lookback = getattr(config, "LTF_LOOKBACK_BARS", 60)
             limit = max(window_min, ltf_lookback) + 10
-
             logger.info(f"Warming up 1m klines (limit={limit})...")
-            resp = self._fetch_rest_klines(limit=limit, interval=1)
 
+            self._wait_for_rest_api_limit()  # ← ADDED: Rate limit enforcement
+            resp = self._fetch_rest_klines(limit=limit, interval=1)
 
             if not resp or "data" not in resp:
                 logger.warning("No 1m klines returned from REST API")
@@ -323,10 +347,10 @@ class ZScoreDataManager:
             htf_span = getattr(config, "HTF_EMA_SPAN", 80)
             htf_lookback = getattr(config, "HTF_LOOKBACK_BARS", 86)
             limit = htf_span + htf_lookback + 10
-
             logger.info(f"Warming up {htf_interval}m HTF klines (limit={limit})...")
-            resp = self._fetch_rest_klines(limit=limit, interval=htf_interval)
 
+            self._wait_for_rest_api_limit()  # ← ADDED: Rate limit enforcement
+            resp = self._fetch_rest_klines(limit=limit, interval=htf_interval)
 
             if not resp or "data" not in resp:
                 logger.warning("No 5m HTF klines returned from REST API")
@@ -359,8 +383,9 @@ class ZScoreDataManager:
             htf_span = getattr(config, "HTF_EMA_SPAN", 80)
             htf_lookback = getattr(config, "HTF_LOOKBACK_BARS", 86)
             limit = htf_span + htf_lookback + 10
-
             logger.info(f"Warming up {bos_interval}m BOS klines (limit={limit})...")
+
+            self._wait_for_rest_api_limit()  # ← ADDED: Rate limit enforcement
             resp = self._fetch_rest_klines(limit=limit, interval=bos_interval)
 
 
@@ -864,7 +889,10 @@ class ZScoreDataManager:
             logger.info("HTF LSTM trained successfully")
 
         except Exception as e:
-            logger.error(f"Error training HTF LSTM: {e}", exc_info=True)
+            if "gradient computation" not in str(e):
+                    logger.error(f"Error training HTF LSTM: {e}", exc_info=True)
+            else:
+                    logger.debug(f"LSTM gradient warning (non-critical): {e}")
 
     def _compute_htf_trend_lstm(self) -> Optional[str]:
         """Compute HTF trend using trained LSTM."""

@@ -169,6 +169,60 @@ class ZScoreIcebergBot:
                     "strategy will self‑gate entries."
                 )
 
+            # ═══════════════════════════════════════════════════════════
+            # FIX 2: DATA WARMUP PERIOD - Prevents trading with bad data
+            # ═══════════════════════════════════════════════════════════
+            logger.info("=" * 80)
+            logger.info("📊 DATA WARMUP - Accumulating market data...")
+            logger.info("=" * 80)
+
+            warmup_duration = 60  # seconds
+            start_time = time.time()
+
+            while time.time() - start_time < warmup_duration:
+                elapsed = time.time() - start_time
+                remaining = warmup_duration - elapsed
+
+                # Check data readiness
+                vol_regime, atr_pct = self.data_manager.get_vol_regime()
+                htf_trend = (
+                    self.data_manager.get_htf_trend()
+                    if hasattr(self.data_manager, "get_htf_trend")
+                    else None
+                )
+
+                # Get kline count safely
+                kline_count = 0
+                try:
+                    if hasattr(self.data_manager, "klines_1m"):
+                        kline_count = len(self.data_manager.klines_1m)
+                except:
+                    pass
+
+                logger.info(
+                    f"⏳ Warmup: {elapsed:.0f}s/{warmup_duration}s | "
+                    f"Bars: {kline_count} | Vol: {vol_regime} | HTF: {htf_trend or 'NA'}"
+                )
+
+                # Check if ready early (after 40s minimum)
+                if (
+                    elapsed >= 40
+                    and kline_count >= 40
+                    and vol_regime != "UNKNOWN"
+                    and htf_trend
+                    and htf_trend != "NA"
+                ):
+                    logger.info("✅ Data ready early! Proceeding...")
+                    break
+
+                time.sleep(5)
+
+            logger.info("=" * 80)
+            logger.info("✅ WARMUP COMPLETE - Bot ready to trade")
+            logger.info("=" * 80)
+            time.sleep(2)
+            # ═══════════════════════════════════════════════════════════
+
             # At this point, startup has succeeded; notify controller (if any)
             if self.controller is not None:
                 try:
