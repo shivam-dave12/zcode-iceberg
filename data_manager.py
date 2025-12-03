@@ -183,11 +183,8 @@ class ZScoreDataManager:
         logger.info(f"Symbol       : {config.SYMBOL}")
         logger.info(f"Exchange     : {config.EXCHANGE}")
 
-        # WebSocket connection
-        self.ws = FuturesWebSocket(
-            api_key=config.COINSWITCH_API_KEY,
-            secret_key=config.COINSWITCH_SECRET_KEY,
-        )
+        # WebSocket connection (actual connect happens in start())
+        self.ws = None
 
         # Data storage
         self._orderbook_bids: List[Tuple[float, float]] = []
