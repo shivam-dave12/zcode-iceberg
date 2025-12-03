@@ -73,6 +73,8 @@ class ZScoreIcebergHunterStrategy:
         self.last_exit_time_min: float = 0.0
         self.excel_logger = excel_logger
         self.trade_seq = 0
+        self.total_trades = 0
+
 
         # ═════════════════════════════════════════════════════════════════
         # ADDED: Thread-safe entry lock (FIX 1)

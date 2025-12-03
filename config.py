@@ -68,6 +68,13 @@ POSITION_CHECK_INTERVAL = 0.12  # 120 ms tick interval
 # TRADING RULES / DAILY RISK
 # ============================================================================
 
+# RISK MANAGER CONSTANTS (REQUIRED)
+MAX_CONCURRENT_POSITIONS = 3
+MAX_DAILY_TRADES = 100  
+MAX_DAILY_LOSS = 50.0
+MIN_MARGIN_PER_TRADE = 4.0  
+MAX_MARGIN_PER_TRADE = 10000.0
+
 # Only one position open at a time for this scalper.
 ONE_POSITION_AT_A_TIME = True
 

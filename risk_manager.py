@@ -52,7 +52,7 @@ class RiskManager:
     
     def get_available_balance(self) -> Optional[Dict]:
         """
-        Get available balance with GLOBAL rate limiting (1 call per 3 seconds MAX)
+        Get available balance with CORRECT CoinSwitch API parsing (1 call per 3 seconds MAX)
         """
         now = time.time()
         
@@ -65,32 +65,35 @@ class RiskManager:
         
         try:
             logger.debug("Fetching fresh balance...")
-            # CORRECT METHOD NAME: get_wallet_balance()
             response = self.api.get_wallet_balance()
             
-            if "data" in response:
-                balance_data = response["data"]
-                available_usdt = float(balance_data.get("USDT", {}).get("available", 0.0))
-                
-                # Cache result for 3 seconds
-                self._cached_balance = {
-                    "available": available_usdt,
-                    "total": float(balance_data.get("USDT", {}).get("total", 0.0)),
-                    "used": float(balance_data.get("USDT", {}).get("used", 0.0)),
-                    "timestamp": now
-                }
-                
-                logger.debug(f"✓ Fresh balance: {available_usdt:.2f} USDT available")
-                return self._cached_balance
-                
-            else:
-                logger.warning(f"Balance API returned no data: {response}")
-                return getattr(self, '_cached_balance', None)
-                
+            logger.debug(f"Raw wallet response: {response}")  # DEBUG
+            
+            if "data" in response and "base_asset_balances" in response["data"]:
+                balances = response["data"]["base_asset_balances"]
+                for asset in balances:
+                    if asset.get("base_asset") == "USDT":
+                        balances_dict = asset.get("balances", {})
+                        available_usdt = float(balances_dict.get("total_available_balance", 0.0))
+                        
+                        # Cache result
+                        self._cached_balance = {
+                            "available": available_usdt,
+                            "total": float(balances_dict.get("total_balance", 0.0)),
+                            "used": float(balances_dict.get("total_blocked_balance", 0.0)),
+                            "timestamp": now
+                        }
+                        
+                        logger.info(f"✓ Fresh balance: {available_usdt:.2f} USDT available")  # Changed to INFO
+                        return self._cached_balance
+            
+            logger.warning(f"Balance API no USDT data: {response}")
+            return getattr(self, '_cached_balance', None)
+            
         except Exception as e:
             logger.error(f"Failed to get balance: {e}")
-            # Return cached even on error (graceful degradation)
             return getattr(self, '_cached_balance', None)
+
     
     def check_trading_allowed(self) -> Tuple[bool, str]:
         """Check if trading is allowed based on risk limits"""
