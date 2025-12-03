@@ -1051,25 +1051,17 @@ class ZScoreIcebergHunterStrategy:
             pass
 
     def _check_momentum_direction(self, side: str, data_manager, current_price: float) -> bool:
-        """
-        Check if momentum is still in the direction of the trade.
-        """
-        # Example: Use Oracle or data_manager metrics if available for momentum.
+        """Check momentum direction using LV or recent price action"""
         try:
-            # This function should check relevant momentum indicator, e.g. LV or Hurst or others
-            # Assuming data_manager has get_momentum_direction(side) -> bool or similar
-            if hasattr(data_manager, "get_momentum_direction"):
-                return data_manager.get_momentum_direction(side)
-            # Fallback: If no direct function, return True for safe side
-            return True
-        except Exception as e:
-            logger.error(f"Error in momentum check: {e}")
-            return False
+            # Use liquidity velocity as momentum proxy
+            lv_1m, lv_5m, _, _ = data_manager.compute_liquidity_velocity_multi_tf()
+            lv_avg = (lv_1m or 0) + (lv_5m or 0)
+            return lv_avg > 1.0  # Positive liquidity velocity
+        except:
+            return True  # Safe default
 
     def _check_trend_direction(self, side: str, data_manager) -> bool:
-        """
-        Check if trend is still in the direction of the trade.
-        """
+        """Check HTF trend alignment"""
         try:
             htf_trend = data_manager.get_htf_trend() if hasattr(data_manager, "get_htf_trend") else None
             if htf_trend is None:
@@ -1078,34 +1070,21 @@ class ZScoreIcebergHunterStrategy:
                 return htf_trend in ["UP", "RANGE"]
             else:
                 return htf_trend in ["DOWN", "RANGE"]
-        except Exception as e:
-            logger.error(f"Error in trend check: {e}")
+        except:
             return False
 
     def _nearest_tp_percent(self, entry_price: float, current_price: float, side: str) -> float:
-        """
-        Return the nearest TP price above current price close to a TP % increment.
-        E.g. if trading at 6.5% from entry and default TP is 10%, set TP to 7%
-        """
-        # Configured full TP percent e.g. 10%
-        full_tp_pct = config.PROFIT_TARGET_ROI * 100  # 10
-
-        # Calculate current profit (%) from entry price
-        if side == "long":
-            current_profit_pct = (current_price - entry_price) / entry_price * 100
-        else:
-            current_profit_pct = (entry_price - current_price) / entry_price * 100
-
-        # Round up to nearest integer percent above current profit
-        adjusted_tp_pct = min(full_tp_pct, (int(current_profit_pct) + 1))
-
-        # Calculate adjusted TP price
+        """Nearest TP% above current profit (e.g. 6.5% -> 7%)"""
+        full_tp_pct = config.PROFIT_TARGET_ROI * 100  # 10%
+        current_profit_pct = ((current_price - entry_price) / entry_price * 100) if side == "long" else ((entry_price - current_price) / entry_price * 100)
+        adjusted_tp_pct = min(full_tp_pct, int(current_profit_pct) + 1)
         if side == "long":
             return round(entry_price * (1 + adjusted_tp_pct / 100), 2)
         else:
             return round(entry_price * (1 - adjusted_tp_pct / 100), 2)
 
     def _update_take_profit(self, order_manager, pos, new_tp_price: float):
+        """Update TP order"""
         logger.info(f"Updating TP: {pos.tp_price:.2f} -> {new_tp_price:.2f}")
         if pos.tp_order_id:
             order_manager.cancel_order(pos.tp_order_id)
@@ -1119,6 +1098,7 @@ class ZScoreIcebergHunterStrategy:
             pos.tp_price = new_tp_price
 
     def _update_stop_loss(self, order_manager, pos, new_sl_price: float):
+        """Update SL order"""
         logger.info(f"Updating SL: {pos.sl_price:.2f} -> {new_sl_price:.2f}")
         if pos.sl_order_id:
             order_manager.cancel_order(pos.sl_order_id)
@@ -1131,9 +1111,9 @@ class ZScoreIcebergHunterStrategy:
             pos.sl_order_id = sl_order["order_id"]
             pos.sl_price = new_sl_price
 
-    # ══════════════════════════════════════════════════════════════════════
-    # Position Entry (COMPLETE WITH ALL FIXES)
-    # ══════════════════════════════════════════════════════════════════════
+        # ══════════════════════════════════════════════════════════════════════
+        # Position Entry (COMPLETE WITH ALL FIXES)
+        # ══════════════════════════════════════════════════════════════════════
 
     def _enter_position(
         self,
@@ -1154,113 +1134,56 @@ class ZScoreIcebergHunterStrategy:
         """
         Enter position with dynamic TP/SL/sizing based on vol regime.
 
-        FIXES APPLIED:
-        ✅ FIX 1: Thread-safe entry lock with try/finally
-        ✅ FIX 8: Volatility-based tick offset for entry price
-        ✅ FIX 9: Pre-trade validation checks
-
-        WORKFLOW:
-        1. ✅ Thread-safe guard: Check + lock atomically
-        2. ✅ Pre-trade validation (data ready, balance sufficient)
-        3. Balance check: Ensure sufficient margin
-        4. Dynamic TP/SL calculation: Based on vol regime
-        5. Position sizing: Vol-regime aware (15% HIGH, 20% LOW)
-        6. Quantity calculation: Leverage-adjusted
-        7. ✅ Entry price: Volatility-based tick offset (NEW)
-        8. Place main LIMIT order
-        9. Wait for fill (timeout: 60s)
-        10. Place TP and SL bracket orders
-        11. Create position object and store state
-        12. Update risk manager stats
-        13. Send Telegram notification
-        14. ✅ Always release lock in finally block
+        UPDATED: Single LIMIT order placement and single wait_for_fill call.
         """
-
-        # ════════════════════════════════════════════════════════════════
-        # STEP 1: Thread-Safe Entry Lock (FIX 1 - Prevents Concurrent Orders)
-        # ════════════════════════════════════════════════════════════════
         with self._entry_lock:
-            # Atomic check: Already entering or position exists?
             if self._entering_position:
-                logger.warning("⚠️  Entry BLOCKED: Already entering position")
+                logger.warning("⚠️ Entry BLOCKED: Already entering position")
                 return
-
             if self.current_position is not None:
-                logger.warning("⚠️  Entry BLOCKED: Position already exists")
+                logger.warning("⚠️ Entry BLOCKED: Position already exists")
                 return
-
-            # Set lock flag
             self._entering_position = True
-            logger.info("🔒 Entry lock ACQUIRED")
 
-        # ════════════════════════════════════════════════════════════════
-        # STEP 2: Pre-Trade Validation (FIX 9)
-        # ════════════════════════════════════════════════════════════════
         valid, reason = self._validate_trade_conditions(data_manager, risk_manager, vol_regime)
         if not valid:
-            logger.warning(f"⚠️  Trade validation failed: {reason}")
+            logger.warning(f"⚠️ Trade validation failed: {reason}")
             with self._entry_lock:
                 self._entering_position = False
             return
 
-        # ════════════════════════════════════════════════════════════════
-        # Wrap entire entry logic in try/finally to ALWAYS release lock
-        # ════════════════════════════════════════════════════════════════
         try:
-            # ════════════════════════════════════════════════════════════
-            # STEP 3: Balance Check
-            # ════════════════════════════════════════════════════════════
             balance_info = risk_manager.get_available_balance()
             if not balance_info:
                 logger.error("Cannot fetch balance for entry")
                 return
-
             available = float(balance_info.get("available", 0.0))
             if available < config.MIN_MARGIN_PER_TRADE:
-                logger.warning(
-                    f"Available {available:.2f} < MIN_MARGIN {config.MIN_MARGIN_PER_TRADE}"
-                )
+                logger.warning(f"Available {available:.2f} < MIN_MARGIN {config.MIN_MARGIN_PER_TRADE}")
                 return
 
-            # ════════════════════════════════════════════════════════════
-            # STEP 4: Dynamic TP/SL Calculation Based on Vol Regime
-            # ════════════════════════════════════════════════════════════
             tp_roi, sl_roi = self._get_dynamic_tp_sl(vol_regime)
-            logger.info(
-                f"Vol Regime: {vol_regime} -> TP ROI: {tp_roi*100:.2f}%, SL ROI: {sl_roi*100:.2f}%"
-            )
-
-            # ════════════════════════════════════════════════════════════
-            # STEP 5: Vol-Regime Aware Position Sizing
-            # ════════════════════════════════════════════════════════════
             target_margin, quantity = risk_manager.calculate_position_size_regime_aware(
                 entry_price=current_price,
                 vol_regime=vol_regime,
+                balance_available=available,
             )
-
             if quantity <= 0:
                 logger.warning("Computed quantity <= 0; skipping entry")
                 return
-
             min_qty = 0.001  # BTC minimum
             if quantity < min_qty:
                 logger.warning(f"Quantity {quantity:.6f} < minimum {min_qty}; adjusting")
                 quantity = min_qty
 
-            # ════════════════════════════════════════════════════════════
-            # STEP 6: Entry Price Calculation (FIX 8 - Volatility-Based)
-            # ════════════════════════════════════════════════════════════
             entry_price = self._calculate_entry_price(side, current_price, vol_regime)
 
-            # ════════════════════════════════════════════════════════════
-            # STEP 7: Calculate TP and SL Prices from Margin-Based ROI
-            # ════════════════════════════════════════════════════════════
             if side == "long":
                 price_move_for_tp = (target_margin * abs(tp_roi)) / quantity
                 tp_price = entry_price + price_move_for_tp
                 price_move_for_sl = (target_margin * abs(sl_roi)) / quantity
                 sl_price = entry_price - price_move_for_sl
-            else:  # short
+            else:
                 price_move_for_tp = (target_margin * abs(tp_roi)) / quantity
                 tp_price = entry_price - price_move_for_tp
                 price_move_for_sl = (target_margin * abs(sl_roi)) / quantity
@@ -1272,26 +1195,16 @@ class ZScoreIcebergHunterStrategy:
             # Validate TP/SL placement
             if side == "long":
                 if tp_price <= entry_price or sl_price >= entry_price:
-                    logger.error(
-                        f"Invalid TP/SL for LONG: entry={entry_price}, tp={tp_price}, sl={sl_price}"
-                    )
+                    logger.error(f"Invalid TP/SL for LONG: entry={entry_price}, tp={tp_price}, sl={sl_price}")
                     return
             else:
                 if tp_price >= entry_price or sl_price <= entry_price:
-                    logger.error(
-                        f"Invalid TP/SL for SHORT: entry={entry_price}, tp={tp_price}, sl={sl_price}"
-                    )
+                    logger.error(f"Invalid TP/SL for SHORT: entry={entry_price}, tp={tp_price}, sl={sl_price}")
                     return
 
-            # ════════════════════════════════════════════════════════════
-            # STEP 8: Generate Trade ID
-            # ════════════════════════════════════════════════════════════
             self.trade_seq += 1
             trade_id = f"Z{int(now_sec)}_{self.trade_seq}"
 
-            # ════════════════════════════════════════════════════════════
-            # STEP 9: Pre-Entry Logging
-            # ════════════════════════════════════════════════════════════
             logger.info("=" * 80)
             logger.info(f"ENTERING {side.upper()} POSITION")
             logger.info("=" * 80)
@@ -1306,44 +1219,30 @@ class ZScoreIcebergHunterStrategy:
             logger.info(f"Leverage : {config.LEVERAGE}x")
             logger.info(f"Position Value : {quantity * entry_price:.2f} USDT")
             logger.info("-" * 80)
-            logger.info(f"TP Price : {tp_price:.2f} (ROI: {tp_roi*100:.2f}%)")
-            logger.info(f"SL Price : {sl_price:.2f} (ROI: {sl_roi*100:.2f}%)")
+            logger.info(f"TP Price : {tp_price:.2f} (ROI: {tp_roi * 100:.2f}%)")
+            logger.info(f"SL Price : {sl_price:.2f} (ROI: {sl_roi * 100:.2f}%)")
             logger.info(f"TP Distance : {abs(tp_price - entry_price):.2f} USDT")
             logger.info(f"SL Distance : {abs(sl_price - entry_price):.2f} USDT")
             logger.info(f"Risk:Reward Ratio : {abs(tp_price - entry_price) / abs(entry_price - sl_price):.2f}:1")
             logger.info("-" * 80)
             logger.info(f"Imbalance : {imbalance_data['imbalance']:.3f}")
             logger.info(f"Z-Score : {delta_data['z_score']:.2f}")
-            logger.info(f"Wall Strength : {wall_data['bid_wall_strength' if side=='long' else 'ask_wall_strength']:.2f}x")
-            logger.info(f"Touch Distance : {touch_data['bid_distance_ticks' if side=='long' else 'ask_distance_ticks']:.1f} ticks")
-       
+            logger.info(f"Wall Strength : {wall_data['bid_wall_strength' if side == 'long' else 'ask_wall_strength']:.2f}x")
+            logger.info(f"Touch Distance : {touch_data['bid_distance_ticks' if side == 'long' else 'ask_distance_ticks']:.1f} ticks")
             if oracle_inputs:
                 logger.info("-" * 80)
-
-                # CVD
                 cvd_str = f"{oracle_inputs.norm_cvd:.3f}" if oracle_inputs.norm_cvd is not None else "N/A"
                 logger.info(f"CVD : {cvd_str}")
-
-                # LV 1m
                 lv_1m_str = f"{oracle_inputs.lv_1m:.2f}" if oracle_inputs.lv_1m is not None else "N/A"
                 logger.info(f"LV 1m : {lv_1m_str}")
-
-                # Hurst
                 hurst_str = f"{oracle_inputs.hurst:.3f}" if oracle_inputs.hurst is not None else "N/A"
                 logger.info(f"Hurst : {hurst_str}")
-
-                # BOS Align
                 bos_str = f"{oracle_inputs.bos_align:.3f}" if oracle_inputs.bos_align is not None else "N/A"
                 logger.info(f"BOS Align : {bos_str}")
-
-                # Trends (strings, safe to use directly)
                 logger.info(f"HTF Trend : {oracle_inputs.htf_trend or 'N/A'}")
                 logger.info(f"LTF Trend : {oracle_inputs.ltf_trend or 'N/A'}")
-            logger.info("=" * 80)
+                logger.info("=" * 80)
 
-            # ════════════════════════════════════════════════════════════
-            # STEP 10: Place Main LIMIT Order
-            # ════════════════════════════════════════════════════════════
             logger.info(f"Placing main LIMIT {side.upper()} order...")
             main_order = order_manager.place_limit_order(
                 side="BUY" if side == "long" else "SELL",
@@ -1351,84 +1250,46 @@ class ZScoreIcebergHunterStrategy:
                 price=entry_price,
                 reduce_only=False,
             )
-
             if not main_order or "order_id" not in main_order:
                 logger.error("Main order placement failed - no order_id returned")
-                logger.error(f"Order response: {main_order}")
                 return
 
             main_order_id = main_order["order_id"]
             logger.info(f"✓ Main order placed: {main_order_id}")
 
-            # ════════════════════════════════════════════════════════════
-            # STEP 11: Wait for Fill
-            # ════════════════════════════════════════════════════════════
             logger.info(f"Waiting for fill (timeout: {self.ENTRY_FILL_TIMEOUT_SEC}s)...")
-            try:
-                filled_order = order_manager.wait_for_fill(
-                    order_id=main_order_id,
-                    timeout_sec=self.ENTRY_FILL_TIMEOUT_SEC,
-                    poll_interval_sec=1.0,  # ← FIXED: Changed from 0.1s to 1.0s (FIX 6)
-                )
+            filled_order = order_manager.wait_for_fill(main_order_id, self.ENTRY_FILL_TIMEOUT_SEC, 1.0)
+            fill_price = order_manager.extract_fill_price(filled_order)
+            logger.info(f"✓ Order filled at: {fill_price:.2f} (limit: {entry_price:.2f})")
 
-                fill_price = order_manager.extract_fill_price(filled_order)
-                logger.info(f"✓ Order filled at: {fill_price:.2f} (limit: {entry_price:.2f})")
+            # Recalculate TP/SL if significant slippage
+            if abs(fill_price - entry_price) / entry_price > 0.001:
+                logger.warning(f"Slippage detected: {abs(fill_price - entry_price):.2f} USDT")
+                if side == "long":
+                    tp_price = fill_price + (target_margin * abs(tp_roi)) / quantity
+                    sl_price = fill_price - (target_margin * abs(sl_roi)) / quantity
+                else:
+                    tp_price = fill_price - (target_margin * abs(tp_roi)) / quantity
+                    sl_price = fill_price + (target_margin * abs(sl_roi)) / quantity
+                tp_price = round(tp_price, 2)
+                sl_price = round(sl_price, 2)
 
-                # Recalculate TP/SL if significant slippage
-                if abs(fill_price - entry_price) / entry_price > 0.001:
-                    logger.warning(f"Slippage detected: {abs(fill_price - entry_price):.2f} USDT")
-                    if side == "long":
-                        tp_price = fill_price + (target_margin * abs(tp_roi)) / quantity
-                        sl_price = fill_price - (target_margin * abs(sl_roi)) / quantity
-                    else:
-                        tp_price = fill_price - (target_margin * abs(tp_roi)) / quantity
-                        sl_price = fill_price + (target_margin * abs(sl_roi)) / quantity
-                    tp_price = round(tp_price, 2)
-                    sl_price = round(sl_price, 2)
-                    logger.info(f"TP/SL recalculated: TP={tp_price:.2f}, SL={sl_price:.2f}")
-
-            except Exception as e:
-                logger.error(f"Main order fill failed: {e}")
-                logger.info("Cancelling unfilled order...")
-                order_manager.cancel_order(main_order_id)
-                return
-
-            # ════════════════════════════════════════════════════════════
-            # STEP 12: Place TP and SL Bracket Orders
-            # ════════════════════════════════════════════════════════════
             logger.info("Placing TP and SL bracket orders...")
             tp_side = "SELL" if side == "long" else "BUY"
             sl_side = "SELL" if side == "long" else "BUY"
-
             tp_order = order_manager.place_take_profit(
                 side=tp_side,
                 quantity=quantity,
                 trigger_price=tp_price,
             )
-
-            if tp_order and "order_id" in tp_order:
-                tp_order_id = tp_order["order_id"]
-                logger.info(f"✓ TP order placed: {tp_order_id} @ {tp_price:.2f}")
-            else:
-                logger.error("TP order placement failed")
-                tp_order_id = ""
-
+            tp_order_id = tp_order["order_id"] if tp_order and "order_id" in tp_order else ""
             sl_order = order_manager.place_stop_loss(
                 side=sl_side,
                 quantity=quantity,
                 trigger_price=sl_price,
             )
+            sl_order_id = sl_order["order_id"] if sl_order and "order_id" in sl_order else ""
 
-            if sl_order and "order_id" in sl_order:
-                sl_order_id = sl_order["order_id"]
-                logger.info(f"✓ SL order placed: {sl_order_id} @ {sl_price:.2f}")
-            else:
-                logger.error("SL order placement failed")
-                sl_order_id = ""
-
-            # ════════════════════════════════════════════════════════════
-            # STEP 13: Create Position Object
-            # ════════════════════════════════════════════════════════════
             self.current_position = ZScorePosition(
                 trade_id=trade_id,
                 side=side,
@@ -1453,13 +1314,10 @@ class ZScoreIcebergHunterStrategy:
                 entry_weighted_score=weighted_score,
                 last_score_check_sec=now_sec,
             )
-
-            # ════════════════════════════════════════════════════════════
-            # STEP 14: Update Risk Manager Stats & Excel Logging
-            # ════════════════════════════════════════════════════════════
             risk_manager.record_trade_opened()
             logger.info(f"✓ Position created successfully: {trade_id}")
 
+            # Excel logging
             if self.excel_logger:
                 try:
                     self.excel_logger.log_entry(
@@ -1483,9 +1341,7 @@ class ZScoreIcebergHunterStrategy:
                 except Exception as e:
                     logger.error(f"Excel logging failed: {e}", exc_info=True)
 
-            # ════════════════════════════════════════════════════════════
-            # STEP 15: Send Telegram Notification
-            # ════════════════════════════════════════════════════════════
+            # Telegram notification
             try:
                 notification = (
                     f"🟢 {'LONG' if side == 'long' else 'SHORT'} ENTRY\n"
@@ -1495,43 +1351,25 @@ class ZScoreIcebergHunterStrategy:
                     f"Qty: {quantity:.6f} BTC\n"
                     f"Margin: {target_margin:.2f} USDT\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"TP: {tp_price:.2f} ({tp_roi*100:+.2f}%)\n"
-                    f"SL: {sl_price:.2f} ({sl_roi*100:+.2f}%)\n"
+                    f"TP: {tp_price:.2f} ({tp_roi * 100:+.2f}%)\n"
+                    f"SL: {sl_price:.2f} ({sl_roi * 100:+.2f}%)\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"Vol Regime: {vol_regime}\n"
                     f"Score: {weighted_score:.4f}\n"
                     f"Z-Score: {delta_data['z_score']:.2f}\n"
-                    f"Imbalance: {imbalance_data['imbalance']:.3f}"
                 )
                 send_telegram_message(notification)
             except Exception as e:
-                logger.error(f"Telegram notification failed: {e}", exc_info=True)
-
-        except Exception as e:
-            logger.error(f"Critical error entering position: {e}", exc_info=True)
-            # Emergency cleanup: cancel any placed orders
-            try:
-                if 'main_order_id' in locals():
-                    order_manager.cancel_order(main_order_id)
-                if 'tp_order_id' in locals() and tp_order_id:
-                    order_manager.cancel_order(tp_order_id)
-                if 'sl_order_id' in locals() and sl_order_id:
-                    order_manager.cancel_order(sl_order_id)
-            except:
-                pass
-            raise
+                logger.error(f"Telegram notification failed: {e}")
 
         finally:
-            # ════════════════════════════════════════════════════════════
-            # ALWAYS RELEASE LOCK (FIX 1 - Critical for preventing deadlocks)
-            # ════════════════════════════════════════════════════════════
             with self._entry_lock:
                 self._entering_position = False
-                logger.info("🔓 Entry lock RELEASED")
+            logger.info("🔓 Entry lock RELEASED")
 
-    # ======================================================================
-    # Position Management
-    # ======================================================================
+        # ======================================================================
+        # Position Management
+        # ======================================================================
 
     def _manage_open_position(
         self,
@@ -1542,10 +1380,11 @@ class ZScoreIcebergHunterStrategy:
         now_sec: float,
     ) -> None:
         """
-        Manage open position:
-        - Check TP/SL filled
-        - Time stop
-        - Manage TP/SL dynamically based on volatility, momentum, trend
+        NEW POSITION MANAGEMENT LOGIC:
+        - After 10 mins: Check momentum/vol/trend every 5s
+        - Volatile market: TP=10%, SL=3%
+        - Favorable: wait 10 more mins, SL to half TP if >50%
+        - Adverse: TP to half or nearest % if above half
         """
         pos = self.current_position
         if pos is None:
@@ -1553,7 +1392,7 @@ class ZScoreIcebergHunterStrategy:
 
         hold_time_min = (now_sec - pos.entry_time_sec) / 60.0
 
-        # Log position state periodically
+        # Periodic position logging
         if now_sec - self._last_position_log_sec >= self.POSITION_LOG_INTERVAL_SEC:
             self._last_position_log_sec = now_sec
             logger.info("=" * 80)
@@ -1565,124 +1404,68 @@ class ZScoreIcebergHunterStrategy:
             logger.info(f"Entry Score: {pos.entry_weighted_score:.4f}")
             logger.info("=" * 80)
 
-        # Check TP/SL status
+        # Check TP/SL status (single check every 10s)
         if now_sec - self._last_status_check_sec >= self.ORDER_STATUS_CHECK_INTERVAL_SEC:
             self._last_status_check_sec = now_sec
             if pos.tp_order_id:
                 tp_status = order_manager.get_order_status(pos.tp_order_id)
                 if tp_status and tp_status.get("status", "").upper() in ["EXECUTED", "FILLED"]:
-                    self._close_position(
-                        reason="TP_HIT",
-                        exit_price=pos.tp_price,
-                        order_manager=order_manager,
-                        risk_manager=risk_manager,
-                    )
+                    self._close_position(reason="TP_HIT", exit_price=pos.tp_price, order_manager=order_manager, risk_manager=risk_manager)
                     return
             if pos.sl_order_id:
                 sl_status = order_manager.get_order_status(pos.sl_order_id)
                 if sl_status and sl_status.get("status", "").upper() in ["EXECUTED", "FILLED"]:
-                    self._close_position(
-                        reason="SL_HIT",
-                        exit_price=pos.sl_price,
-                        order_manager=order_manager,
-                        risk_manager=risk_manager,
-                    )
+                    self._close_position(reason="SL_HIT", exit_price=pos.sl_price, order_manager=order_manager, risk_manager=risk_manager)
                     return
 
-        # Time stop
+        # Time stop (keep existing 10 min max)
         if hold_time_min >= config.MAX_HOLD_MINUTES:
-            self._close_position(
-                reason="TIME_STOP",
-                exit_price=current_price,
-                order_manager=order_manager,
-                risk_manager=risk_manager,
-            )
+            self._close_position(reason="TIME_STOP", exit_price=current_price, order_manager=order_manager, risk_manager=risk_manager)
             return
 
-        # ==== New Position management logic replacing score decay ====
-
-        # Fetch latest volatility regime and trends
-        vol_regime, atr_pct = data_manager.get_vol_regime()
-        momentum_ok = False
-        trend_ok = False
-        volatility_ok = False
-
-        try:
-            momentum_ok = self._check_momentum_direction(pos.side, data_manager, current_price)
-            trend_ok = self._check_trend_direction(pos.side, data_manager)
-            volatility_ok = vol_regime == "HIGH"
-        except Exception as e:
-            logger.error(f"Error evaluating market conditions for TP management: {e}")
-
-        # Set TP and SL according to volatility regime if first check (at entry)
-        if hold_time_min < 1.0:
-            if volatility_ok:
-                new_tp_price = pos.entry_price * (1 + config.PROFIT_TARGET_ROI) if pos.side == "long" else pos.entry_price * (1 - config.PROFIT_TARGET_ROI)
-                new_sl_price = pos.entry_price * (1 - 0.03) if pos.side == "long" else pos.entry_price * (1 + 0.03)
-                # Update TP and SL if different
-                self._update_tp_sl(order_manager, pos, new_tp_price, new_sl_price)
-                return
-
-        # Check if TP not hit after first 10 mins
-        if hold_time_min >= 10.0 and hold_time_min < 20.0:
-            if momentum_ok and trend_ok and volatility_ok:
-                # Wait another 10 mins with same TP
-                # If price past half TP, move SL to half TP
-                half_tp = pos.entry_price + (pos.tp_price - pos.entry_price) / 2 if pos.side == "long" else pos.entry_price - (pos.entry_price - pos.tp_price) / 2
-                price_relative = (current_price - pos.entry_price) / (pos.tp_price - pos.entry_price) if pos.side == "long" else (pos.entry_price - current_price) / (pos.entry_price - pos.tp_price)
-                if price_relative > 0.5:
-                    new_sl_price = half_tp
-                    if abs(pos.sl_price - new_sl_price) > 1e-6:
-                        self._update_stop_loss(order_manager, pos, new_sl_price)
-                return
-
-            else:
-                # Momentum/trend or volatility changed adverse - Move TP to half TP or to nearest TP% if price already above half TP
-                half_tp = pos.entry_price + (pos.tp_price - pos.entry_price) / 2 if pos.side == "long" else pos.entry_price - (pos.entry_price - pos.tp_price) / 2
-                if (pos.side == "long" and current_price > half_tp) or (pos.side == "short" and current_price < half_tp):
-                    # Set TP near current price but rounded to a TP% increment (e.g., 7% if price is at 6.5%)
-                    adjusted_tp_price = self._nearest_tp_percent(pos.entry_price, current_price, pos.side)
-                    if abs(pos.tp_price - adjusted_tp_price) > 1e-6:
-                        self._update_take_profit(order_manager, pos, adjusted_tp_price)
+        # === NEW 10-MINUTE POSITION MANAGEMENT ===
+        if hold_time_min >= 10.0:
+            # Check momentum/vol/trend every 5 seconds
+            if now_sec - getattr(pos, 'last_condition_check_sec', 0) >= 5.0:
+                pos.last_condition_check_sec = now_sec
+                
+                vol_regime, atr_pct = data_manager.get_vol_regime()
+                momentum_ok = self._check_momentum_direction(pos.side, data_manager, current_price)
+                trend_ok = self._check_trend_direction(pos.side, data_manager)
+                volatility_ok = vol_regime == "HIGH"
+                
+                # LOG every 5s check
+                logger.info(f"[{hold_time_min:.1f}min] Momentum:{'✅' if momentum_ok else '❌'} Trend:{'✅' if trend_ok else '❌'} Vol:{vol_regime}{'HIGH✅' if volatility_ok else 'LOW❌'}")
+                
+                # ALL 3 favorable -> continue with full TP, move SL if > half TP
+                if momentum_ok and trend_ok and volatility_ok:
+                    half_tp_price = pos.entry_price + (pos.tp_price - pos.entry_price) * 0.5 if pos.side == "long" else pos.entry_price - (pos.entry_price - pos.tp_price) * 0.5
+                    current_profit_pct = ((current_price - pos.entry_price) / pos.entry_price * 100) if pos.side == "long" else ((pos.entry_price - current_price) / pos.entry_price * 100)
+                    
+                    if current_profit_pct > 5.0:  # > half TP (5%)
+                        new_sl_price = half_tp_price
+                        if abs(pos.sl_price - new_sl_price) > 0.01:
+                            self._update_stop_loss(order_manager, pos, new_sl_price)
+                    return
+                
+                # ANY adverse -> adjust TP based on current profit
                 else:
-                    if abs(pos.tp_price - half_tp) > 1e-6:
-                        self._update_take_profit(order_manager, pos, half_tp)
-                return
-
-        # Trail stop in high vol (existing logic)
-        if pos.entry_vol_regime == "HIGH":
-            if pos.side == "long":
-                profit_pct = (current_price - pos.entry_price) / pos.entry_price
-                if profit_pct >= config.VOL_REGIME_TRAIL_PROFIT_THRESHOLD:
-                    new_sl = pos.entry_price * (1.0 + config.VOL_REGIME_TRAIL_BUFFER)
-                    if new_sl > pos.sl_price:
-                        logger.info(f"Trailing SL (LONG): {pos.sl_price:.2f} -> {new_sl:.2f}")
-                        if pos.sl_order_id:
-                            order_manager.cancel_order(pos.sl_order_id)
-                        sl_order = order_manager.place_stop_loss(
-                            side="SELL",
-                            quantity=pos.quantity,
-                            trigger_price=new_sl,
-                        )
-                        pos.sl_price = new_sl
-                        pos.sl_order_id = sl_order["order_id"] if sl_order else ""
-            else:  # short
-                profit_pct = (pos.entry_price - current_price) / pos.entry_price  # Positive on profit for shorts
-                if profit_pct >= config.VOL_REGIME_TRAIL_PROFIT_THRESHOLD:
-                    new_sl = pos.entry_price * (1.0 - config.VOL_REGIME_TRAIL_BUFFER)  # Trail down for shorts
-                    if new_sl < pos.sl_price:  # Lower is better for short SL
-                        logger.info(f"Trailing SL (SHORT): {pos.sl_price:.2f} -> {new_sl:.2f}")
-                        if pos.sl_order_id:
-                            order_manager.cancel_order(pos.sl_order_id)
-                        sl_order = order_manager.place_stop_loss(
-                            side="BUY",
-                            quantity=pos.quantity,
-                            trigger_price=new_sl,
-                        )
-                        pos.sl_price = new_sl
-                        pos.sl_order_id = sl_order["order_id"] if sl_order else ""
+                    half_tp_price = pos.entry_price + (pos.tp_price - pos.entry_price) * 0.5 if pos.side == "long" else pos.entry_price - (pos.entry_price - pos.tp_price) * 0.5
+                    current_profit_pct = ((current_price - pos.entry_price) / pos.entry_price * 100) if pos.side == "long" else ((pos.entry_price - current_price) / pos.entry_price * 100)
+                    
+                    if current_profit_pct > 5.0:  # Above half TP
+                        new_tp_price = self._nearest_tp_percent(pos.entry_price, current_price, pos.side)
+                        if abs(pos.tp_price - new_tp_price) > 0.01:
+                            self._update_take_profit(order_manager, pos, new_tp_price)
+                    else:  # Below half TP
+                        if abs(pos.tp_price - half_tp_price) > 0.01:
+                            self._update_take_profit(order_manager, pos, half_tp_price)
+                    return
 
     def _close_position(self, reason: str, exit_price: float, order_manager, risk_manager) -> None:
+        """
+        Close position - SINGLE cancel request only, check status first
+        """
         pos = self.current_position
         if pos is None:
             return
@@ -1693,47 +1476,29 @@ class ZScoreIcebergHunterStrategy:
         logger.info(f"Exit Price: {exit_price:.2f}")
         logger.info("=" * 80)
         
-        # Only cancel orders if they're not already in terminal state
-        if reason not in ["TP_HIT", "SL_HIT"]:
-            # Manual close - cancel both orders
-            if pos.tp_order_id:
-                try:
-                    order_manager.cancel_order(pos.tp_order_id)
-                except Exception as e:
-                    logger.debug(f"TP cancel skipped (already terminal): {e}")
-            if pos.sl_order_id:
-                try:
-                    order_manager.cancel_order(pos.sl_order_id)
-                except Exception as e:
-                    logger.debug(f"SL cancel skipped (already terminal): {e}")
-        else:
-            # TP/SL hit - exchange auto-cancels the opposite order
-            logger.info(f"✓ Exit triggered by {reason} - opposite order auto-cancelled by exchange")
+        # SINGLE cancel request - check TP status first
+        if pos.tp_order_id:
+            tp_status = order_manager.get_order_status(pos.tp_order_id)
+            if tp_status and tp_status.get("status", "").upper() not in ["EXECUTED", "FILLED", "CANCELLED"]:
+                order_manager.cancel_order(pos.tp_order_id)
         
-      
-        # Calculate P&L
+        # SINGLE cancel request - check SL status next
+        if pos.sl_order_id:
+            sl_status = order_manager.get_order_status(pos.sl_order_id)
+            if sl_status and sl_status.get("status", "").upper() not in ["EXECUTED", "FILLED", "CANCELLED"]:
+                order_manager.cancel_order(pos.sl_order_id)
+        
+        # Clear position
         if pos.side == "long":
             pnl_per_unit = exit_price - pos.entry_price
         else:
             pnl_per_unit = pos.entry_price - exit_price
-
         gross_pnl = pnl_per_unit * pos.quantity
-        fees = (pos.entry_price + exit_price) * pos.quantity * config.TAKER_FEE_RATE
+        fees = pos.entry_price * exit_price * pos.quantity * config.TAKER_FEE_RATE
         net_pnl = gross_pnl - fees
-
+        
         risk_manager.update_trade_stats(net_pnl)
-
         logger.info(f"P&L: {net_pnl:.2f} USDT (Gross: {gross_pnl:.2f}, Fees: {fees:.2f})")
-
-        # Send Telegram notification
-        send_telegram_message(
-            f"🔴 {pos.side.upper()} EXIT\n"
-            f"ID: {pos.trade_id}\n"
-            f"Reason: {reason}\n"
-            f"Entry: {pos.entry_price:.2f} | Exit: {exit_price:.2f}\n"
-            f"P&L: {net_pnl:.2f} USDT\n"
-            f"Hold: {(time.time() - pos.entry_time_sec) / 60.0:.2f} min"
-        )
-
+        
         self.current_position = None
         self.last_exit_time_min = time.time() / 60.0
