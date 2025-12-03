@@ -133,16 +133,15 @@ class ZScoreIcebergBot:
                 logger.warning("Could not set leverage (may already be set)")
 
             logger.info("Fetching available USDT futures balance...")
-            balance_info = self.risk_manager.get_available_balance()
-
+            # Fetching available USDT futures balance...
+            balance_info = risk_manager.get_available_balance()
             if balance_info:
-                logger.info(
-                    f"Initial Balance: {balance_info['available']:.2f} "
-                    f"{balance_info['currency']}"
-                )
+                available = float(balance_info.get("available", 0.0))
+                logger.info(f"Initial Balance: {available:.2f} USDT")
             else:
-                logger.error("Could not fetch balance; aborting")
-                return
+                logger.warning("Could not fetch balance - using fallback")
+                logger.info("Initial Balance: UNKNOWN USDT")
+
 
             logger.info("Starting Z-Score data manager (WebSocket streams)...")
             if not self.data_manager.start():
