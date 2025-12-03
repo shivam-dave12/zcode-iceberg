@@ -255,7 +255,7 @@ class ZScoreDataManager:
             limit = max(window_min, ltf_lookback) + 10
 
             logger.info(f"Warming up 1m klines (limit={limit})...")
-            resp = self._fetch_rest_klines(limit=limit, interval=htf_interval)
+            resp = self._fetch_rest_klines(limit=limit, interval=1)
 
 
             if not resp or "data" not in resp:
@@ -361,7 +361,7 @@ class ZScoreDataManager:
             limit = htf_span + htf_lookback + 10
 
             logger.info(f"Warming up {bos_interval}m BOS klines (limit={limit})...")
-            resp = self._fetch_rest_klines(limit=limit, interval=htf_interval)
+            resp = self._fetch_rest_klines(limit=limit, interval=bos_interval)
 
 
             if not resp or "data" not in resp:
@@ -836,8 +836,8 @@ class ZScoreDataManager:
             if len(X_list) == 0:
                 return
 
-            X = torch.tensor(np.asarray(X_list), dtype=torch.float32)
-            y = torch.tensor(np.asarray(y_list), dtype=torch.long)
+            X = torch.tensor(np.asarray(X_list), dtype=torch.float32).clone().detach()
+            y = torch.tensor(np.asarray(y_list), dtype=torch.long).clone().detach()
 
             # Initialize model
             self._htf_lstm = TrendLSTM(
@@ -850,7 +850,7 @@ class ZScoreDataManager:
             self._htf_lstm.train()
             for epoch in range(20):
                 optimizer.zero_grad()
-                outputs = self._htf_lstm(X)
+                outputs = self._htf_lstm(X.clone())
                 loss = criterion(outputs, y)
                 loss.backward()
                 optimizer.step()
@@ -982,8 +982,8 @@ class ZScoreDataManager:
             if len(X_list) == 0:
                 return
 
-            X = torch.tensor(np.asarray(X_list), dtype=torch.float32)
-            y = torch.tensor(np.asarray(y_list), dtype=torch.long)
+            X = torch.tensor(np.asarray(X_list), dtype=torch.float32).clone().detach()
+            y = torch.tensor(np.asarray(y_list), dtype=torch.long).clone().detach()
 
             self._ltf_lstm = TrendLSTM(
                 input_dim=1, hidden_dim=16, num_layers=1, num_classes=3
@@ -994,7 +994,7 @@ class ZScoreDataManager:
             self._ltf_lstm.train()
             for epoch in range(20):
                 optimizer.zero_grad()
-                outputs = self._ltf_lstm(X)
+                outputs = self._ltf_lstm(X.clone())
                 loss = criterion(outputs, y)
                 loss.backward()
                 optimizer.step()
