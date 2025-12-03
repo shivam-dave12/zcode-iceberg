@@ -1236,28 +1236,28 @@ class ZScoreIcebergHunterStrategy:
             logger.info(f"Wall Strength : {wall_data['bid_wall_strength' if side=='long' else 'ask_wall_strength']:.2f}x")
             logger.info(f"Touch Distance : {touch_data['bid_distance_ticks' if side=='long' else 'ask_distance_ticks']:.1f} ticks")
        
-        if oracle_inputs:
-            logger.info("-" * 80)
+            if oracle_inputs:
+                logger.info("-" * 80)
 
-            # CVD
-            cvd_str = f"{oracle_inputs.norm_cvd:.3f}" if oracle_inputs.norm_cvd is not None else "N/A"
-            logger.info(f"CVD : {cvd_str}")
+                # CVD
+                cvd_str = f"{oracle_inputs.norm_cvd:.3f}" if oracle_inputs.norm_cvd is not None else "N/A"
+                logger.info(f"CVD : {cvd_str}")
 
-            # LV 1m
-            lv_1m_str = f"{oracle_inputs.lv_1m:.2f}" if oracle_inputs.lv_1m is not None else "N/A"
-            logger.info(f"LV 1m : {lv_1m_str}")
+                # LV 1m
+                lv_1m_str = f"{oracle_inputs.lv_1m:.2f}" if oracle_inputs.lv_1m is not None else "N/A"
+                logger.info(f"LV 1m : {lv_1m_str}")
 
-            # Hurst
-            hurst_str = f"{oracle_inputs.hurst:.3f}" if oracle_inputs.hurst is not None else "N/A"
-            logger.info(f"Hurst : {hurst_str}")
+                # Hurst
+                hurst_str = f"{oracle_inputs.hurst:.3f}" if oracle_inputs.hurst is not None else "N/A"
+                logger.info(f"Hurst : {hurst_str}")
 
-            # BOS Align
-            bos_str = f"{oracle_inputs.bos_align:.3f}" if oracle_inputs.bos_align is not None else "N/A"
-            logger.info(f"BOS Align : {bos_str}")
+                # BOS Align
+                bos_str = f"{oracle_inputs.bos_align:.3f}" if oracle_inputs.bos_align is not None else "N/A"
+                logger.info(f"BOS Align : {bos_str}")
 
-            # Trends (strings, safe to use directly)
-            logger.info(f"HTF Trend : {oracle_inputs.htf_trend or 'N/A'}")
-            logger.info(f"LTF Trend : {oracle_inputs.ltf_trend or 'N/A'}")
+                # Trends (strings, safe to use directly)
+                logger.info(f"HTF Trend : {oracle_inputs.htf_trend or 'N/A'}")
+                logger.info(f"LTF Trend : {oracle_inputs.ltf_trend or 'N/A'}")
             logger.info("=" * 80)
 
             # ════════════════════════════════════════════════════════════
