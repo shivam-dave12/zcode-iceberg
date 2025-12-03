@@ -30,6 +30,10 @@ torch.manual_seed(42)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
+# DEBUG: enable autograd anomaly detection for LSTM training
+# Disable this in production if you find it too slow.
+torch.autograd.set_detect_anomaly(True)
+
 np.random.seed(42)
 
 import random
@@ -252,7 +256,16 @@ class ZScoreDataManager:
             # REST warmup for 15m BOS candles
             self._warmup_bos_klines_15m()
 
-            return True
+        # Train LSTM models once after warmup (to avoid training spam in-loop)
+        try:
+            if not self._htf_lstm_trained:
+                self.train_htf_lstm()
+            if not self._ltf_lstm_trained:
+                self.train_ltf_lstm()
+        except Exception as e:
+            logger.error(f"Error training LSTMs during startup: {e}", exc_info=True)
+
+        return True
 
         except Exception as e:
             logger.error(f"Error starting ZScoreDataManager: {e}", exc_info=True)
@@ -772,25 +785,34 @@ class ZScoreDataManager:
 
     def get_htf_trend(self) -> Optional[str]:
         """
-        Get HTF (5m) trend using LSTM + EMA-slope + consistency logic.
-        Returns: "UP", "DOWN", "RANGE", or None if insufficient data.
+        Get HTF 5m trend using LSTM + EMA-slope consistency logic.
+        Returns 'UP', 'DOWN', 'RANGE', or None if insufficient data.
+        Uses 2-bar hysteresis via _htf_pending_trend/_htf_confirm_count.
         """
         try:
-            if len(self._htf_5m_closes) < getattr(config, "HTF_LOOKBACK_BARS", 86):
+            # Use snapshot under candle lock to avoid mutation during iteration
+            with self._candles_lock:
+                htf_len = len(self._htf_5m_closes)
+
+            if htf_len < getattr(config, "HTF_LOOKBACK_BARS", 86):
                 return None
 
-            # Ensure LSTM is trained
-            if not self._htf_lstm_trained:
-                self._train_htf_lstm()
+            # Ensure LSTM is trained (once data is ready)
+            if not self._htf_lstm_trained or self._htf_lstm is None:
+                self.train_htf_lstm()
+                if not self._htf_lstm_trained:
+                    return None
 
-            # Compute trend
             trend = self._compute_htf_trend_lstm()
+            if trend is None:
+                return None
 
-            # Hysteresis: require 2 consecutive confirmations before changing trend
+            # Hysteresis: require 2 consecutive confirmations before flipping
             if trend != self._htf_pending_trend:
                 self._htf_pending_trend = trend
                 self._htf_confirm_count = 1
-                return self._last_htf_trend  # Keep old trend
+                # Keep old trend until confirmed
+                return self._last_htf_trend
 
             self._htf_confirm_count += 1
             if self._htf_confirm_count >= 2:
@@ -798,116 +820,142 @@ class ZScoreDataManager:
                 return trend
             else:
                 return self._last_htf_trend
-
         except Exception as e:
             logger.error(f"Error in get_htf_trend: {e}", exc_info=True)
             return None
 
-    def _train_htf_lstm(self) -> None:
-        """Train HTF LSTM on synthetic labels from EMA-slope + consistency."""
+    def train_htf_lstm(self) -> None:
+        """
+        Train HTF LSTM on synthetic labels from EMA-slope consistency.
+        Safe against deque mutation and inplace-grad errors.
+        """
         try:
-            if len(self._htf_5m_closes) < getattr(config, "HTF_LOOKBACK_BARS", 86):
+            # Snapshot closes under lock
+            with self._candles_lock:
+                closes_list = list(self._htf_5m_closes)
+
+            if len(closes_list) < getattr(config, "HTF_LOOKBACK_BARS", 86):
                 return
 
-            closes = np.asarray([c for (_, c) in self._htf_5m_closes], dtype=np.float64)
-
+            closes = np.asarray([c for _, c in closes_list], dtype=np.float64)
             if len(closes) < 50:
                 return
 
-            # Synthetic labels using EMA-slope logic
             span = getattr(config, "HTF_EMA_SPAN", 34)
             lookback = getattr(config, "HTF_LOOKBACK_BARS", 24)
             min_slope = getattr(config, "MIN_TREND_SLOPE", 0.0003)
             consistency = getattr(config, "CONSISTENCY_THRESHOLD", 0.60)
 
-            labels = []
+            # Synthetic labels using EMA-slope logic
+            labels: List[int] = []
             for i in range(len(closes)):
                 if i < span + lookback:
-                    labels.append(2)  # RANGE (not enough history)
+                    # Not enough history – treat as RANGE
+                    labels.append(2)
                     continue
 
                 window = closes[i - lookback : i]
-                ema = pd.Series(window).ewm(span=span, adjust=False).mean().iloc[-1]
-                slope = (ema - closes[i - lookback]) / closes[i - lookback]
-                above = np.sum(window > ema) / len(window)
+                ema = (
+                    pd.Series(window)
+                    .ewm(span=span, adjust=False)
+                    .mean()
+                    .iloc[-1]
+                )
+                base = closes[i - lookback]
+                slope = (ema - base) / base if base != 0 else 0.0
+                above = float(np.sum(window > ema)) / float(len(window))
 
-                if slope > min_slope and above >= consistency:
+                if slope > min_slope and above > consistency:
                     labels.append(0)  # UPTREND
-                elif slope < -min_slope and (1 - above) >= consistency:
+                elif slope < -min_slope and (1.0 - above) > consistency:
                     labels.append(1)  # DOWNTREND
                 else:
                     labels.append(2)  # RANGE
 
             labels = np.asarray(labels, dtype=np.int64)
 
-            # Build features: returns + volume proxy
-            returns = np.diff(closes) / closes[:-1]
+            # Build features: simple returns as volume proxy
+            returns = np.diff(closes)
             returns = np.insert(returns, 0, 0.0)
 
-            # Normalize
             self._htf_norm_mean = float(np.mean(returns))
-            self._htf_norm_std = float(np.std(returns)) + 1e-8
+            self._htf_norm_std = float(np.std(returns) + 1e-8)
+
             returns_norm = (returns - self._htf_norm_mean) / self._htf_norm_std
 
-            # Prepare sequences
-            seq_len = 10
-            X_list = []
-            y_list = []
+            seqlen = 10
+            X_list: List[np.ndarray] = []
+            y_list: List[int] = []
 
-            for i in range(seq_len, len(returns_norm)):
-                X_list.append(returns_norm[i - seq_len : i].reshape(-1, 1))
-                y_list.append(labels[i])
+            for i in range(seqlen, len(returns_norm)):
+                X_list.append(returns_norm[i - seqlen : i].reshape(-1, 1))
+                y_list.append(int(labels[i]))
 
             if len(X_list) == 0:
                 return
 
-            # Create tensors with proper gradient handling
-            X = torch.tensor(np.asarray(X_list), dtype=torch.float32).requires_grad_(False)
+            X = torch.tensor(np.asarray(X_list), dtype=torch.float32)
             y = torch.tensor(np.asarray(y_list), dtype=torch.long)
 
-            # Initialize model
             self._htf_lstm = TrendLSTM(
-                input_dim=1, hidden_dim=16, num_layers=1, num_classes=3
+                input_dim=1,
+                hidden_dim=16,
+                num_layers=1,
+                num_classes=3,
             )
             criterion = nn.CrossEntropyLoss()
             optimizer = optim.Adam(self._htf_lstm.parameters(), lr=0.001)
 
-            # Train - use detached copy in each iteration
             self._htf_lstm.train()
             for epoch in range(20):
                 optimizer.zero_grad()
-                # Create fresh detached copy for each iteration
-                X_batch = X.detach().clone()
-                outputs = self._htf_lstm(X_batch)
+                # New graph each epoch; X is a plain tensor (no grad) so safe
+                outputs = self._htf_lstm(X)
                 loss = criterion(outputs, y)
                 loss.backward()
                 optimizer.step()
 
             self._htf_lstm.eval()
             self._htf_lstm_trained = True
-
             logger.info("HTF LSTM trained successfully")
-
-        except Exception as e:
-            if "gradient computation" not in str(e):
-                    logger.error(f"Error training HTF LSTM: {e}", exc_info=True)
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "inplace" in msg or "gradient computation" in msg:
+                logger.error(
+                    f"HTF LSTM training failed due to inplace/gradient issue: {e}. Skipping.",
+                    exc_info=True,
+                )
             else:
-                    logger.debug(f"LSTM gradient warning (non-critical): {e}")
+                logger.error(f"Error training HTF LSTM: {e}", exc_info=True)
+            self._htf_lstm_trained = False
+        except Exception as e:
+            logger.error(f"Error training HTF LSTM: {e}", exc_info=True)
+            self._htf_lstm_trained = False
 
     def _compute_htf_trend_lstm(self) -> Optional[str]:
-        """Compute HTF trend using trained LSTM."""
+        """
+        Compute HTF trend using trained LSTM.
+        Returns 'UP', 'DOWN', or 'RANGE'.
+        """
         try:
             if not self._htf_lstm_trained or self._htf_lstm is None:
                 return None
 
-            closes = np.asarray([c for (_, c) in self._htf_5m_closes], dtype=np.float64)
+            # Snapshot closes under lock
+            with self._candles_lock:
+                closes_list = list(self._htf_5m_closes)
+
+            closes = np.asarray([c for _, c in closes_list], dtype=np.float64)
             if len(closes) < 11:
                 return None
 
-            returns = np.diff(closes[-11:]) / closes[-11:-1]
-            returns_norm = (returns - self._htf_norm_mean) / self._htf_norm_std
+            returns = np.diff(closes)
+            returns = np.insert(returns, 0, 0.0)
 
-            X = torch.tensor(returns_norm.reshape(1, -1, 1), dtype=torch.float32)
+            returns_norm = (returns - self._htf_norm_mean) / self._htf_norm_std
+            X = torch.tensor(
+                returns_norm.reshape(1, -1, 1), dtype=torch.float32
+            )
 
             with torch.no_grad():
                 outputs = self._htf_lstm(X)
@@ -919,30 +967,37 @@ class ZScoreDataManager:
                 return "DOWN"
             else:
                 return "RANGE"
-
         except Exception as e:
             logger.error(f"Error computing HTF LSTM trend: {e}", exc_info=True)
             return None
+
 
     # ======================================================================
     # LTF Trend (1m LSTM-based)
     # ======================================================================
 
-    def get_ltf_trend(self) -> Optional[str]:
+     def get_ltf_trend(self) -> Optional[str]:
         """
-        Get LTF (1m) trend using LSTM.
-        Returns: "UP", "DOWN", "RANGE", or None.
+        Get LTF 1m trend using LSTM.
+        Returns 'UP', 'DOWN', 'RANGE', or None if insufficient data.
+        Uses 2-bar hysteresis via _ltf_pending_trend/_ltf_confirm_count.
         """
         try:
-            if len(self._ltf_1m_closes) < getattr(config, "LTF_LOOKBACK_BARS", 30):
+            with self._candles_lock:
+                ltf_len = len(self._ltf_1m_closes)
+
+            if ltf_len < getattr(config, "LTF_LOOKBACK_BARS", 30):
                 return None
 
-            if not self._ltf_lstm_trained:
-                self._train_ltf_lstm()
+            if not self._ltf_lstm_trained or self._ltf_lstm is None:
+                self.train_ltf_lstm()
+                if not self._ltf_lstm_trained:
+                    return None
 
             trend = self._compute_ltf_trend_lstm()
+            if trend is None:
+                return None
 
-            # Hysteresis
             if trend != self._ltf_pending_trend:
                 self._ltf_pending_trend = trend
                 self._ltf_confirm_count = 1
@@ -954,19 +1009,23 @@ class ZScoreDataManager:
                 return trend
             else:
                 return self._last_ltf_trend
-
         except Exception as e:
             logger.error(f"Error in get_ltf_trend: {e}", exc_info=True)
             return None
 
-    def _train_ltf_lstm(self) -> None:
-        """Train LTF LSTM."""
+    def train_ltf_lstm(self) -> None:
+        """
+        Train LTF LSTM on synthetic labels from EMA-slope consistency.
+        Safe against deque mutation and inplace-grad errors.
+        """
         try:
-            if len(self._ltf_1m_closes) < getattr(config, "LTF_LOOKBACK_BARS", 30):
+            with self._candles_lock:
+                closes_list = list(self._ltf_1m_closes)
+
+            if len(closes_list) < getattr(config, "LTF_LOOKBACK_BARS", 30):
                 return
 
-            closes = np.asarray([c for (_, c) in self._ltf_1m_closes], dtype=np.float64)
-
+            closes = np.asarray([c for _, c in closes_list], dtype=np.float64)
             if len(closes) < 50:
                 return
 
@@ -975,50 +1034,59 @@ class ZScoreDataManager:
             min_slope = getattr(config, "LTF_MIN_TREND_SLOPE", 0.0002)
             consistency = getattr(config, "LTF_CONSISTENCY_THRESHOLD", 0.52)
 
-            labels = []
+            labels: List[int] = []
             for i in range(len(closes)):
                 if i < span + lookback:
                     labels.append(2)
                     continue
 
                 window = closes[i - lookback : i]
-                ema = pd.Series(window).ewm(span=span, adjust=False).mean().iloc[-1]
-                slope = (ema - closes[i - lookback]) / closes[i - lookback]
-                above = np.sum(window > ema) / len(window)
+                ema = (
+                    pd.Series(window)
+                    .ewm(span=span, adjust=False)
+                    .mean()
+                    .iloc[-1]
+                )
+                base = closes[i - lookback]
+                slope = (ema - base) / base if base != 0 else 0.0
+                above = float(np.sum(window > ema)) / float(len(window))
 
-                if slope > min_slope and above >= consistency:
-                    labels.append(0)
-                elif slope < -min_slope and (1 - above) >= consistency:
-                    labels.append(1)
+                if slope > min_slope and above > consistency:
+                    labels.append(0)  # UPTREND
+                elif slope < -min_slope and (1.0 - above) > consistency:
+                    labels.append(1)  # DOWNTREND
                 else:
-                    labels.append(2)
+                    labels.append(2)  # RANGE
 
             labels = np.asarray(labels, dtype=np.int64)
 
-            returns = np.diff(closes) / closes[:-1]
+            returns = np.diff(closes)
             returns = np.insert(returns, 0, 0.0)
 
             self._ltf_norm_mean = float(np.mean(returns))
-            self._ltf_norm_std = float(np.std(returns)) + 1e-8
+            self._ltf_norm_std = float(np.std(returns) + 1e-8)
+
             returns_norm = (returns - self._ltf_norm_mean) / self._ltf_norm_std
 
-            seq_len = 10
-            X_list = []
-            y_list = []
+            seqlen = 10
+            X_list: List[np.ndarray] = []
+            y_list: List[int] = []
 
-            for i in range(seq_len, len(returns_norm)):
-                X_list.append(returns_norm[i - seq_len : i].reshape(-1, 1))
-                y_list.append(labels[i])
+            for i in range(seqlen, len(returns_norm)):
+                X_list.append(returns_norm[i - seqlen : i].reshape(-1, 1))
+                y_list.append(int(labels[i]))
 
             if len(X_list) == 0:
                 return
 
-            # Create tensors with proper gradient handling
-            X = torch.tensor(np.asarray(X_list), dtype=torch.float32).requires_grad_(False)
+            X = torch.tensor(np.asarray(X_list), dtype=torch.float32)
             y = torch.tensor(np.asarray(y_list), dtype=torch.long)
 
             self._ltf_lstm = TrendLSTM(
-                input_dim=1, hidden_dim=16, num_layers=1, num_classes=3
+                input_dim=1,
+                hidden_dim=16,
+                num_layers=1,
+                num_classes=3,
             )
             criterion = nn.CrossEntropyLoss()
             optimizer = optim.Adam(self._ltf_lstm.parameters(), lr=0.001)
@@ -1026,35 +1094,51 @@ class ZScoreDataManager:
             self._ltf_lstm.train()
             for epoch in range(20):
                 optimizer.zero_grad()
-                # Create fresh detached copy for each iteration
-                X_batch = X.detach().clone()
-                outputs = self._ltf_lstm(X_batch)
+                outputs = self._ltf_lstm(X)
                 loss = criterion(outputs, y)
                 loss.backward()
                 optimizer.step()
 
             self._ltf_lstm.eval()
             self._ltf_lstm_trained = True
-
             logger.info("LTF LSTM trained successfully")
-
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "inplace" in msg or "gradient computation" in msg:
+                logger.error(
+                    f"LTF LSTM training failed due to inplace/gradient issue: {e}. Skipping.",
+                    exc_info=True,
+                )
+            else:
+                logger.error(f"Error training LTF LSTM: {e}", exc_info=True)
+            self._ltf_lstm_trained = False
         except Exception as e:
             logger.error(f"Error training LTF LSTM: {e}", exc_info=True)
+            self._ltf_lstm_trained = False
 
     def _compute_ltf_trend_lstm(self) -> Optional[str]:
-        """Compute LTF trend using trained LSTM."""
+        """
+        Compute LTF trend using trained LSTM.
+        Returns 'UP', 'DOWN', or 'RANGE'.
+        """
         try:
             if not self._ltf_lstm_trained or self._ltf_lstm is None:
                 return None
 
-            closes = np.asarray([c for (_, c) in self._ltf_1m_closes], dtype=np.float64)
+            with self._candles_lock:
+                closes_list = list(self._ltf_1m_closes)
+
+            closes = np.asarray([c for _, c in closes_list], dtype=np.float64)
             if len(closes) < 11:
                 return None
 
-            returns = np.diff(closes[-11:]) / closes[-11:-1]
-            returns_norm = (returns - self._ltf_norm_mean) / self._ltf_norm_std
+            returns = np.diff(closes)
+            returns = np.insert(returns, 0, 0.0)
 
-            X = torch.tensor(returns_norm.reshape(1, -1, 1), dtype=torch.float32)
+            returns_norm = (returns - self._ltf_norm_mean) / self._ltf_norm_std
+            X = torch.tensor(
+                returns_norm.reshape(1, -1, 1), dtype=torch.float32
+            )
 
             with torch.no_grad():
                 outputs = self._ltf_lstm(X)
@@ -1066,10 +1150,10 @@ class ZScoreDataManager:
                 return "DOWN"
             else:
                 return "RANGE"
-
         except Exception as e:
             logger.error(f"Error computing LTF LSTM trend: {e}", exc_info=True)
             return None
+
 
     # ======================================================================
     # Oracle Metric Wrappers (Called by Strategy)

@@ -37,7 +37,7 @@ class RiskManager:
         # Balance cache (to avoid hammering wallet_balance endpoint)
         self._balance_cache: Optional[Dict] = None
         self._last_balance_fetch: float = 0.0
-        self._balance_cache_ttl_sec: float = 5.0
+        self._balance_cache_ttl_sec: float = 10.0
         self._last_429_log: float = 0.0
 
         logger.info("✓ RiskManager initialized")
@@ -90,8 +90,10 @@ class RiskManager:
     def get_available_balance(self) -> Optional[Dict]:
         """
         Get available USDT futures wallet balance via new API.
-        - Uses a short cache (5 seconds) to respect rate limits.
-        - On 429 Too Many Requests, keeps and returns last cached value.
+
+        - Uses a short cache (10 seconds) to respect rate limits.
+        - On 429 Too Many Requests, backs off exponentially and
+          returns last cached value if all retries fail.
         """
         now = time.time()
 
@@ -101,55 +103,75 @@ class RiskManager:
         ):
             return self._balance_cache
 
-        try:
-            response = self.api.get_wallet_balance()
+        max_retries = 3
+        backoff_base = 2.0
 
-            if isinstance(response, dict) and response.get("status_code") == 429:
-                if now - self._last_429_log > 5.0:
-                    logger.error(
-                        "Failed to get balance: 429 Too Many Requests. "
-                        "Using cached balance if available."
+        for attempt in range(max_retries):
+            try:
+                response = self.api.get_wallet_balance()
+
+                if isinstance(response, dict) and response.get("status_code") == 429:
+                    # Rate limited – back off and retry, but keep cache
+                    now = time.time()
+                    if now - self._last_429_log > 5.0:
+                        logger.error(
+                            "Failed to get balance: 429 Too Many Requests. "
+                            "Using cached balance if available."
+                        )
+                        self._last_429_log = now
+
+                    sleep_sec = backoff_base ** attempt
+                    time.sleep(sleep_sec)
+                    continue  # try again
+
+                if "data" in response:
+                    data = response["data"]
+                    base_balances = data.get("base_asset_balances", [])
+                    usdt_balance = next(
+                        (b for b in base_balances if b.get("base_asset") == "USDT"),
+                        None,
                     )
-                    self._last_429_log = now
+
+                    if usdt_balance:
+                        balances = usdt_balance.get("balances", {})
+                        result = {
+                            "total": float(balances.get("total_balance", 0)),
+                            "available": float(
+                                balances.get("total_available_balance", 0)
+                            ),
+                            "blocked": float(
+                                balances.get("total_blocked_balance", 0)
+                            ),
+                            "currency": "USDT",
+                        }
+
+                        self._balance_cache = result
+                        self._last_balance_fetch = time.time()
+
+                        logger.debug(
+                            "Wallet balance fetched: "
+                            f"total={result['total']:.4f}, "
+                            f"available={result['available']:.4f}, "
+                            f"blocked={result['blocked']:.4f}"
+                        )
+                        return result
+                    else:
+                        logger.warning(
+                            "USDT balance not found in wallet response"
+                        )
+                        return self._balance_cache
+
+                logger.error(f"Failed to get balance: {response}")
                 return self._balance_cache
 
-            if "data" in response:
-                data = response["data"]
-                base_balances = data.get("base_asset_balances", [])
-                usdt_balance = next(
-                    (b for b in base_balances if b.get("base_asset") == "USDT"),
-                    None,
-                )
+            except Exception as e:
+                # On exception, back off and retry; keep last cache
+                logger.error(f"Error getting balance: {e}", exc_info=True)
+                sleep_sec = backoff_base ** attempt
+                time.sleep(sleep_sec)
 
-                if usdt_balance:
-                    balances = usdt_balance.get("balances", {})
-                    result = {
-                        "total": float(balances.get("total_balance", 0)),
-                        "available": float(balances.get("total_available_balance", 0)),
-                        "blocked": float(balances.get("total_blocked_balance", 0)),
-                        "currency": "USDT",
-                    }
-
-                    self._balance_cache = result
-                    self._last_balance_fetch = now
-
-                    logger.debug(
-                        "Wallet balance fetched: "
-                        f"total={result['total']:.4f}, "
-                        f"available={result['available']:.4f}, "
-                        f"blocked={result['blocked']:.4f}"
-                    )
-                    return result
-                else:
-                    logger.warning("USDT balance not found in wallet response")
-                    return self._balance_cache
-
-            logger.error(f"Failed to get balance: {response}")
-            return self._balance_cache
-
-        except Exception as e:
-            logger.error(f"Error getting balance: {e}", exc_info=True)
-            return self._balance_cache
+        # All retries exhausted – return whatever cache we have (may be None)
+        return self._balance_cache
 
     # ======================================================================
     # Legacy HF position sizing (kept for compatibility)
