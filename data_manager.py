@@ -84,59 +84,48 @@ class ZScoreDataManager:
         logger.info("=" * 80)
         logger.info(f"Symbol       : {config.SYMBOL}")
         logger.info(f"Exchange     : {config.EXCHANGE}")
-        logger.info("Streams      : ORDERBOOK, TRADES, CANDLESTICK")
-        logger.info("=" * 80)
 
-        self.api: FuturesAPI = FuturesAPI(
+        # WebSocket connection
+        self.ws = FuturesWebSocket(
             api_key=config.COINSWITCH_API_KEY,
             secret_key=config.COINSWITCH_SECRET_KEY,
         )
-        self.ws: Optional[FuturesWebSocket] = None
 
-        self._bids: List[Tuple[float, float]] = []
-        self._asks: List[Tuple[float, float]] = []
-        self._recent_trades: deque = deque(maxlen=50000)
-        self._price_window: deque = deque(maxlen=50000)
-        self._last_price: float = 0.0
+        # Data storage
+        self._orderbook_bids: List[Tuple[float, float]] = []
+        self._orderbook_asks: List[Tuple[float, float]] = []
+        self._trades: Deque[Dict] = deque(maxlen=1000)
+        self._price_window: Deque[Tuple[int, float]] = deque(
+            maxlen=int(self._MAX_PRICE_HISTORY_SEC * 2)
+        )
+        self._candles_1m: Deque[Dict] = deque(maxlen=100)
+        self._candles_5m: Deque[Dict] = deque(maxlen=100)
 
-        # Native 5‑minute HTF candles: list of (ts_ms, close)
-        self._htf_5m_closes: deque = deque(maxlen=1000)
+        # Locks
+        self._orderbook_lock = threading.Lock()
+        self._trades_lock = threading.Lock()
+        self._price_lock = threading.Lock()
+        self._candles_lock = threading.Lock()
 
-        # Native 1‑minute LTF candles: list of (ts_ms, close)
-        self._ltf_1m_closes: deque = deque(maxlen=3000)
-
-        # Native 15‑minute BOS candles (for BOS alignment / 15m structure)
-        self._bos_15m_closes: deque = deque(maxlen=1000)
-
-        # LSTM models + training state
-        self._htf_lstm: Optional[TrendLSTM] = None
-        self._htf_lstm_trained: bool = False
-        self._htf_norm_mean: float = 0.0
-        self._htf_norm_std: float = 1.0
-
-        self._ltf_lstm: Optional[TrendLSTM] = None
-        self._ltf_lstm_trained: bool = False
-        self._ltf_norm_mean: float = 0.0
-        self._ltf_norm_std: float = 1.0
-
-        # Hysteresis state for HTF trend
-        self._last_htf_trend: Optional[str] = None
-        self._htf_confirm_count: int = 0
-        self._htf_pending_trend: Optional[str] = None
-
-        # Hysteresis state for LTF trend
-        self._last_ltf_trend: Optional[str] = None
-        self._ltf_confirm_count: int = 0
-        self._ltf_pending_trend: Optional[str] = None
-
-        self.is_streaming: bool = False
-        self.stats: Dict = {
+        # Stats
+        self.stats = {
             "orderbook_updates": 0,
-            "trades_received": 0,
-            "candles_received": 0,  # 1‑minute candles
-            "prices_recorded": 0,
+            "trade_updates": 0,
+            "candle_updates": 0,
             "last_update": None,
         }
+
+        # LSTM model for LTF trend (placeholder)
+        self._lstm_model: Optional[nn.Module] = None
+        self._lstm_seq_len = 10
+        self._lstm_input_dim = 5
+
+        # Initialize Aether Oracle ⬅️ THIS IS THE CRITICAL LINE
+        from aether_oracle import AetherOracle
+        self._oracle = AetherOracle()
+
+        logger.info(f"Streams      : ORDERBOOK, TRADES, CANDLESTICK")
+        logger.info("=" * 80)
 
     # ======================================================================
     # Lifecycle
