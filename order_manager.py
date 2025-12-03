@@ -1,6 +1,5 @@
 """
 Order Manager - Handles order placement and management
-
 Updated to use new CoinSwitch API plugins
 """
 
@@ -37,15 +36,14 @@ class OrderManager:
 
         logger.info("✓ OrderManager initialized with new API plugin")
 
-    # ═══════════════════════════════════════════════════════════════
-    # ADDED: Order status caching (FIX 3 & 4) - Reduces API calls 95%
-    # ═══════════════════════════════════════════════════════════════
-    self._order_status_cache = {}  # {order_id: (status_dict, timestamp)}
-    self._cache_ttl = 2.0  # 2-second cache TTL
-    self._last_status_call = defaultdict(float)  # Rate limit per order
-    self._min_status_interval = 1.0  # Min 1s between status calls
-    logger.info("✓ Order status caching enabled (2s TTL, 1s min interval)")
-
+        # ═══════════════════════════════════════════════════════════════
+        # ADDED: Order status caching (FIX 3 & 4) - Reduces API calls 95%
+        # ═══════════════════════════════════════════════════════════════
+        self._order_status_cache = {}  # {order_id: (status_dict, timestamp)}
+        self._cache_ttl = 2.0  # 2-second cache TTL
+        self._last_status_call = defaultdict(float)  # Rate limit per order
+        self._min_status_interval = 1.0  # Min 1s between status calls
+        logger.info("✓ Order status caching enabled (2s TTL, 1s min interval)")
 
     # ======================================================================
     # Rate limiting / helpers
@@ -69,7 +67,6 @@ class OrderManager:
     def extract_fill_price(self, order_data: Dict) -> float:
         """
         Extract a valid fill price from API order dict or raise.
-
         Enforces:
         - non-zero
         - non-NaN
@@ -89,6 +86,7 @@ class OrderManager:
         if price is None or price <= 0 or str(price).lower() in ("nan", "inf", "-inf"):
             msg = str(order_data.get("message") or order_data.get("error") or "")
             status_code = order_data.get("status_code")
+
             if status_code == 429 or "too many requests" in msg.lower():
                 raise RuntimeError(
                     "Order fill price not returned due to API rate limit (429 / Too Many Requests)."
@@ -108,7 +106,6 @@ class OrderManager:
     ) -> Dict:
         """
         Poll order status until a real fill is present or timeout.
-
         Conditions to return:
         - status in EXECUTED / PARTIALLY_EXECUTED / FILLED (case-insensitive)
         - exec_quantity > 0
@@ -139,6 +136,7 @@ class OrderManager:
             exec_qty_str = status_resp.get("exec_quantity") or status_resp.get(
                 "executed_qty"
             )
+
             try:
                 exec_qty = float(exec_qty_str) if exec_qty_str is not None else 0.0
             except Exception:
@@ -203,14 +201,14 @@ class OrderManager:
                     "timestamp": datetime.now().isoformat(),
                     "reduce_only": reduce_only,
                 }
-                self.order_history.append(self.active_orders[order_id].copy())
 
-                logger.info(f"âœ“ Order placed successfully: {order_id}")
+                self.order_history.append(self.active_orders[order_id].copy())
+                logger.info(f"✓ Order placed successfully: {order_id}")
                 logger.info(f"  Status: {order_details.get('status')}")
                 return order_details
             else:
                 error_msg = response.get("response", {}).get("message", "Unknown error")
-                logger.error(f"âœ— Order placement failed: {error_msg}")
+                logger.error(f"✗ Order placement failed: {error_msg}")
                 logger.error(f"  Full response: {response}")
                 return None
 
@@ -225,9 +223,7 @@ class OrderManager:
         price: float,
         reduce_only: bool = False,
     ) -> Optional[Dict]:
-        """
-        Place a limit order.
-        """
+        """Place a limit order."""
         try:
             if not self._check_rate_limit():
                 logger.warning("Rate limit exceeded for orders; delaying by 2 seconds")
@@ -262,13 +258,13 @@ class OrderManager:
                     "timestamp": datetime.now().isoformat(),
                     "reduce_only": reduce_only,
                 }
-                self.order_history.append(self.active_orders[order_id].copy())
 
-                logger.info(f"âœ“ Limit order placed: {order_id}")
+                self.order_history.append(self.active_orders[order_id].copy())
+                logger.info(f"✓ Limit order placed: {order_id}")
                 return order_details
             else:
                 error_msg = response.get("response", {}).get("message", "Unknown error")
-                logger.error(f"âœ— Limit order failed: {error_msg}")
+                logger.error(f"✗ Limit order failed: {error_msg}")
                 return None
 
         except Exception as e:
@@ -278,9 +274,7 @@ class OrderManager:
     def place_stop_loss(
         self, side: str, quantity: float, trigger_price: float
     ) -> Optional[Dict]:
-        """
-        Place a stop loss order.
-        """
+        """Place a stop loss order."""
         try:
             logger.info(f"Placing STOP LOSS {side} @ ${trigger_price:,.2f}")
 
@@ -296,7 +290,7 @@ class OrderManager:
 
             if "data" in response and "order_id" in response["data"]:
                 order_id = response["data"]["order_id"]
-                logger.info(f"âœ“ Stop loss order placed: {order_id}")
+                logger.info(f"✓ Stop loss order placed: {order_id}")
 
                 self.active_orders[order_id] = {
                     "order_id": order_id,
@@ -308,9 +302,10 @@ class OrderManager:
                     "status": response["data"].get("status", "UNKNOWN"),
                     "timestamp": datetime.now().isoformat(),
                 }
+
                 return response["data"]
             else:
-                logger.error(f"âœ— Stop loss order failed: {response}")
+                logger.error(f"✗ Stop loss order failed: {response}")
                 return None
 
         except Exception as e:
@@ -320,9 +315,7 @@ class OrderManager:
     def place_take_profit(
         self, side: str, quantity: float, trigger_price: float
     ) -> Optional[Dict]:
-        """
-        Place a take profit order.
-        """
+        """Place a take profit order."""
         try:
             logger.info(f"Placing TAKE PROFIT {side} @ ${trigger_price:,.2f}")
 
@@ -338,7 +331,7 @@ class OrderManager:
 
             if "data" in response and "order_id" in response["data"]:
                 order_id = response["data"]["order_id"]
-                logger.info(f"âœ“ Take profit order placed: {order_id}")
+                logger.info(f"✓ Take profit order placed: {order_id}")
 
                 self.active_orders[order_id] = {
                     "order_id": order_id,
@@ -350,9 +343,10 @@ class OrderManager:
                     "status": response["data"].get("status", "UNKNOWN"),
                     "timestamp": datetime.now().isoformat(),
                 }
+
                 return response["data"]
             else:
-                logger.error(f"âœ— Take profit order failed: {response}")
+                logger.error(f"✗ Take profit order failed: {response}")
                 return None
 
         except Exception as e:
@@ -367,18 +361,19 @@ class OrderManager:
         """Cancel an order."""
         try:
             logger.info(f"Cancelling order: {order_id}")
+
             response = self.api.cancel_order(
                 order_id=order_id,
                 exchange=config.EXCHANGE,
             )
 
             if "data" in response:
-                logger.info(f"âœ“ Order cancelled: {order_id}")
+                logger.info(f"✓ Order cancelled: {order_id}")
                 if order_id in self.active_orders:
                     self.active_orders[order_id]["status"] = "CANCELLED"
                 return True
             else:
-                logger.error(f"âœ— Cancel failed: {response}")
+                logger.error(f"✗ Cancel failed: {response}")
                 return False
 
         except Exception as e:
@@ -389,17 +384,18 @@ class OrderManager:
         """Cancel all open orders for the symbol."""
         try:
             logger.info(f"Cancelling all orders for {config.SYMBOL}")
+
             response = self.api.cancel_all_orders(
                 exchange=config.EXCHANGE,
                 symbol=config.SYMBOL,
             )
 
             if "data" in response or not response.get("error"):
-                logger.info("âœ“ All orders cancelled")
+                logger.info("✓ All orders cancelled")
                 self.active_orders.clear()
                 return True
             else:
-                logger.error(f"âœ— Cancel all failed: {response}")
+                logger.error(f"✗ Cancel all failed: {response}")
                 return False
 
         except Exception as e:
@@ -487,6 +483,7 @@ class OrderManager:
             else:
                 logger.warning("Could not fetch open orders")
                 return []
+
         except Exception as e:
             logger.error(f"Error getting open orders: {e}")
             return []
@@ -498,6 +495,7 @@ class OrderManager:
     def get_order_statistics(self) -> Dict:
         """Get order statistics."""
         total_orders = len(self.order_history)
+
         if total_orders == 0:
             return {
                 "total_orders": 0,
