@@ -35,7 +35,7 @@ class OrderManager:
         self.order_count = 0
         self.rate_limit_window_start = time.time()
 
-        logger.info("✓ OrderManager initialized with new API plugin")
+        logger.info("âœ“ OrderManager initialized with new API plugin")
 
     # ======================================================================
     # Rate limiting / helpers
@@ -195,12 +195,12 @@ class OrderManager:
                 }
                 self.order_history.append(self.active_orders[order_id].copy())
 
-                logger.info(f"✓ Order placed successfully: {order_id}")
+                logger.info(f"âœ“ Order placed successfully: {order_id}")
                 logger.info(f"  Status: {order_details.get('status')}")
                 return order_details
             else:
                 error_msg = response.get("response", {}).get("message", "Unknown error")
-                logger.error(f"✗ Order placement failed: {error_msg}")
+                logger.error(f"âœ— Order placement failed: {error_msg}")
                 logger.error(f"  Full response: {response}")
                 return None
 
@@ -254,11 +254,11 @@ class OrderManager:
                 }
                 self.order_history.append(self.active_orders[order_id].copy())
 
-                logger.info(f"✓ Limit order placed: {order_id}")
+                logger.info(f"âœ“ Limit order placed: {order_id}")
                 return order_details
             else:
                 error_msg = response.get("response", {}).get("message", "Unknown error")
-                logger.error(f"✗ Limit order failed: {error_msg}")
+                logger.error(f"âœ— Limit order failed: {error_msg}")
                 return None
 
         except Exception as e:
@@ -286,7 +286,7 @@ class OrderManager:
 
             if "data" in response and "order_id" in response["data"]:
                 order_id = response["data"]["order_id"]
-                logger.info(f"✓ Stop loss order placed: {order_id}")
+                logger.info(f"âœ“ Stop loss order placed: {order_id}")
 
                 self.active_orders[order_id] = {
                     "order_id": order_id,
@@ -300,7 +300,7 @@ class OrderManager:
                 }
                 return response["data"]
             else:
-                logger.error(f"✗ Stop loss order failed: {response}")
+                logger.error(f"âœ— Stop loss order failed: {response}")
                 return None
 
         except Exception as e:
@@ -328,7 +328,7 @@ class OrderManager:
 
             if "data" in response and "order_id" in response["data"]:
                 order_id = response["data"]["order_id"]
-                logger.info(f"✓ Take profit order placed: {order_id}")
+                logger.info(f"âœ“ Take profit order placed: {order_id}")
 
                 self.active_orders[order_id] = {
                     "order_id": order_id,
@@ -342,7 +342,7 @@ class OrderManager:
                 }
                 return response["data"]
             else:
-                logger.error(f"✗ Take profit order failed: {response}")
+                logger.error(f"âœ— Take profit order failed: {response}")
                 return None
 
         except Exception as e:
@@ -363,12 +363,12 @@ class OrderManager:
             )
 
             if "data" in response:
-                logger.info(f"✓ Order cancelled: {order_id}")
+                logger.info(f"âœ“ Order cancelled: {order_id}")
                 if order_id in self.active_orders:
                     self.active_orders[order_id]["status"] = "CANCELLED"
                 return True
             else:
-                logger.error(f"✗ Cancel failed: {response}")
+                logger.error(f"âœ— Cancel failed: {response}")
                 return False
 
         except Exception as e:
@@ -385,11 +385,11 @@ class OrderManager:
             )
 
             if "data" in response or not response.get("error"):
-                logger.info("✓ All orders cancelled")
+                logger.info("âœ“ All orders cancelled")
                 self.active_orders.clear()
                 return True
             else:
-                logger.error(f"✗ Cancel all failed: {response}")
+                logger.error(f"âœ— Cancel all failed: {response}")
                 return False
 
         except Exception as e:

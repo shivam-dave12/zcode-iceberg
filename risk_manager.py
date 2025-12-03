@@ -1,16 +1,14 @@
 """
 Risk Manager - Manages position sizing and risk controls
-
 Updated to use new CoinSwitch API plugins
-
 + Balance caching and 429-safe behaviour for Z-Score Imbalance Iceberg Hunter
++ Vol-regime aware position sizing
 """
 
 import logging
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from datetime import datetime
-
 from futures_api import FuturesAPI
 import config
 
@@ -23,7 +21,6 @@ class RiskManager:
 
     def __init__(self):
         """Initialize risk manager with new API plugin"""
-
         self.api = FuturesAPI(
             api_key=config.COINSWITCH_API_KEY,
             secret_key=config.COINSWITCH_SECRET_KEY,
@@ -33,7 +30,6 @@ class RiskManager:
         self.daily_trades = 0
         self.daily_pnl = 0.0
         self.last_reset = datetime.utcnow()
-
         self.total_trades = 0
         self.winning_trades = 0
         self.losing_trades = 0
@@ -53,7 +49,6 @@ class RiskManager:
     def check_trading_allowed(self) -> tuple:
         """
         Check if trading is allowed based on risk limits.
-
         Returns:
             (allowed: bool, reason: str)
         """
@@ -95,7 +90,6 @@ class RiskManager:
     def get_available_balance(self) -> Optional[Dict]:
         """
         Get available USDT futures wallet balance via new API.
-
         - Uses a short cache (5 seconds) to respect rate limits.
         - On 429 Too Many Requests, keeps and returns last cached value.
         """
@@ -177,6 +171,7 @@ class RiskManager:
 
             risk_amount = min(20, current_balance * 0.02)
             price_diff = abs(entry_price - stop_loss_price)
+
             if price_diff == 0:
                 logger.warning("Stop loss same as entry price in HF calc")
                 return 0.001
@@ -237,3 +232,57 @@ class RiskManager:
             self.daily_trades = 0
             self.daily_pnl = 0.0
             self.last_reset = now
+
+    def calculate_position_size_regime_aware(
+        self,
+        entry_price: float,
+        vol_regime: str,
+        current_balance: float = None,
+    ) -> Tuple[float, float]:
+        """
+        Calculate position size with vol-regime awareness.
+        
+        Args:
+            entry_price: Entry price for the position
+            vol_regime: "LOW", "HIGH", "NEUTRAL", or "UNKNOWN"
+            current_balance: Optional balance override
+        
+        Returns:
+            (target_margin, quantity)
+        """
+        try:
+            if current_balance is None:
+                balance_info = self.get_available_balance()
+                if not balance_info:
+                    logger.error("Could not fetch balance for regime-aware sizing")
+                    return (config.MIN_MARGIN_PER_TRADE, 0.001)
+                current_balance = balance_info["available"]
+
+            # Vol-regime based usage percentage
+            if vol_regime == "HIGH":
+                usage_pct = config.VOL_REGIME_SIZE_HIGH_PCT
+            elif vol_regime == "LOW":
+                usage_pct = config.VOL_REGIME_SIZE_LOW_PCT
+            else:
+                # NEUTRAL or UNKNOWN: average
+                usage_pct = (config.VOL_REGIME_SIZE_HIGH_PCT + config.VOL_REGIME_SIZE_LOW_PCT) / 2.0
+
+            target_margin = current_balance * usage_pct
+            target_margin = max(config.MIN_MARGIN_PER_TRADE, target_margin)
+            target_margin = min(config.MAX_MARGIN_PER_TRADE, target_margin)
+
+            # Calculate quantity
+            quantity = (target_margin * config.LEVERAGE) / entry_price
+            quantity = max(0.001, quantity)
+            quantity = round(quantity, 6)
+
+            logger.info(
+                f"Regime-aware sizing: vol_regime={vol_regime}, usage={usage_pct*100:.1f}%, "
+                f"margin={target_margin:.2f}, qty={quantity:.6f}"
+            )
+
+            return (target_margin, quantity)
+
+        except Exception as e:
+            logger.error(f"Error in regime-aware position sizing: {e}", exc_info=True)
+            return (config.MIN_MARGIN_PER_TRADE, 0.001)
