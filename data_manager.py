@@ -89,14 +89,10 @@ class ZScoreDataManager:
         logger.info("=" * 80)
         logger.info("Z-SCORE DATA MANAGER INITIALIZED")
         logger.info("=" * 80)
-        logger.info(f"Symbol : {config.SYMBOL}")
-        logger.info(f"Exchange : {config.EXCHANGE}")
+        logger.info(f"Symbol       : {config.SYMBOL}")
+        logger.info(f"Exchange     : {config.EXCHANGE}")
 
-        # WebSocket connection
-        # NOTE:
-        #   - FuturesWebSocket.__init__ takes no arguments (public streams only).
-        #   - Actual connection + subscriptions are handled in start().
-        #   - Keep this as a simple placeholder to avoid constructor crashes.
+        # WebSocket connection (actual connect happens in start())
         self.ws: Optional[FuturesWebSocket] = None
 
         # REST API client
@@ -112,11 +108,10 @@ class ZScoreDataManager:
         self._price_window: Deque[Tuple[int, float]] = deque(
             maxlen=int(self._MAX_PRICE_HISTORY_SEC * 2)
         )
-
         self._candles_1m: Deque[Dict] = deque(maxlen=100)
         self._candles_5m: Deque[Dict] = deque(maxlen=100)
 
-        # Additional series used elsewhere in the file (htf/ltf/bos)
+        # Additional series used elsewhere
         self._htf_5m_closes: Deque[Tuple[int, float]] = deque(maxlen=5000)
         self._bos_15m_closes: Deque[Tuple[int, float]] = deque(maxlen=5000)
         self._ltf_1m_closes: Deque[Tuple[int, float]] = deque(maxlen=5000)
@@ -126,8 +121,7 @@ class ZScoreDataManager:
         self._last_price: float = 0.0
 
         # Locks
-        import threading  # local import to avoid circulars in some environments
-
+        import threading
         self._orderbook_lock = threading.Lock()
         self._trades_lock = threading.Lock()
         self._price_lock = threading.Lock()
@@ -144,12 +138,11 @@ class ZScoreDataManager:
             "last_update": None,
         }
 
-        # LSTM model for LTF trend (placeholder)
+        # LSTM / model placeholders
         self._lstm_model: Optional[nn.Module] = None
         self._lstm_seq_len = 10
         self._lstm_input_dim = 5
 
-        # HTF / LTF LSTM training flags and norms (used later in file)
         self._htf_lstm: Optional[TrendLSTM] = None
         self._htf_lstm_trained: bool = False
         self._htf_norm_mean: float = 0.0
@@ -172,52 +165,6 @@ class ZScoreDataManager:
 
         # Streaming flag
         self.is_streaming: bool = False
-
-        logger.info(f"Streams : ORDERBOOK, TRADES, CANDLESTICK")
-        logger.info("=" * 80)
-
-    def __init__(self) -> None:
-        logger.info("=" * 80)
-        logger.info("Z-SCORE DATA MANAGER INITIALIZED")
-        logger.info("=" * 80)
-        logger.info(f"Symbol       : {config.SYMBOL}")
-        logger.info(f"Exchange     : {config.EXCHANGE}")
-
-        # WebSocket connection (actual connect happens in start())
-        self.ws = None
-
-        # Data storage
-        self._orderbook_bids: List[Tuple[float, float]] = []
-        self._orderbook_asks: List[Tuple[float, float]] = []
-        self._trades: Deque[Dict] = deque(maxlen=1000)
-        self._price_window: Deque[Tuple[int, float]] = deque(
-            maxlen=int(self._MAX_PRICE_HISTORY_SEC * 2)
-        )
-        self._candles_1m: Deque[Dict] = deque(maxlen=100)
-        self._candles_5m: Deque[Dict] = deque(maxlen=100)
-
-        # Locks
-        self._orderbook_lock = threading.Lock()
-        self._trades_lock = threading.Lock()
-        self._price_lock = threading.Lock()
-        self._candles_lock = threading.Lock()
-
-        # Stats
-        self.stats = {
-            "orderbook_updates": 0,
-            "trade_updates": 0,
-            "candle_updates": 0,
-            "last_update": None,
-        }
-
-        # LSTM model for LTF trend (placeholder)
-        self._lstm_model: Optional[nn.Module] = None
-        self._lstm_seq_len = 10
-        self._lstm_input_dim = 5
-
-        # Initialize Aether Oracle ⬅️ THIS IS THE CRITICAL LINE
-        from aether_oracle import AetherOracle
-        self._oracle = AetherOracle()
 
         logger.info(f"Streams      : ORDERBOOK, TRADES, CANDLESTICK")
         logger.info("=" * 80)
