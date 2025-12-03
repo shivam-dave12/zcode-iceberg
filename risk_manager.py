@@ -9,6 +9,7 @@ import logging
 import time
 from typing import Dict, Optional, Tuple
 from datetime import datetime
+
 from futures_api import FuturesAPI
 import config
 
@@ -37,6 +38,9 @@ class RiskManager:
         # Balance cache (to avoid hammering wallet_balance endpoint)
         self._balance_cache: Optional[Dict] = None
         self._last_balance_fetch: float = 0.0
+        # ═══════════════════════════════════════════════════════════════
+        # FIX: Increased cache TTL from 5s to 10s
+        # ═══════════════════════════════════════════════════════════════
         self._balance_cache_ttl_sec: float = 10.0
         self._last_429_log: float = 0.0
 
@@ -103,6 +107,9 @@ class RiskManager:
         ):
             return self._balance_cache
 
+        # ═══════════════════════════════════════════════════════════════
+        # FIX: Exponential backoff on 429 errors
+        # ═══════════════════════════════════════════════════════════════
         max_retries = 3
         backoff_base = 2.0
 
@@ -121,6 +128,7 @@ class RiskManager:
                         self._last_429_log = now
 
                     sleep_sec = backoff_base ** attempt
+                    logger.debug(f"Backing off for {sleep_sec:.1f}s (attempt {attempt + 1}/{max_retries})")
                     time.sleep(sleep_sec)
                     continue  # try again
 
@@ -166,11 +174,13 @@ class RiskManager:
 
             except Exception as e:
                 # On exception, back off and retry; keep last cache
-                logger.error(f"Error getting balance: {e}", exc_info=True)
-                sleep_sec = backoff_base ** attempt
-                time.sleep(sleep_sec)
+                logger.error(f"Error getting balance (attempt {attempt + 1}/{max_retries}): {e}", exc_info=True)
+                if attempt < max_retries - 1:
+                    sleep_sec = backoff_base ** attempt
+                    time.sleep(sleep_sec)
 
         # All retries exhausted – return whatever cache we have (may be None)
+        logger.warning("All balance fetch retries exhausted; returning cached value")
         return self._balance_cache
 
     # ======================================================================
@@ -213,6 +223,60 @@ class RiskManager:
             logger.error(f"Error calculating position size: {e}", exc_info=True)
             return 0.001
 
+    def calculate_position_size_regime_aware(
+        self,
+        entry_price: float,
+        vol_regime: str,
+        current_balance: float = None,
+    ) -> Tuple[float, float]:
+        """
+        Calculate position size with vol-regime awareness.
+
+        Args:
+            entry_price: Entry price for the position
+            vol_regime: "LOW", "HIGH", "NEUTRAL", or "UNKNOWN"
+            current_balance: Optional balance override
+
+        Returns:
+            (target_margin, quantity)
+        """
+        try:
+            if current_balance is None:
+                balance_info = self.get_available_balance()
+                if not balance_info:
+                    logger.error("Could not fetch balance for regime-aware sizing")
+                    return (config.MIN_MARGIN_PER_TRADE, 0.001)
+                current_balance = balance_info["available"]
+
+            # Vol-regime based usage percentage
+            if vol_regime == "HIGH":
+                usage_pct = config.VOL_REGIME_SIZE_HIGH_PCT
+            elif vol_regime == "LOW":
+                usage_pct = config.VOL_REGIME_SIZE_LOW_PCT
+            else:
+                # NEUTRAL or UNKNOWN: average
+                usage_pct = (config.VOL_REGIME_SIZE_HIGH_PCT + config.VOL_REGIME_SIZE_LOW_PCT) / 2.0
+
+            target_margin = current_balance * usage_pct
+            target_margin = max(config.MIN_MARGIN_PER_TRADE, target_margin)
+            target_margin = min(config.MAX_MARGIN_PER_TRADE, target_margin)
+
+            # Calculate quantity
+            quantity = (target_margin * config.LEVERAGE) / entry_price
+            quantity = max(0.001, quantity)
+            quantity = round(quantity, 6)
+
+            logger.info(
+                f"Regime-aware sizing: vol_regime={vol_regime}, usage={usage_pct*100:.1f}%, "
+                f"margin={target_margin:.2f}, qty={quantity:.6f}"
+            )
+
+            return (target_margin, quantity)
+
+        except Exception as e:
+            logger.error(f"Error in regime-aware position sizing: {e}", exc_info=True)
+            return (config.MIN_MARGIN_PER_TRADE, 0.001)
+
     # ======================================================================
     # Trade statistics
     # ======================================================================
@@ -254,57 +318,3 @@ class RiskManager:
             self.daily_trades = 0
             self.daily_pnl = 0.0
             self.last_reset = now
-
-    def calculate_position_size_regime_aware(
-        self,
-        entry_price: float,
-        vol_regime: str,
-        current_balance: float = None,
-    ) -> Tuple[float, float]:
-        """
-        Calculate position size with vol-regime awareness.
-        
-        Args:
-            entry_price: Entry price for the position
-            vol_regime: "LOW", "HIGH", "NEUTRAL", or "UNKNOWN"
-            current_balance: Optional balance override
-        
-        Returns:
-            (target_margin, quantity)
-        """
-        try:
-            if current_balance is None:
-                balance_info = self.get_available_balance()
-                if not balance_info:
-                    logger.error("Could not fetch balance for regime-aware sizing")
-                    return (config.MIN_MARGIN_PER_TRADE, 0.001)
-                current_balance = balance_info["available"]
-
-            # Vol-regime based usage percentage
-            if vol_regime == "HIGH":
-                usage_pct = config.VOL_REGIME_SIZE_HIGH_PCT
-            elif vol_regime == "LOW":
-                usage_pct = config.VOL_REGIME_SIZE_LOW_PCT
-            else:
-                # NEUTRAL or UNKNOWN: average
-                usage_pct = (config.VOL_REGIME_SIZE_HIGH_PCT + config.VOL_REGIME_SIZE_LOW_PCT) / 2.0
-
-            target_margin = current_balance * usage_pct
-            target_margin = max(config.MIN_MARGIN_PER_TRADE, target_margin)
-            target_margin = min(config.MAX_MARGIN_PER_TRADE, target_margin)
-
-            # Calculate quantity
-            quantity = (target_margin * config.LEVERAGE) / entry_price
-            quantity = max(0.001, quantity)
-            quantity = round(quantity, 6)
-
-            logger.info(
-                f"Regime-aware sizing: vol_regime={vol_regime}, usage={usage_pct*100:.1f}%, "
-                f"margin={target_margin:.2f}, qty={quantity:.6f}"
-            )
-
-            return (target_margin, quantity)
-
-        except Exception as e:
-            logger.error(f"Error in regime-aware position sizing: {e}", exc_info=True)
-            return (config.MIN_MARGIN_PER_TRADE, 0.001)

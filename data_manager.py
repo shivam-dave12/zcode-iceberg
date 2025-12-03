@@ -1,6 +1,5 @@
 """
 Z-Score Data Manager - Depth / Trades / Price Window
-
 CORRECTED: Matches official CoinSwitch WebSocket formats
 UPDATED: Robust Volatility (ATR/Realized) calculation to prevent MISSING data
 + Vol-Regime Detection for dynamic parameter tuning
@@ -14,7 +13,6 @@ from datetime import datetime
 import threading
 import numpy as np
 import pandas as pd  # used for EMA, ATR, and feature calculations
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -30,12 +28,12 @@ torch.manual_seed(42)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
-# DEBUG: enable autograd anomaly detection for LSTM training
-# Disable this in production if you find it too slow.
+# ═══════════════════════════════════════════════════════════════
+# FIX: Enable autograd anomaly detection for LSTM training
+# ═══════════════════════════════════════════════════════════════
 torch.autograd.set_detect_anomaly(True)
 
 np.random.seed(42)
-
 import random
 random.seed(42)
 
@@ -93,8 +91,8 @@ class ZScoreDataManager:
         logger.info("=" * 80)
         logger.info("Z-SCORE DATA MANAGER INITIALIZED")
         logger.info("=" * 80)
-        logger.info(f"Symbol       : {config.SYMBOL}")
-        logger.info(f"Exchange     : {config.EXCHANGE}")
+        logger.info(f"Symbol  : {config.SYMBOL}")
+        logger.info(f"Exchange: {config.EXCHANGE}")
 
         # WebSocket connection (actual connect happens in start())
         self.ws: Optional[FuturesWebSocket] = None
@@ -125,7 +123,6 @@ class ZScoreDataManager:
         self._last_price: float = 0.0
 
         # Locks
-        import threading
         self._orderbook_lock = threading.Lock()
         self._trades_lock = threading.Lock()
         self._price_lock = threading.Lock()
@@ -149,7 +146,6 @@ class ZScoreDataManager:
         self._rest_api_min_interval = 2.0  # Min 2 seconds between REST calls
         logger.info("✓ REST API rate limiting enabled (2s minimum interval)")
 
-        
         # LSTM / model placeholders
         self._lstm_model: Optional[nn.Module] = None
         self._lstm_seq_len = 10
@@ -178,7 +174,7 @@ class ZScoreDataManager:
         # Streaming flag
         self.is_streaming: bool = False
 
-        logger.info(f"Streams      : ORDERBOOK, TRADES, CANDLESTICK")
+        logger.info(f"Streams : ORDERBOOK, TRADES, CANDLESTICK")
         logger.info("=" * 80)
 
     # ======================================================================
@@ -195,17 +191,17 @@ class ZScoreDataManager:
 
         if elapsed < self._rest_api_min_interval:
             wait_time = self._rest_api_min_interval - elapsed
-            logger.debug(f"⏸️  REST API rate limit: waiting {wait_time:.2f}s...")
+            logger.debug(f"⏸️ REST API rate limit: waiting {wait_time:.2f}s...")
             time.sleep(wait_time)
 
         self._rest_api_last_call = time.time()
-
 
     def start(self) -> bool:
         """Connect WebSocket and subscribe to streams, then warm up from REST klines."""
         try:
             self.ws = FuturesWebSocket()
             logger.info("Connecting to CoinSwitch Futures WebSocket...")
+
             if not self.ws.connect():
                 logger.error("WebSocket connection failed")
                 return False
@@ -256,16 +252,18 @@ class ZScoreDataManager:
             # REST warmup for 15m BOS candles
             self._warmup_bos_klines_15m()
 
-        # Train LSTM models once after warmup (to avoid training spam in-loop)
-        try:
-            if not self._htf_lstm_trained:
-                self.train_htf_lstm()
-            if not self._ltf_lstm_trained:
-                self.train_ltf_lstm()
-        except Exception as e:
-            logger.error(f"Error training LSTMs during startup: {e}", exc_info=True)
+            # ═══════════════════════════════════════════════════════════════
+            # FIX: Train LSTM models once after warmup (avoid training spam)
+            # ═══════════════════════════════════════════════════════════════
+            try:
+                if not self._htf_lstm_trained:
+                    self.train_htf_lstm()
+                if not self._ltf_lstm_trained:
+                    self.train_ltf_lstm()
+            except Exception as e:
+                logger.error(f"Error training LSTMs during startup: {e}", exc_info=True)
 
-        return True
+            return True
 
         except Exception as e:
             logger.error(f"Error starting ZScoreDataManager: {e}", exc_info=True)
@@ -290,11 +288,11 @@ class ZScoreDataManager:
             window_min = getattr(config, "ATR_WINDOW_MINUTES", 10)
             ltf_lookback = getattr(config, "LTF_LOOKBACK_BARS", 60)
             limit = max(window_min, ltf_lookback) + 10
+
             logger.info(f"Warming up 1m klines (limit={limit})...")
-
             self._wait_for_rest_api_limit()  # ← ADDED: Rate limit enforcement
-            resp = self._fetch_rest_klines(limit=limit, interval=1)
 
+            resp = self._fetch_rest_klines(limit=limit, interval=1)
             if not resp or "data" not in resp:
                 logger.warning("No 1m klines returned from REST API")
                 return
@@ -350,6 +348,7 @@ class ZScoreDataManager:
                         continue
                 except Exception:
                     continue
+
         logger.warning("No REST klines method available on FuturesAPI; skipping REST warmup.")
         return None
 
@@ -360,11 +359,11 @@ class ZScoreDataManager:
             htf_span = getattr(config, "HTF_EMA_SPAN", 80)
             htf_lookback = getattr(config, "HTF_LOOKBACK_BARS", 86)
             limit = htf_span + htf_lookback + 10
+
             logger.info(f"Warming up {htf_interval}m HTF klines (limit={limit})...")
-
             self._wait_for_rest_api_limit()  # ← ADDED: Rate limit enforcement
-            resp = self._fetch_rest_klines(limit=limit, interval=htf_interval)
 
+            resp = self._fetch_rest_klines(limit=limit, interval=htf_interval)
             if not resp or "data" not in resp:
                 logger.warning("No 5m HTF klines returned from REST API")
                 return
@@ -396,12 +395,11 @@ class ZScoreDataManager:
             htf_span = getattr(config, "HTF_EMA_SPAN", 80)
             htf_lookback = getattr(config, "HTF_LOOKBACK_BARS", 86)
             limit = htf_span + htf_lookback + 10
+
             logger.info(f"Warming up {bos_interval}m BOS klines (limit={limit})...")
-
             self._wait_for_rest_api_limit()  # ← ADDED: Rate limit enforcement
+
             resp = self._fetch_rest_klines(limit=limit, interval=bos_interval)
-
-
             if not resp or "data" not in resp:
                 logger.warning("No 15m BOS klines returned from REST API")
                 return
@@ -518,18 +516,17 @@ class ZScoreDataManager:
                 close_str = data.get("c")
                 if not close_str:
                     return
+
                 try:
                     price = float(close_str)
                 except Exception:
                     return
+
                 if price <= 0:
                     return
 
                 ts_ms = int(
-                    data.get("ts")
-                    or data.get("T")
-                    or data.get("t")
-                    or int(time.time() * 1000)
+                    data.get("ts") or data.get("T") or data.get("t") or int(time.time() * 1000)
                 )
 
                 self._append_price(ts_ms, price)
@@ -546,18 +543,17 @@ class ZScoreDataManager:
                 close_str = data.get("c")
                 if not close_str:
                     return
+
                 try:
                     price = float(close_str)
                 except Exception:
                     return
+
                 if price <= 0:
                     return
 
                 ts_ms = int(
-                    data.get("ts")
-                    or data.get("T")
-                    or data.get("t")
-                    or int(time.time() * 1000)
+                    data.get("ts") or data.get("T") or data.get("t") or int(time.time() * 1000)
                 )
 
                 self._append_htf_5m_close(ts_ms, price)
@@ -566,24 +562,23 @@ class ZScoreDataManager:
             logger.error(f"Error in _on_candlestick_5m: {e}", exc_info=True)
 
     def _on_candlestick_15m(self, data) -> None:
-        """Handle 15‑minute candlestick updates (BOS / structure)."""
+        """Handle 15‑minute candlestick updates (BOS structure)."""
         try:
             if isinstance(data, dict):
                 close_str = data.get("c")
                 if not close_str:
                     return
+
                 try:
                     price = float(close_str)
                 except Exception:
                     return
+
                 if price <= 0:
                     return
 
                 ts_ms = int(
-                    data.get("ts")
-                    or data.get("T")
-                    or data.get("t")
-                    or int(time.time() * 1000)
+                    data.get("ts") or data.get("T") or data.get("t") or int(time.time() * 1000)
                 )
 
                 self._append_bos_15m_close(ts_ms, price)
@@ -592,7 +587,7 @@ class ZScoreDataManager:
             logger.error(f"Error in _on_candlestick_15m: {e}", exc_info=True)
 
     # ======================================================================
-    # Internal helpers
+    # Data append helpers
     # ======================================================================
 
     def _append_price(self, ts_ms: int, price: float) -> None:
@@ -602,11 +597,12 @@ class ZScoreDataManager:
         self.stats["prices_recorded"] += 1
         self.stats["last_update"] = datetime.now()
 
-        # Keep slightly more than MAX history to allow for late data / buffer
+        # Trim old prices
         cutoff_price = ts_ms - (self._MAX_PRICE_HISTORY_SEC + 120) * 1000
         while self._price_window and self._price_window[0][0] < cutoff_price:
             self._price_window.popleft()
 
+        # Trim old trades
         cutoff_trades = ts_ms - (self._MAX_TRADES_HISTORY_SEC + 60) * 1000
         while self._recent_trades and self._recent_trades[0]["ts_ms"] < cutoff_trades:
             self._recent_trades.popleft()
@@ -615,13 +611,13 @@ class ZScoreDataManager:
         """Append a native 5‑minute close into the HTF buffer."""
         self._htf_5m_closes.append((ts_ms, close_price))
 
-        # Keep only enough HTF history for robust LSTM training
+        # Keep slightly more than MAX history to allow for late data + buffer
         htf_interval_min = getattr(config, "HTF_TREND_INTERVAL", 5)
         htf_span = getattr(config, "HTF_EMA_SPAN", 80)
         htf_lookback = getattr(config, "HTF_LOOKBACK_BARS", 86)
         max_htf_sec = (htf_span + htf_lookback + 3) * htf_interval_min * 60
-        cutoff = ts_ms - max_htf_sec * 1000
 
+        cutoff = ts_ms - max_htf_sec * 1000
         while self._htf_5m_closes and self._htf_5m_closes[0][0] < cutoff:
             self._htf_5m_closes.popleft()
 
@@ -633,30 +629,28 @@ class ZScoreDataManager:
         htf_span = getattr(config, "HTF_EMA_SPAN", 80)
         htf_lookback = getattr(config, "HTF_LOOKBACK_BARS", 86)
         max_bos_sec = (htf_span + htf_lookback + 3) * bos_interval_min * 60
-        cutoff = ts_ms - max_bos_sec * 1000
 
+        cutoff = ts_ms - max_bos_sec * 1000
         while self._bos_15m_closes and self._bos_15m_closes[0][0] < cutoff:
             self._bos_15m_closes.popleft()
 
     def _append_ltf_1m_close(self, ts_ms: int, close_price: float) -> None:
-        """Append a native 1‑minute close into the LTF buffer for 1m trend."""
+        """Append a native 1‑minute close into the LTF buffer (for 1m trend)."""
         self._ltf_1m_closes.append((ts_ms, close_price))
 
         ltf_span = getattr(config, "LTF_EMA_SPAN", getattr(config, "EMA_PERIOD", 20))
         ltf_lookback = getattr(config, "LTF_LOOKBACK_BARS", 60)
         max_ltf_sec = (ltf_span + ltf_lookback + 3) * 60  # 1m bars
-        cutoff = ts_ms - max_ltf_sec * 1000
 
+        cutoff = ts_ms - max_ltf_sec * 1000
         while self._ltf_1m_closes and self._ltf_1m_closes[0][0] < cutoff:
             self._ltf_1m_closes.popleft()
 
     # ======================================================================
-    # Public accessors
+    # Public data getters
     # ======================================================================
 
-    def get_orderbook_snapshot(
-        self,
-    ) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+    def get_orderbook_snapshot(self) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
         return list(self._bids), list(self._asks)
 
     def get_last_price(self) -> float:
@@ -665,8 +659,7 @@ class ZScoreDataManager:
     def get_price_window(self, window_seconds: int = 480) -> List[Tuple[int, float]]:
         """
         Get price window for the last N seconds.
-        FIXED: Uses a snapshot of the deque to avoid mutation/race
-        issues while iterating.
+        FIXED: Uses a snapshot of the deque to avoid mutation/race issues while iterating.
         """
         if not self._price_window:
             return []
@@ -681,8 +674,7 @@ class ZScoreDataManager:
     def get_recent_trades(self, window_seconds: int) -> List[Dict]:
         """
         Get recent trades within a window.
-        FIXED: Uses a snapshot of the deque to avoid mutation/race
-        issues while iterating.
+        FIXED: Uses a snapshot of the deque to avoid mutation/race issues while iterating.
         """
         if not self._recent_trades:
             return []
@@ -692,10 +684,6 @@ class ZScoreDataManager:
 
         snapshot = list(self._recent_trades)
         return [t for t in snapshot if t["ts_ms"] >= cutoff_ms]
-
-    # ======================================================================
-    # Derived metrics: EMA + ATR (for volatility / legacy trend)
-    # ======================================================================
 
     def get_ema(self, period: int = 20, window_minutes: int = 480) -> Optional[float]:
         """
@@ -711,9 +699,7 @@ class ZScoreDataManager:
             if len(prices) < period:
                 return None
 
-            ema_series = (
-                pd.Series(prices).ewm(span=period, adjust=False).mean()
-            )
+            ema_series = pd.Series(prices).ewm(span=period, adjust=False).mean()
             return float(ema_series.iloc[-1])
 
         except Exception as e:
@@ -723,7 +709,7 @@ class ZScoreDataManager:
     def get_atr_percent(self, window_minutes: int = 10) -> Optional[float]:
         """
         Calculate ATR as a percentage of current price using tick data.
-        Returns ATR% (e.g., 0.008 = 0.8%).
+        Returns ATR % (e.g., 0.008 = 0.8%).
         """
         try:
             pw = self.get_price_window(window_seconds=window_minutes * 60)
@@ -740,7 +726,6 @@ class ZScoreDataManager:
 
             atr = float(np.mean(ranges))
             current_price = self.get_last_price()
-
             if current_price <= 0:
                 return None
 
@@ -748,23 +733,18 @@ class ZScoreDataManager:
             return atr_pct
 
         except Exception as e:
-            logger.error(f"Error calculating ATR%: {e}", exc_info=True)
+            logger.error(f"Error calculating ATR: {e}", exc_info=True)
             return None
-
-    # ======================================================================
-    # VOL-REGIME DETECTION (NEW)
-    # ======================================================================
 
     def get_vol_regime(self) -> Tuple[str, Optional[float]]:
         """
-        Classify current volatility regime based on ATR%.
-        Returns: (regime_str, atr_pct)
-        regime_str: "LOW", "HIGH", "NEUTRAL", or "UNKNOWN"
-        atr_pct: actual ATR% value or None if unavailable
+        Classify current volatility regime based on ATR.
+        Returns (regime_str, atr_pct)
+        - regime_str: "LOW", "HIGH", "NEUTRAL", or "UNKNOWN"
+        - atr_pct: actual ATR % value or None if unavailable
         """
         try:
             atr_pct = self.get_atr_percent(window_minutes=config.ATR_WINDOW_MINUTES)
-
             if atr_pct is None:
                 return ("UNKNOWN", None)
 
@@ -779,9 +759,9 @@ class ZScoreDataManager:
             logger.error(f"Error in get_vol_regime: {e}", exc_info=True)
             return ("UNKNOWN", None)
 
-    # ======================================================================
-    # HTF Trend (5m LSTM-based robust 3-state)
-    # ======================================================================
+    # ══════════════════════════════════════════════════════════════════════
+    # HTF Trend (5m LSTM) - FIXED: Thread-safe, no inplace ops
+    # ══════════════════════════════════════════════════════════════════════
 
     def get_htf_trend(self) -> Optional[str]:
         """
@@ -820,6 +800,7 @@ class ZScoreDataManager:
                 return trend
             else:
                 return self._last_htf_trend
+
         except Exception as e:
             logger.error(f"Error in get_htf_trend: {e}", exc_info=True)
             return None
@@ -918,6 +899,7 @@ class ZScoreDataManager:
             self._htf_lstm.eval()
             self._htf_lstm_trained = True
             logger.info("HTF LSTM trained successfully")
+
         except RuntimeError as e:
             msg = str(e).lower()
             if "inplace" in msg or "gradient computation" in msg:
@@ -967,16 +949,16 @@ class ZScoreDataManager:
                 return "DOWN"
             else:
                 return "RANGE"
+
         except Exception as e:
             logger.error(f"Error computing HTF LSTM trend: {e}", exc_info=True)
             return None
 
+    # ══════════════════════════════════════════════════════════════════════
+    # LTF Trend (1m LSTM) - FIXED: Thread-safe, no inplace ops
+    # ══════════════════════════════════════════════════════════════════════
 
-    # ======================================================================
-    # LTF Trend (1m LSTM-based)
-    # ======================================================================
-
-     def get_ltf_trend(self) -> Optional[str]:
+    def get_ltf_trend(self) -> Optional[str]:
         """
         Get LTF 1m trend using LSTM.
         Returns 'UP', 'DOWN', 'RANGE', or None if insufficient data.
@@ -1009,6 +991,7 @@ class ZScoreDataManager:
                 return trend
             else:
                 return self._last_ltf_trend
+
         except Exception as e:
             logger.error(f"Error in get_ltf_trend: {e}", exc_info=True)
             return None
@@ -1102,6 +1085,7 @@ class ZScoreDataManager:
             self._ltf_lstm.eval()
             self._ltf_lstm_trained = True
             logger.info("LTF LSTM trained successfully")
+
         except RuntimeError as e:
             msg = str(e).lower()
             if "inplace" in msg or "gradient computation" in msg:
@@ -1150,20 +1134,17 @@ class ZScoreDataManager:
                 return "DOWN"
             else:
                 return "RANGE"
+
         except Exception as e:
             logger.error(f"Error computing LTF LSTM trend: {e}", exc_info=True)
             return None
 
-
-    # ======================================================================
-    # Oracle Metric Wrappers (Called by Strategy)
-    # ======================================================================
+    # ══════════════════════════════════════════════════════════════════════
+    # Oracle wrappers (unchanged)
+    # ══════════════════════════════════════════════════════════════════════
 
     def compute_liquidity_velocity_multi_tf(self) -> Tuple[Optional[float], Optional[float], Optional[float], bool]:
-        """
-        Wrapper for oracle's LV computation.
-        Returns: (lv_1m, lv_5m, lv_15m, micro_trap)
-        """
+        """Wrapper for oracle's LV computation. Returns (lv_1m, lv_5m, lv_15m, micro_trap)"""
         try:
             return self._oracle.compute_liquidity_velocity_multi_tf(self)
         except Exception as e:
@@ -1171,10 +1152,7 @@ class ZScoreDataManager:
             return (None, None, None, False)
 
     def compute_norm_cvd(self, window_sec: int = 10) -> Optional[float]:
-        """
-        Wrapper for oracle's normalized CVD computation.
-        Returns: Normalized CVD in [-1, 1] or None
-        """
+        """Wrapper for oracle's normalized CVD computation. Returns Normalized CVD in [-1, 1] or None"""
         try:
             return self._oracle.compute_norm_cvd(self, window_sec=window_sec)
         except Exception as e:
@@ -1182,10 +1160,7 @@ class ZScoreDataManager:
             return None
 
     def compute_hurst_exponent(self, window_ticks: int = 20) -> Optional[float]:
-        """
-        Wrapper for oracle's Hurst exponent computation.
-        Returns: Hurst value or None
-        """
+        """Wrapper for oracle's Hurst exponent computation. Returns Hurst value or None"""
         try:
             return self._oracle.compute_hurst_exponent(self, window_ticks=window_ticks)
         except Exception as e:
@@ -1193,10 +1168,7 @@ class ZScoreDataManager:
             return None
 
     def compute_bos_alignment(self, current_price: float) -> Optional[float]:
-        """
-        Wrapper for oracle's BOS alignment computation.
-        Returns: BOS alignment score (0-1) or None
-        """
+        """Wrapper for oracle's BOS alignment computation. Returns BOS alignment score (0-1) or None"""
         try:
             return self._oracle.compute_bos_alignment(self, current_price)
         except Exception as e:

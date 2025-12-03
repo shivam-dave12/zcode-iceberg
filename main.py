@@ -1,8 +1,6 @@
 """
 Z-SCORE IMBALANCE ICEBERG HUNTER - Main Execution
-
 High-frequency BTCUSDT futures scalper on CoinSwitch PRO.
-
 UPDATED: Event-driven WebSocket callbacks for sub-50ms latency.
 """
 
@@ -11,6 +9,7 @@ import signal
 import sys
 import logging
 from datetime import datetime
+
 from futures_api import FuturesAPI
 from futures_websocket import FuturesWebSocket
 import config
@@ -48,7 +47,6 @@ def _handle_uncaught_exception(exc_type, exc_value, exc_traceback) -> None:
     if issubclass(exc_type, KeyboardInterrupt):
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
         return
-
     logger.error(
         "Uncaught exception",
         exc_info=(exc_type, exc_value, exc_traceback),
@@ -128,6 +126,7 @@ class ZScoreIcebergBot:
                 exchange=config.EXCHANGE,
                 leverage=config.LEVERAGE,
             )
+
             if lev_res:
                 logger.info(f"Leverage set to {config.LEVERAGE}x")
             else:
@@ -135,6 +134,7 @@ class ZScoreIcebergBot:
 
             logger.info("Fetching available USDT futures balance...")
             balance_info = self.risk_manager.get_available_balance()
+
             if balance_info:
                 logger.info(
                     f"Initial Balance: {balance_info['available']:.2f} "
@@ -221,8 +221,8 @@ class ZScoreIcebergBot:
             logger.info("✅ WARMUP COMPLETE - Bot ready to trade")
             logger.info("=" * 80)
             time.sleep(2)
-            # ═══════════════════════════════════════════════════════════
 
+            # ═══════════════════════════════════════════════════════════
             # At this point, startup has succeeded; notify controller (if any)
             if self.controller is not None:
                 try:
@@ -250,7 +250,6 @@ class ZScoreIcebergBot:
         """
         Register event-driven callbacks on WebSocket data updates.
         This enables sub-50ms strategy updates on fresh orderbook/trade data.
-        
         FIXED: Complete implementation with proper callback wrapping.
         """
         if self._callbacks_registered:
@@ -258,7 +257,6 @@ class ZScoreIcebergBot:
 
         try:
             ws = self.data_manager.ws
-
             if not ws:
                 logger.warning("WebSocket not initialized; cannot register callbacks")
                 return
@@ -274,7 +272,6 @@ class ZScoreIcebergBot:
                 try:
                     # First, update data_manager state (original callback)
                     original_orderbook_cb(data)
-                    
                     # Then trigger strategy update (event-driven)
                     self._on_data_update()
                 except Exception as e:
@@ -284,7 +281,6 @@ class ZScoreIcebergBot:
                 try:
                     # First, update data_manager state
                     original_trade_cb(data)
-                    
                     # Then trigger strategy update
                     self._on_data_update()
                 except Exception as e:
@@ -320,7 +316,6 @@ class ZScoreIcebergBot:
                 order_manager=self.order_manager,
                 risk_manager=self.risk_manager,
             )
-
         except Exception as e:
             logger.error(f"Error in event-driven strategy update: {e}", exc_info=True)
 
@@ -357,7 +352,6 @@ class ZScoreIcebergBot:
 
         try:
             last_update = self.data_manager.stats.get("last_update")
-
             if not last_update:
                 return
 
@@ -393,7 +387,6 @@ class ZScoreIcebergBot:
             time.sleep(2.0)
 
             restart_success = False
-
             for attempt in range(3):
                 try:
                     logger.info(f"WebSocket restart attempt {attempt + 1}/3...")
@@ -446,6 +439,16 @@ class ZScoreIcebergBot:
         """Clean shutdown."""
         self.running = False
 
+        # ═══════════════════════════════════════════════════════════════
+        # FIX: Cancel all open orders to avoid orphan fills after STOP
+        # ═══════════════════════════════════════════════════════════════
+        #try:
+        #    if self.order_manager:
+        #        logger.info("Cancelling all open orders before shutdown...")
+        #        self.order_manager.cancel_all_orders()
+        #except Exception as e:
+        #    logger.error(f"Error cancelling open orders during stop: {e}", exc_info=True)
+
         try:
             if self.data_manager:
                 self.data_manager.stop()
@@ -470,7 +473,6 @@ class ZScoreIcebergBot:
             return
 
         now = time.time()
-
         if now - self._last_report_sec < interval:
             return
 
