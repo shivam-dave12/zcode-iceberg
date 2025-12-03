@@ -36,8 +36,8 @@ class RiskManager:
         self.losing_trades = 0
 
         # Balance cache (to avoid hammering wallet_balance endpoint)
-        self._balance_cache: Optional[Dict] = None
-        self._last_balance_fetch: float = 0.0
+        self._last_balance_time = 0
+        self._cached_balance = None
         # ═══════════════════════════════════════════════════════════════
         # FIX: Increased cache TTL from 5s to 10s
         # ═══════════════════════════════════════════════════════════════
@@ -91,85 +91,46 @@ class RiskManager:
     # Balance management
     # ======================================================================
 
-def get_available_balance(self) -> Optional[Dict]:
-    """Get available balance with global rate limiting"""
-    now = time.time()
-    
-    # GLOBAL RATE LIMIT - 1 call per 3 seconds MAX
-    if hasattr(self, '_last_balance_time') and now - self._last_balance_time < 3.0:
-        logger.debug("Balance rate limited - using cache")
-        return getattr(self, '_cached_balance', None)
-    
-    self._last_balance_time = now
-
-            try:
-                response = self.api.get_wallet_balance()
-
-                if isinstance(response, dict) and response.get("status_code") == 429:
-                    # Rate limited – back off and retry, but keep cache
-                    now = time.time()
-                    if now - self._last_429_log > 5.0:
-                        logger.error(
-                            "Failed to get balance: 429 Too Many Requests. "
-                            "Using cached balance if available."
-                        )
-                        self._last_429_log = now
-
-                    sleep_sec = backoff_base ** attempt
-                    logger.debug(f"Backing off for {sleep_sec:.1f}s (attempt {attempt + 1}/{max_retries})")
-                    time.sleep(sleep_sec)
-                    continue  # try again
-
-                if "data" in response:
-                    data = response["data"]
-                    base_balances = data.get("base_asset_balances", [])
-                    usdt_balance = next(
-                        (b for b in base_balances if b.get("base_asset") == "USDT"),
-                        None,
-                    )
-
-                    if usdt_balance:
-                        balances = usdt_balance.get("balances", {})
-                        result = {
-                            "total": float(balances.get("total_balance", 0)),
-                            "available": float(
-                                balances.get("total_available_balance", 0)
-                            ),
-                            "blocked": float(
-                                balances.get("total_blocked_balance", 0)
-                            ),
-                            "currency": "USDT",
-                        }
-
-                        self._balance_cache = result
-                        self._last_balance_fetch = time.time()
-
-                        logger.debug(
-                            "Wallet balance fetched: "
-                            f"total={result['total']:.4f}, "
-                            f"available={result['available']:.4f}, "
-                            f"blocked={result['blocked']:.4f}"
-                        )
-                        return result
-                    else:
-                        logger.warning(
-                            "USDT balance not found in wallet response"
-                        )
-                        return self._balance_cache
-
-                logger.error(f"Failed to get balance: {response}")
-                return self._balance_cache
-
-            except Exception as e:
-                # On exception, back off and retry; keep last cache
-                logger.error(f"Error getting balance (attempt {attempt + 1}/{max_retries}): {e}", exc_info=True)
-                if attempt < max_retries - 1:
-                    sleep_sec = backoff_base ** attempt
-                    time.sleep(sleep_sec)
-
-        # All retries exhausted – return whatever cache we have (may be None)
-        logger.warning("All balance fetch retries exhausted; returning cached value")
-        return self._balance_cache
+    def get_available_balance(self) -> Optional[Dict]:
+        """
+        Get available balance with GLOBAL rate limiting (1 call per 3 seconds MAX)
+        """
+        now = time.time()
+        
+        # GLOBAL RATE LIMIT - 1 call per 3 seconds MAX
+        if hasattr(self, '_last_balance_time') and now - self._last_balance_time < 3.0:
+            logger.debug("Balance rate limited - using cache")
+            return getattr(self, '_cached_balance', None)
+        
+        self._last_balance_time = now
+        
+        try:
+            logger.debug("Fetching fresh balance...")
+            response = self.api.get_balance()
+            
+            if "data" in response:
+                balance_data = response["data"]
+                available_usdt = float(balance_data.get("USDT", {}).get("available", 0.0))
+                
+                # Cache result for 3 seconds
+                self._cached_balance = {
+                    "available": available_usdt,
+                    "total": float(balance_data.get("USDT", {}).get("total", 0.0)),
+                    "used": float(balance_data.get("USDT", {}).get("used", 0.0)),
+                    "timestamp": now
+                }
+                
+                logger.debug(f"✓ Fresh balance: {available_usdt:.2f} USDT available")
+                return self._cached_balance
+                
+            else:
+                logger.warning(f"Balance API returned no data: {response}")
+                return getattr(self, '_cached_balance', None)
+                
+        except Exception as e:
+            logger.error(f"Failed to get balance: {e}")
+            # Return cached even on error (graceful degradation)
+            return getattr(self, '_cached_balance', None)
 
     # ======================================================================
     # Legacy HF position sizing (kept for compatibility)
