@@ -128,7 +128,6 @@ class ZScoreIcebergBot:
                 exchange=config.EXCHANGE,
                 leverage=config.LEVERAGE,
             )
-
             if lev_res:
                 logger.info(f"Leverage set to {config.LEVERAGE}x")
             else:
@@ -136,7 +135,6 @@ class ZScoreIcebergBot:
 
             logger.info("Fetching available USDT futures balance...")
             balance_info = self.risk_manager.get_available_balance()
-
             if balance_info:
                 logger.info(
                     f"Initial Balance: {balance_info['available']:.2f} "
@@ -156,7 +154,6 @@ class ZScoreIcebergBot:
 
             logger.info("Waiting for first live prices (minimal warmup)...")
             wait_start = time.time()
-
             while self.data_manager.get_last_price() <= 0:
                 if time.time() - wait_start > 60:
                     logger.error("Timeout waiting for initial price ticks")
@@ -164,7 +161,6 @@ class ZScoreIcebergBot:
                 time.sleep(0.5)
 
             last_price = self.data_manager.get_last_price()
-
             if last_price > 0:
                 logger.info(f"First live price received: {last_price:.2f}")
             else:
@@ -173,9 +169,20 @@ class ZScoreIcebergBot:
                     "strategy will self‑gate entries."
                 )
 
+            # At this point, startup has succeeded; notify controller (if any)
+            if self.controller is not None:
+                try:
+                    self.controller.notify_bot_started()
+                except Exception as e:
+                    logger.error(
+                        f"Error notifying controller of startup completion: {e}",
+                        exc_info=True,
+                    )
+
             logger.info(
-                "Entering Z-Score main loop (EVENT-DRIVEN mode). Strategy will only trade "
-                "when imbalance, wall, delta, and touch conditions all align."
+                "Entering Z-Score main loop (EVENT-DRIVEN mode). "
+                "Strategy will only trade when imbalance, wall, delta, "
+                "and touch conditions all align."
             )
 
             self.running = True

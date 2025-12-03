@@ -63,6 +63,10 @@ class TelegramBotController:
 
         # Setup log capture
         self._setup_log_capture()
+        # - _bot_start_error holds a short error message for user-facing reporting
+        self._bot_started_event = threading.Event()
+        self._bot_start_failed_event = threading.Event()
+        self._bot_start_error: Optional[str] = None
 
     def _setup_log_capture(self) -> None:
         """Setup logging handler to capture logs into buffer."""
@@ -156,6 +160,18 @@ class TelegramBotController:
                 logger.error(f"Error in polling loop: {e}", exc_info=True)
                 time.sleep(5.0)
 
+    def notify_bot_started(self) -> None:
+        """
+        Called by ZScoreIcebergBot once startup has fully succeeded.
+        This method is intentionally lightweight and thread-safe.
+        """
+        try:
+            self._bot_started_event.set()
+            logger.info("Bot startup confirmed by ZScoreIcebergBot.")
+        except Exception as e:
+            logger.error(f"Error in notify_bot_started: {e}", exc_info=True)
+
+
     def stop_daemon(self) -> None:
         """Stop the daemon and any running bot"""
         logger.info("Stopping Telegram Bot Controller...")
@@ -245,38 +261,54 @@ class TelegramBotController:
             self._send_message("🚀 Starting trading bot...")
             logger.info("Starting trading bot from Telegram command...")
 
+            # Reset startup events before launching a new thread
+            self._bot_started_event.clear()
+            self._bot_start_failed_event.clear()
+            self._bot_start_error = None
+
             # Start bot in separate thread
             self.bot_thread = threading.Thread(
                 target=self._run_bot,
                 daemon=False,
-                name="TradingBotThread"
+                name="TradingBotThread",
             )
             self.bot_thread.start()
 
-            # Wait for bot to initialize with multiple checks
+            # Wait for explicit startup signal from the bot
             max_wait = 15.0  # Maximum 15 seconds
-            check_interval = 0.5  # Check every 0.5 seconds
+            check_interval = 0.5
             elapsed = 0.0
 
             while elapsed < max_wait:
                 time.sleep(check_interval)
                 elapsed += check_interval
 
-                if self.bot_running:
+                # Bot reported successful startup
+                if self._bot_started_event.is_set():
                     self._send_message("✅ Trading bot started successfully")
-                    logger.info("Trading bot started successfully")
+                    logger.info("Trading bot reported successful startup")
                     return
 
-            # Timeout - but bot might still be starting
-            if self.bot_thread.is_alive():
+                # Bot reported startup failure before readiness
+                if self._bot_start_failed_event.is_set():
+                    msg = self._bot_start_error or "See logs for details"
+                    self._send_message(f"❌ Failed to start trading bot: {msg}")
+                    logger.error(f"Trading bot failed to start: {msg}")
+                    return
+
+            # Timeout: no explicit success/failure yet
+            if self.bot_thread and self.bot_thread.is_alive():
                 self._send_message(
                     "⚠️ Bot is starting (taking longer than expected)...\n"
-                    "Send 'Status' in a few seconds to verify"
+                    "Send 'STATUS' in a few seconds to verify"
                 )
-                logger.warning("Bot thread alive but bot_running flag not set yet")
+                logger.warning(
+                    "Bot thread alive but no startup confirmation yet "
+                    f"(waited {max_wait:.1f}s)"
+                )
             else:
-                self._send_message("❌ Failed to start trading bot - check logs")
-                logger.error("Failed to start trading bot - thread not alive")
+                self._send_message("❌ Failed to start trading bot - thread not alive")
+                logger.error("Failed to start trading bot - thread not alive after wait")
 
         except Exception as e:
             logger.error(f"Error handling START command: {e}", exc_info=True)
@@ -382,22 +414,37 @@ class TelegramBotController:
 
     def _run_bot(self) -> None:
         """Run the trading bot (called in separate thread)"""
+        # Import here to avoid circular imports
+        from main import ZScoreIcebergBot
+
+        # Reset state for this run
+        self.bot_running = True
+        self._bot_started_event.clear()
+        self._bot_start_failed_event.clear()
+        self._bot_start_error = None
+
+        logger.info("Bot thread started, initializing bot instance...")
+
         try:
-            # Import here to avoid circular imports
-            from main import ZScoreIcebergBot
-
-            # Set flag immediately so controller knows we're starting
-            self.bot_running = True
-            logger.info("Bot thread started, initializing bot instance...")
-
             self.bot_instance = ZScoreIcebergBot(controller=self)
 
             # Start the bot (this blocks until bot stops)
+            # ZScoreIcebergBot will call controller.notify_bot_started()
+            # once startup has completed successfully.
             self.bot_instance.start()
 
         except Exception as e:
+            # If startup has not been confirmed yet, treat this as a startup failure
+            if not self._bot_started_event.is_set():
+                self._bot_start_failed_event.set()
+                self._bot_start_error = str(e)
+
             logger.error(f"Error running bot: {e}", exc_info=True)
-            self._send_message(f"❌ Bot crashed: {e}")
+            try:
+                self._send_message(f"❌ Bot crashed: {e}")
+            except Exception:
+                logger.error("Failed to send crash message to Telegram", exc_info=True)
+
         finally:
             self.bot_running = False
             self.bot_instance = None

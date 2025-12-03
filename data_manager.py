@@ -1,5 +1,6 @@
 """
 Z-Score Data Manager - Depth / Trades / Price Window
+
 CORRECTED: Matches official CoinSwitch WebSocket formats
 UPDATED: Robust Volatility (ATR/Realized) calculation to prevent MISSING data
 + Vol-Regime Detection for dynamic parameter tuning
@@ -10,11 +11,14 @@ import logging
 from typing import Dict, List, Tuple, Optional, Deque  # Add Tuple if missing
 from collections import deque
 from datetime import datetime
+
 import numpy as np
 import pandas as pd  # used for EMA, ATR, and feature calculations
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
+
 from futures_api import FuturesAPI
 from futures_websocket import FuturesWebSocket
 import config
@@ -25,7 +29,9 @@ logger = logging.getLogger(__name__)
 torch.manual_seed(42)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
+
 np.random.seed(42)
+
 import random
 random.seed(42)
 
@@ -35,6 +41,7 @@ class TrendLSTM(nn.Module):
     Simple LSTM classifier for 3-state trend:
     0 = UPTREND, 1 = DOWNTREND, 2 = RANGEBOUND
     """
+
     def __init__(
         self,
         input_dim: int,
@@ -77,6 +84,97 @@ class ZScoreDataManager:
         getattr(config, "ATR_WINDOW_MINUTES", 10) * 60 * 2,
     )
     _MAX_TRADES_HISTORY_SEC = 900
+
+    def __init__(self) -> None:
+        logger.info("=" * 80)
+        logger.info("Z-SCORE DATA MANAGER INITIALIZED")
+        logger.info("=" * 80)
+        logger.info(f"Symbol : {config.SYMBOL}")
+        logger.info(f"Exchange : {config.EXCHANGE}")
+
+        # WebSocket connection
+        # NOTE:
+        #   - FuturesWebSocket.__init__ takes no arguments (public streams only).
+        #   - Actual connection + subscriptions are handled in start().
+        #   - Keep this as a simple placeholder to avoid constructor crashes.
+        self.ws: Optional[FuturesWebSocket] = None
+
+        # REST API client
+        self.api = FuturesAPI(
+            api_key=config.COINSWITCH_API_KEY,
+            secret_key=config.COINSWITCH_SECRET_KEY,
+        )
+
+        # Data storage
+        self._orderbook_bids: List[Tuple[float, float]] = []
+        self._orderbook_asks: List[Tuple[float, float]] = []
+        self._trades: Deque[Dict] = deque(maxlen=1000)
+        self._price_window: Deque[Tuple[int, float]] = deque(
+            maxlen=int(self._MAX_PRICE_HISTORY_SEC * 2)
+        )
+
+        self._candles_1m: Deque[Dict] = deque(maxlen=100)
+        self._candles_5m: Deque[Dict] = deque(maxlen=100)
+
+        # Additional series used elsewhere in the file (htf/ltf/bos)
+        self._htf_5m_closes: Deque[Tuple[int, float]] = deque(maxlen=5000)
+        self._bos_15m_closes: Deque[Tuple[int, float]] = deque(maxlen=5000)
+        self._ltf_1m_closes: Deque[Tuple[int, float]] = deque(maxlen=5000)
+        self._recent_trades: Deque[Dict] = deque(maxlen=2000)
+
+        # Last price cache
+        self._last_price: float = 0.0
+
+        # Locks
+        import threading  # local import to avoid circulars in some environments
+
+        self._orderbook_lock = threading.Lock()
+        self._trades_lock = threading.Lock()
+        self._price_lock = threading.Lock()
+        self._candles_lock = threading.Lock()
+
+        # Stats
+        self.stats = {
+            "orderbook_updates": 0,
+            "trade_updates": 0,
+            "candle_updates": 0,
+            "prices_recorded": 0,
+            "trades_received": 0,
+            "candles_received": 0,
+            "last_update": None,
+        }
+
+        # LSTM model for LTF trend (placeholder)
+        self._lstm_model: Optional[nn.Module] = None
+        self._lstm_seq_len = 10
+        self._lstm_input_dim = 5
+
+        # HTF / LTF LSTM training flags and norms (used later in file)
+        self._htf_lstm: Optional[TrendLSTM] = None
+        self._htf_lstm_trained: bool = False
+        self._htf_norm_mean: float = 0.0
+        self._htf_norm_std: float = 1.0
+        self._htf_pending_trend: Optional[str] = None
+        self._htf_confirm_count: int = 0
+        self._last_htf_trend: Optional[str] = None
+
+        self._ltf_lstm: Optional[TrendLSTM] = None
+        self._ltf_lstm_trained: bool = False
+        self._ltf_norm_mean: float = 0.0
+        self._ltf_norm_std: float = 1.0
+        self._ltf_pending_trend: Optional[str] = None
+        self._ltf_confirm_count: int = 0
+        self._last_ltf_trend: Optional[str] = None
+
+        # Initialize Aether Oracle
+        from aether_oracle import AetherOracle
+        self._oracle = AetherOracle()
+
+        # Streaming flag
+        self.is_streaming: bool = False
+
+        logger.info(f"Streams : ORDERBOOK, TRADES, CANDLESTICK")
+        logger.info("=" * 80)
 
     def __init__(self) -> None:
         logger.info("=" * 80)
