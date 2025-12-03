@@ -255,12 +255,8 @@ class ZScoreDataManager:
             limit = max(window_min, ltf_lookback) + 10
 
             logger.info(f"Warming up 1m klines (limit={limit})...")
-            resp = self.api.get_klines(
-                symbol=config.SYMBOL,
-                interval=1,
-                limit=limit,
-                exchange=config.EXCHANGE,
-            )
+            resp = self._fetch_rest_klines(limit=limit, interval=htf_interval)
+
 
             if not resp or "data" not in resp:
                 logger.warning("No 1m klines returned from REST API")
@@ -290,6 +286,36 @@ class ZScoreDataManager:
         except Exception as e:
             logger.error(f"Error in _warmup_from_klines_1m: {e}", exc_info=True)
 
+    def _fetch_rest_klines(self, limit: int, interval: int = 1):
+        """
+        Try multiple method names on the FuturesAPI and common signatures.
+        Returns the response dict or None if unavailable.
+        """
+        candidates = (
+            getattr(self.api, "get_klines", None),
+            getattr(self.api, "get_candles", None),
+            getattr(self.api, "fetch_klines", None),
+            getattr(self.api, "klines", None),
+        )
+
+        for fn in candidates:
+            if callable(fn):
+                try:
+                    # Try named kwargs first
+                    resp = fn(symbol=config.SYMBOL, interval=interval, limit=limit, exchange=config.EXCHANGE)
+                    return resp
+                except TypeError:
+                    try:
+                        # Try positional fallback
+                        resp = fn(config.SYMBOL, interval, limit)
+                        return resp
+                    except Exception:
+                        continue
+                except Exception:
+                    continue
+        logger.warning("No REST klines method available on FuturesAPI; skipping REST warmup.")
+        return None
+
     def _warmup_htf_klines_5m(self) -> None:
         """Warmup HTF 5m candles from REST."""
         try:
@@ -299,12 +325,8 @@ class ZScoreDataManager:
             limit = htf_span + htf_lookback + 10
 
             logger.info(f"Warming up {htf_interval}m HTF klines (limit={limit})...")
-            resp = self.api.get_klines(
-                symbol=config.SYMBOL,
-                interval=htf_interval,
-                limit=limit,
-                exchange=config.EXCHANGE,
-            )
+            resp = self._fetch_rest_klines(limit=limit, interval=htf_interval)
+
 
             if not resp or "data" not in resp:
                 logger.warning("No 5m HTF klines returned from REST API")
@@ -339,12 +361,8 @@ class ZScoreDataManager:
             limit = htf_span + htf_lookback + 10
 
             logger.info(f"Warming up {bos_interval}m BOS klines (limit={limit})...")
-            resp = self.api.get_klines(
-                symbol=config.SYMBOL,
-                interval=bos_interval,
-                limit=limit,
-                exchange=config.EXCHANGE,
-            )
+            resp = self._fetch_rest_klines(limit=limit, interval=htf_interval)
+
 
             if not resp or "data" not in resp:
                 logger.warning("No 15m BOS klines returned from REST API")
