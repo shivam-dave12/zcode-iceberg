@@ -1,19 +1,22 @@
 """
-Z-Score Data Manager - Depth / Trades / Price Window
+Z-Score Data Manager - Enhanced Volume-Aware Edition
 
-CORRECTED: Matches official CoinSwitch WebSocket formats
-UPDATED: Robust Volatility (ATR/Realized) calculation to prevent MISSING data
+NEW FEATURES:
+- Volume regime detection (LOW/HIGH/NEUTRAL)
+- Event-driven callbacks for strategy updates
+- Normalized signal scoring for probabilistic gauntlet
+- LTF trend removed per spec (HTF only)
 """
 
 import time
 import logging
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Callable
 from collections import deque
 from datetime import datetime
+from scipy import stats as scipy_stats
 
 import numpy as np
-import pandas as pd  # used for EMA, ATR, and feature calculations
-
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -28,19 +31,14 @@ logger = logging.getLogger(__name__)
 torch.manual_seed(42)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
-
 np.random.seed(42)
-
 import random
 random.seed(42)
 
 
 class TrendLSTM(nn.Module):
-    """
-    Simple LSTM classifier for 3-state trend:
-    0 = UPTREND, 1 = DOWNTREND, 2 = RANGEBOUND
-    """
-
+    """LSTM for 3-state trend: UP/DOWN/RANGE"""
+    
     def __init__(
         self,
         input_dim: int,
@@ -58,19 +56,17 @@ class TrendLSTM(nn.Module):
         self.fc = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (batch, seq_len, input_dim)
         out, _ = self.lstm(x)
-        out = out[:, -1, :]  # last timestep
+        out = out[:, -1, :]
         out = self.fc(out)
         return out
 
 
 class ZScoreDataManager:
-    """Data manager for Z-Score Imbalance Iceberg Hunter."""
+    """
+    Enhanced data manager with volume regime detection and event-driven updates.
+    """
 
-    # Price history must be long enough to cover:
-    # - HTF_EMA_SPAN + HTF_LOOKBACK_BARS worth of HTF_TREND_INTERVAL minutes
-    # - ATR_WINDOW_MINUTES (with some buffer)
     _MAX_PRICE_HISTORY_SEC = max(
         900,
         getattr(config, "HTF_TREND_INTERVAL", 5)
@@ -82,16 +78,16 @@ class ZScoreDataManager:
         * 60,
         getattr(config, "ATR_WINDOW_MINUTES", 10) * 60 * 2,
     )
-
     _MAX_TRADES_HISTORY_SEC = 900
 
     def __init__(self) -> None:
         logger.info("=" * 80)
-        logger.info("Z-SCORE DATA MANAGER INITIALIZED")
+        logger.info("Z-SCORE DATA MANAGER - VOLUME-AWARE ENHANCED EDITION")
         logger.info("=" * 80)
         logger.info(f"Symbol : {config.SYMBOL}")
         logger.info(f"Exchange : {config.EXCHANGE}")
-        logger.info("Streams : ORDERBOOK, TRADES, CANDLESTICK")
+        logger.info("Streams : ORDERBOOK, TRADES, CANDLESTICK (1m, 5m, 15m)")
+        logger.info("Features: VOL REGIME DETECTION, EVENT-DRIVEN CALLBACKS")
         logger.info("=" * 80)
 
         self.api: FuturesAPI = FuturesAPI(
@@ -100,62 +96,279 @@ class ZScoreDataManager:
         )
         self.ws: Optional[FuturesWebSocket] = None
 
+        # Core data structures
         self._bids: List[Tuple[float, float]] = []
         self._asks: List[Tuple[float, float]] = []
         self._recent_trades: deque = deque(maxlen=50000)
         self._price_window: deque = deque(maxlen=50000)
         self._last_price: float = 0.0
 
-        # Native 5‑minute HTF candles: list of (ts_ms, close)
+        # Candle buffers
         self._htf_5m_closes: deque = deque(maxlen=1000)
-
-        # Native 1‑minute LTF candles: list of (ts_ms, close)
-        self._ltf_1m_closes: deque = deque(maxlen=3000)
-
-        # Native 15‑minute BOS candles (for BOS alignment / 15m structure)
         self._bos_15m_closes: deque = deque(maxlen=1000)
+        self._ltf_1m_closes: deque = deque(maxlen=3000)  # Keep for EMA/ATR
 
-        # LSTM models + training state
+        # LSTM models (HTF only, LTF disabled per spec)
         self._htf_lstm: Optional[TrendLSTM] = None
         self._htf_lstm_trained: bool = False
         self._htf_norm_mean: float = 0.0
         self._htf_norm_std: float = 1.0
 
-        self._ltf_lstm: Optional[TrendLSTM] = None
-        self._ltf_lstm_trained: bool = False
-        self._ltf_norm_mean: float = 0.0
-        self._ltf_norm_std: float = 1.0
-
-        # Hysteresis state for HTF trend
+        # HTF hysteresis state
         self._last_htf_trend: Optional[str] = None
         self._htf_confirm_count: int = 0
         self._htf_pending_trend: Optional[str] = None
 
-        # Hysteresis state for LTF trend
-        self._last_ltf_trend: Optional[str] = None
-        self._ltf_confirm_count: int = 0
-        self._ltf_pending_trend: Optional[str] = None
+        # Volume regime state (NEW)
+        self._current_vol_regime: str = config.VOL_REGIME_NEUTRAL
+        self._last_atr_pct: Optional[float] = None
 
-        # Latest ATR snapshot (for vol-regime + sizing)
-        self._latest_atr_pct: Optional[float] = None
-        self._latest_atr_ts_ms: Optional[int] = None
+        # Event-driven callbacks (NEW)
+        self._strategy_update_callback: Optional[Callable] = None
 
         self.is_streaming: bool = False
-
         self.stats: Dict = {
             "orderbook_updates": 0,
             "trades_received": 0,
-            "candles_received": 0,  # 1‑minute candles
+            "candles_received": 0,
             "prices_recorded": 0,
             "last_update": None,
         }
+
+    # ======================================================================
+    # Event-driven callback registration (NEW)
+    # ======================================================================
+
+    def register_strategy_callback(self, callback: Callable) -> None:
+        """
+        Register strategy update callback for event-driven execution.
+        Called on every orderbook/trade update with fresh data.
+        """
+        self._strategy_update_callback = callback
+        logger.info("✓ Strategy callback registered for event-driven updates")
+
+    def _trigger_strategy_update(self) -> None:
+        """Fire strategy callback if registered (non-blocking)."""
+        if self._strategy_update_callback is not None:
+            try:
+                self._strategy_update_callback()
+            except Exception as e:
+                logger.error(f"Error in strategy callback: {e}", exc_info=True)
+
+    # ======================================================================
+    # Volume Regime Detection (NEW)
+    # ======================================================================
+
+    def get_vol_regime(self, atr_pct: Optional[float] = None) -> str:
+        """
+        Classify current volatility regime: LOW, HIGH, or NEUTRAL.
+        
+        Args:
+            atr_pct: Optional pre-computed ATR%; if None, computed fresh
+            
+        Returns:
+            One of config.VOL_REGIME_LOW, VOL_REGIME_HIGH, VOL_REGIME_NEUTRAL
+        """
+        if atr_pct is None:
+            try:
+                atr_pct = self.get_atr_percent()
+            except Exception as e:
+                logger.error(f"Error computing ATR for regime: {e}", exc_info=True)
+                return self._current_vol_regime  # Return cached
+
+        if atr_pct is None:
+            return self._current_vol_regime
+
+        self._last_atr_pct = atr_pct
+
+        if atr_pct < config.VOL_REGIME_LOW_THRESHOLD:
+            regime = config.VOL_REGIME_LOW
+        elif atr_pct > config.VOL_REGIME_HIGH_THRESHOLD:
+            regime = config.VOL_REGIME_HIGH
+        else:
+            regime = config.VOL_REGIME_NEUTRAL
+
+        if regime != self._current_vol_regime:
+            logger.info(
+                f"Volume regime transition: {self._current_vol_regime} → {regime} "
+                f"(ATR={atr_pct*100:.3f}%)"
+            )
+            self._current_vol_regime = regime
+
+        return regime
+
+    def get_dynamic_z_threshold(self, atr_pct: Optional[float] = None) -> float:
+        """
+        Compute dynamic Z-score threshold based on ATR%.
+        
+        Formula: BASE + SCALE * ((atr_pct - LOW_THRESH) / LOW_THRESH)
+        Clamped to [Z_SCORE_MIN, Z_SCORE_MAX]
+        
+        Returns:
+            Adaptive Z-score threshold for current volatility
+        """
+        if atr_pct is None:
+            regime = self.get_vol_regime()
+            if regime == config.VOL_REGIME_LOW:
+                return config.LOW_VOL_DELTA_Z_THRESHOLD
+            elif regime == config.VOL_REGIME_HIGH:
+                return config.HIGH_VOL_DELTA_Z_THRESHOLD
+            else:
+                return config.BASE_DELTA_Z_THRESHOLD
+
+        # Continuous formula
+        base = config.BASE_DELTA_Z_THRESHOLD
+        scale = config.Z_SCORE_SCALE_FACTOR
+        low_thresh = config.VOL_REGIME_LOW_THRESHOLD
+
+        if atr_pct <= low_thresh:
+            z_thresh = config.LOW_VOL_DELTA_Z_THRESHOLD
+        else:
+            delta = (atr_pct - low_thresh) / low_thresh
+            z_thresh = base + scale * delta
+
+        z_thresh = max(config.Z_SCORE_MIN, min(config.Z_SCORE_MAX, z_thresh))
+        return z_thresh
+
+    def get_dynamic_wall_mult(self, regime: Optional[str] = None) -> float:
+        """Get wall volume multiplier for current regime."""
+        if regime is None:
+            regime = self._current_vol_regime
+
+        if regime == config.VOL_REGIME_LOW:
+            return config.LOW_VOL_WALL_VOLUME_MULT
+        elif regime == config.VOL_REGIME_HIGH:
+            return config.HIGH_VOL_WALL_VOLUME_MULT
+        else:
+            return config.BASE_WALL_VOLUME_MULT
+
+    # ======================================================================
+    # Normalized Signal Scoring (NEW) - For Probabilistic Gauntlet
+    # ======================================================================
+
+    def normalize_signal_cdf(
+        self, 
+        value: float, 
+        threshold: float, 
+        std_dev: float = 1.0
+    ) -> float:
+        """
+        Normalize signal value to [0, 1] using CDF of normal distribution.
+        
+        Args:
+            value: Raw signal value
+            threshold: Decision threshold
+            std_dev: Standard deviation for scaling
+            
+        Returns:
+            Probability score [0, 1]
+        """
+        try:
+            z = (value - threshold) / std_dev
+            prob = float(scipy_stats.norm.cdf(z))
+            return max(0.0, min(1.0, prob))
+        except Exception as e:
+            logger.error(f"Error in CDF normalization: {e}", exc_info=True)
+            return 0.5  # Neutral on error
+
+    def compute_signal_scores(
+        self,
+        imbalance_data: Optional[Dict],
+        wall_data: Optional[Dict],
+        delta_data: Optional[Dict],
+        touch_data: Optional[Dict],
+        htf_trend: Optional[str],
+        regime: Optional[str] = None,
+    ) -> Dict[str, float]:
+        """
+        Compute normalized scores [0, 1] for all base signals.
+        
+        Returns:
+            Dict with keys: 'imbalance', 'wall', 'delta_z', 'touch', 'trend'
+            Each value is a probability score for LONG entry (invert for SHORT)
+        """
+        if regime is None:
+            regime = self._current_vol_regime
+
+        scores = {
+            'imbalance': 0.0,
+            'wall': 0.0,
+            'delta_z': 0.0,
+            'touch': 0.0,
+            'trend': 0.0,
+        }
+
+        # Imbalance score
+        if imbalance_data is not None:
+            imb_val = float(imbalance_data.get("imbalance", 0.0))
+            imb_thresh = config.BASE_IMBALANCE_THRESHOLD
+            # Use std=0.15 (empirical spread of imbalance values)
+            scores['imbalance'] = self.normalize_signal_cdf(
+                value=imb_val,
+                threshold=imb_thresh,
+                std_dev=0.15
+            )
+
+        # Wall score
+        if wall_data is not None:
+            wall_val = float(wall_data.get("bid_wall_strength", 0.0))
+            wall_thresh = self.get_dynamic_wall_mult(regime)
+            # Use std=1.0 (wall strength units)
+            scores['wall'] = self.normalize_signal_cdf(
+                value=wall_val,
+                threshold=wall_thresh,
+                std_dev=1.0
+            )
+
+        # Delta Z score
+        if delta_data is not None:
+            z_val = float(delta_data.get("z_score", 0.0))
+            z_thresh = self.get_dynamic_z_threshold()
+            # Use std=0.5 (Z-score distribution)
+            scores['delta_z'] = self.normalize_signal_cdf(
+                value=z_val,
+                threshold=z_thresh,
+                std_dev=0.5
+            )
+
+        # Touch score (inverted: closer = better)
+        if touch_data is not None:
+            touch_val = float(touch_data.get("bid_distance_ticks", 999.0))
+            touch_thresh = config.BASE_TOUCH_THRESHOLD_TICKS
+            # Invert: lower distance = higher score
+            # Use std=2.0 ticks
+            scores['touch'] = 1.0 - self.normalize_signal_cdf(
+                value=touch_val,
+                threshold=touch_thresh,
+                std_dev=2.0
+            )
+
+        # Trend score (HTF alignment)
+        if htf_trend is not None:
+            htf_norm = htf_trend.upper()
+            if htf_norm in ("UP", "UPTREND"):
+                scores['trend'] = 1.0  # Full alignment for LONG
+            elif htf_norm in ("DOWN", "DOWNTREND"):
+                scores['trend'] = 0.0  # No alignment for LONG
+            elif htf_norm in ("RANGE", "RANGEBOUND"):
+                # Apply regime-specific RANGE bonus
+                if regime == config.VOL_REGIME_LOW:
+                    scores['trend'] = config.LOW_VOL_RANGE_BONUS
+                elif regime == config.VOL_REGIME_HIGH:
+                    scores['trend'] = config.HIGH_VOL_RANGE_BONUS
+                else:
+                    scores['trend'] = 0.65  # Neutral bonus
+            else:
+                scores['trend'] = 0.5  # Unknown = neutral
+
+        return scores
 
     # ======================================================================
     # Lifecycle
     # ======================================================================
 
     def start(self) -> bool:
-        """Connect WebSocket and subscribe to streams, then warm up from REST klines."""
+        """Connect WebSocket with event-driven callbacks."""
         try:
             self.ws = FuturesWebSocket()
             logger.info("Connecting to CoinSwitch Futures WebSocket...")
@@ -163,25 +376,20 @@ class ZScoreDataManager:
                 logger.error("WebSocket connection failed")
                 return False
 
-            # ORDERBOOK: just "BTCUSDT" (no interval)
+            # Subscribe with event-driven callbacks
             logger.info(f"Subscribing ORDERBOOK: {config.SYMBOL}")
             self.ws.subscribe_orderbook(config.SYMBOL, callback=self._on_orderbook)
 
-            # TRADES: "BTCUSDT"
             logger.info(f"Subscribing TRADES: {config.SYMBOL}")
             self.ws.subscribe_trades(config.SYMBOL, callback=self._on_trade)
 
-            # 1‑minute CANDLESTICKS (for EMA/ATR + LTF LSTM)
-            logger.info(
-                f"Subscribing CANDLESTICKS 1m: {config.SYMBOL}_{config.CANDLE_INTERVAL}"
-            )
+            logger.info(f"Subscribing CANDLESTICKS 1m: {config.SYMBOL}_{config.CANDLE_INTERVAL}")
             self.ws.subscribe_candlestick(
                 pair=config.SYMBOL,
-                interval=config.CANDLE_INTERVAL,  # typically 1
+                interval=config.CANDLE_INTERVAL,
                 callback=self._on_candlestick_1m,
             )
 
-            # 5‑minute CANDLESTICKS (HTF LSTM)
             logger.info(f"Subscribing CANDLESTICKS 5m: {config.SYMBOL}_5")
             self.ws.subscribe_candlestick(
                 pair=config.SYMBOL,
@@ -189,7 +397,6 @@ class ZScoreDataManager:
                 callback=self._on_candlestick_5m,
             )
 
-            # 15‑minute CANDLESTICKS (BOS / structure)
             logger.info(f"Subscribing CANDLESTICKS 15m: {config.SYMBOL}_15")
             self.ws.subscribe_candlestick(
                 pair=config.SYMBOL,
@@ -198,18 +405,18 @@ class ZScoreDataManager:
             )
 
             self.is_streaming = True
-            logger.info("Z-Score data streams started")
+            logger.info("✓ Z-Score data streams started (event-driven mode)")
 
-            # REST warmup for 1m prices (EMA, ATR, LTF)
+            # Warmup from REST
             self._warmup_from_klines_1m()
-
-            # REST warmup for 5m HTF candles
             self._warmup_htf_klines_5m()
-
-            # REST warmup for 15m BOS candles
             self._warmup_bos_klines_15m()
 
+            # Initial regime detection
+            self.get_vol_regime()
+
             return True
+
         except Exception as e:
             logger.error(f"Error starting ZScoreDataManager: {e}", exc_info=True)
             return False
@@ -224,7 +431,7 @@ class ZScoreDataManager:
             logger.info("ZScoreDataManager stopped")
 
     # ======================================================================
-    # Warmup - 1m, 5m, 15m
+    # Warmup methods (unchanged from original)
     # ======================================================================
 
     def _warmup_from_klines_1m(
@@ -232,10 +439,7 @@ class ZScoreDataManager:
         minutes: Optional[int] = None,
         interval: str = "1",
     ) -> None:
-        """
-        Warm up 1‑minute price history using REST /trade/api/v2/futures/klines.
-        This feeds _price_window for EMA/ATR and _ltf_1m_closes for LSTM.
-        """
+        """Warm up 1m price history for EMA/ATR."""
         try:
             if minutes is None:
                 htf_interval_min = getattr(config, "HTF_TREND_INTERVAL", 5)
@@ -250,6 +454,7 @@ class ZScoreDataManager:
 
             end_ms = int(time.time() * 1000)
             start_ms = end_ms - minutes * 60 * 1000
+
             params = {
                 "symbol": config.SYMBOL,
                 "exchange": config.EXCHANGE,
@@ -259,11 +464,6 @@ class ZScoreDataManager:
                 "limit": minutes,
             }
 
-            logger.info(
-                f"Warmup (1m) from REST klines: symbol={config.SYMBOL}, "
-                f"interval={interval}, minutes={minutes}"
-            )
-
             resp = self.api._make_request(
                 method="GET",
                 endpoint="/trade/api/v2/futures/klines",
@@ -272,9 +472,7 @@ class ZScoreDataManager:
             )
 
             if not isinstance(resp, dict):
-                logger.error(
-                    f"Klines warmup 1m: unexpected response type {type(resp)}"
-                )
+                logger.error(f"Klines warmup 1m: unexpected response type {type(resp)}")
                 return
 
             data = resp.get("data", [])
@@ -286,8 +484,8 @@ class ZScoreDataManager:
                 return int(k.get("close_time") or k.get("start_time") or 0)
 
             data_sorted = sorted(data, key=_ts)
-            seeded = 0
 
+            seeded = 0
             for k in data_sorted:
                 try:
                     ts_ms = int(k.get("close_time") or k.get("start_time") or 0)
@@ -297,6 +495,7 @@ class ZScoreDataManager:
                     close_price = float(close_str)
                     if close_price <= 0:
                         continue
+
                     self._append_price(ts_ms, close_price)
                     self._append_ltf_1m_close(ts_ms, close_price)
                     seeded += 1
@@ -305,40 +504,32 @@ class ZScoreDataManager:
 
             if seeded > 0:
                 logger.info(
-                    f"Klines warmup 1m complete: seeded {seeded} candle closes, "
+                    f"Klines warmup 1m complete: seeded {seeded} candles, "
                     f"last_price={self._last_price:.2f}"
                 )
-            else:
-                logger.warning("Klines warmup 1m: no valid candles parsed")
+
         except Exception as e:
             logger.error(f"Error in klines 1m warmup: {e}", exc_info=True)
 
     def _warmup_htf_klines_5m(self) -> None:
-        """
-        Warm up native 5‑minute HTF candles from REST.
-        Populates _htf_5m_closes with enough bars for LSTM training.
-        """
+        """Warm up 5m HTF candles."""
         try:
             htf_interval_min = getattr(config, "HTF_TREND_INTERVAL", 5)
             htf_span = getattr(config, "HTF_EMA_SPAN", 80)
             htf_lookback = getattr(config, "HTF_LOOKBACK_BARS", 86)
-            minutes = htf_interval_min * (htf_span + htf_lookback + 2)  # small buffer
+            minutes = htf_interval_min * (htf_span + htf_lookback + 2)
 
             end_ms = int(time.time() * 1000)
             start_ms = end_ms - minutes * 60 * 1000
+
             params = {
                 "symbol": config.SYMBOL,
                 "exchange": config.EXCHANGE,
                 "interval": "5",
                 "start_time": start_ms,
                 "end_time": end_ms,
-                "limit": minutes,  # generous; API will cap
+                "limit": minutes,
             }
-
-            logger.info(
-                f"Warmup (5m HTF) from REST klines: symbol={config.SYMBOL}, "
-                f"interval=5, minutes={minutes}"
-            )
 
             resp = self.api._make_request(
                 method="GET",
@@ -348,9 +539,7 @@ class ZScoreDataManager:
             )
 
             if not isinstance(resp, dict):
-                logger.error(
-                    f"HTF klines 5m warmup: unexpected response type {type(resp)}"
-                )
+                logger.error(f"HTF klines 5m warmup: unexpected response type {type(resp)}")
                 return
 
             data = resp.get("data", [])
@@ -362,8 +551,8 @@ class ZScoreDataManager:
                 return int(k.get("close_time") or k.get("start_time") or 0)
 
             data_sorted = sorted(data, key=_ts)
-            seeded = 0
 
+            seeded = 0
             for k in data_sorted:
                 try:
                     ts_ms = int(k.get("close_time") or k.get("start_time") or 0)
@@ -373,25 +562,20 @@ class ZScoreDataManager:
                     close_price = float(close_str)
                     if close_price <= 0:
                         continue
+
                     self._append_htf_5m_close(ts_ms, close_price)
                     seeded += 1
                 except Exception:
                     continue
 
             if seeded > 0:
-                logger.info(
-                    f"HTF klines 5m warmup complete: seeded {seeded} candles"
-                )
-            else:
-                logger.warning("HTF klines 5m warmup: no valid candles parsed")
+                logger.info(f"HTF klines 5m warmup complete: seeded {seeded} candles")
+
         except Exception as e:
             logger.error(f"Error in HTF 5m klines warmup: {e}", exc_info=True)
 
     def _warmup_bos_klines_15m(self) -> None:
-        """
-        Warm up native 15‑minute BOS candles from REST for BOS alignment.
-        Populates _bos_15m_closes with sufficient history.
-        """
+        """Warm up 15m BOS candles."""
         try:
             htf_interval_min = getattr(config, "HTF_TREND_INTERVAL", 5)
             htf_span = getattr(config, "HTF_EMA_SPAN", 80)
@@ -400,19 +584,15 @@ class ZScoreDataManager:
 
             end_ms = int(time.time() * 1000)
             start_ms = end_ms - minutes * 60 * 1000
+
             params = {
                 "symbol": config.SYMBOL,
                 "exchange": config.EXCHANGE,
                 "interval": "15",
                 "start_time": start_ms,
                 "end_time": end_ms,
-                "limit": minutes,  # generous; API will cap
+                "limit": minutes,
             }
-
-            logger.info(
-                f"Warmup (15m BOS) from REST klines: symbol={config.SYMBOL}, "
-                f"interval=15, minutes={minutes}"
-            )
 
             resp = self.api._make_request(
                 method="GET",
@@ -422,9 +602,7 @@ class ZScoreDataManager:
             )
 
             if not isinstance(resp, dict):
-                logger.error(
-                    f"BOS klines 15m warmup: unexpected response type {type(resp)}"
-                )
+                logger.error(f"BOS klines 15m warmup: unexpected response type {type(resp)}")
                 return
 
             data = resp.get("data", [])
@@ -436,8 +614,8 @@ class ZScoreDataManager:
                 return int(k.get("close_time") or k.get("start_time") or 0)
 
             data_sorted = sorted(data, key=_ts)
-            seeded = 0
 
+            seeded = 0
             for k in data_sorted:
                 try:
                     ts_ms = int(k.get("close_time") or k.get("start_time") or 0)
@@ -447,29 +625,26 @@ class ZScoreDataManager:
                     close_price = float(close_str)
                     if close_price <= 0:
                         continue
+
                     self._append_bos_15m_close(ts_ms, close_price)
                     seeded += 1
                 except Exception:
                     continue
 
             if seeded > 0:
-                logger.info(
-                    f"BOS klines 15m warmup complete: seeded {seeded} candles"
-                )
-            else:
-                logger.warning("BOS klines 15m warmup: no valid candles parsed")
+                logger.info(f"BOS klines 15m warmup complete: seeded {seeded} candles")
+
         except Exception as e:
             logger.error(f"Error in BOS 15m klines warmup: {e}", exc_info=True)
 
     # ======================================================================
-    # WebSocket callbacks
+    # WebSocket callbacks (ENHANCED with event-driven trigger)
     # ======================================================================
 
     def _on_orderbook(self, data: Dict) -> None:
-        """Handle orderbook updates."""
+        """Handle orderbook updates + trigger strategy."""
         try:
             if not isinstance(data, dict):
-                logger.error(f"Orderbook callback non-dict: {type(data)}")
                 return
 
             bids_raw = data.get("b", []) or []
@@ -481,7 +656,6 @@ class ZScoreDataManager:
             for level in bids_raw:
                 if len(level) >= 2:
                     bids.append((float(level[0]), float(level[1])))
-
             for level in asks_raw:
                 if len(level) >= 2:
                     asks.append((float(level[0]), float(level[1])))
@@ -494,23 +668,24 @@ class ZScoreDataManager:
 
             self._bids = bids
             self._asks = asks
-
             self.stats["orderbook_updates"] += 1
             self.stats["last_update"] = datetime.now()
 
-            # Optional: if price is still unset, use mid-price once
             if self._last_price <= 0:
                 mid = (bids[0][0] + asks[0][0]) / 2.0
                 ts_ms = int(time.time() * 1000)
                 self._append_price(ts_ms, mid)
+
+            # EVENT-DRIVEN: Trigger strategy update on fresh orderbook
+            self._trigger_strategy_update()
+
         except Exception as e:
             logger.error(f"Error in _on_orderbook: {e}", exc_info=True)
 
     def _on_trade(self, data: Dict) -> None:
-        """Handle trades (updates last price every trade)."""
+        """Handle trades + trigger strategy."""
         try:
             if not isinstance(data, dict):
-                logger.error(f"Trade callback non-dict: {type(data)}")
                 return
 
             price = float(data.get("p", 0.0))
@@ -530,14 +705,17 @@ class ZScoreDataManager:
                 }
             )
 
-            # Update last price from every trade
             self._append_price(ts_ms, price)
             self.stats["trades_received"] += 1
+
+            # EVENT-DRIVEN: Trigger strategy update on fresh trade
+            self._trigger_strategy_update()
+
         except Exception as e:
             logger.error(f"Error in _on_trade: {e}", exc_info=True)
 
     def _on_candlestick_1m(self, data) -> None:
-        """Handle 1‑minute candlestick updates (for EMA/ATR and LTF LSTM)."""
+        """Handle 1m candles (for EMA/ATR)."""
         try:
             if isinstance(data, dict):
                 close_str = data.get("c")
@@ -547,6 +725,7 @@ class ZScoreDataManager:
                     price = float(close_str)
                 except Exception:
                     return
+
                 if price <= 0:
                     return
 
@@ -560,11 +739,15 @@ class ZScoreDataManager:
                 self._append_price(ts_ms, price)
                 self._append_ltf_1m_close(ts_ms, price)
                 self.stats["candles_received"] += 1
+
+                # Update volume regime on new candle
+                self.get_vol_regime()
+
         except Exception as e:
             logger.error(f"Error in _on_candlestick_1m: {e}", exc_info=True)
 
     def _on_candlestick_5m(self, data) -> None:
-        """Handle 5‑minute candlestick updates (native HTF stream)."""
+        """Handle 5m candles (HTF LSTM)."""
         try:
             if isinstance(data, dict):
                 close_str = data.get("c")
@@ -574,6 +757,7 @@ class ZScoreDataManager:
                     price = float(close_str)
                 except Exception:
                     return
+
                 if price <= 0:
                     return
 
@@ -585,11 +769,12 @@ class ZScoreDataManager:
                 )
 
                 self._append_htf_5m_close(ts_ms, price)
+
         except Exception as e:
             logger.error(f"Error in _on_candlestick_5m: {e}", exc_info=True)
 
     def _on_candlestick_15m(self, data) -> None:
-        """Handle 15‑minute candlestick updates (BOS / structure)."""
+        """Handle 15m candles (BOS)."""
         try:
             if isinstance(data, dict):
                 close_str = data.get("c")
@@ -599,6 +784,7 @@ class ZScoreDataManager:
                     price = float(close_str)
                 except Exception:
                     return
+
                 if price <= 0:
                     return
 
@@ -610,6 +796,7 @@ class ZScoreDataManager:
                 )
 
                 self._append_bos_15m_close(ts_ms, price)
+
         except Exception as e:
             logger.error(f"Error in _on_candlestick_15m: {e}", exc_info=True)
 
