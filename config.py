@@ -44,6 +44,8 @@ BALANCE_USAGE_PERCENTAGE = 30  # Use 30% of margin per trade
 MIN_MARGIN_PER_TRADE = 4  # Minimum margin (USDT)
 MAX_MARGIN_PER_TRADE = 10_000  # Safety cap (USDT)
 
+TRADING_ENABLED = True  # Master switch for live trading
+
 # Legacy HF fields kept for compatibility with other modules (not used directly
 # by the current Z-Score strategy implementation, but referenced by some
 # shared components).
