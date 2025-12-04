@@ -104,7 +104,7 @@ def _make_request(self, method: str, endpoint: str, params: Dict = None, payload
         if 'response' in locals() and response:
             error_msg += f" | Status: {response.status_code} | Body: {response.text[:500]}..."  # Trunc raw body for debug
         logger.error(error_msg)
-        return {
+            return {
             "error": str(e),
             "status_code": getattr(response, 'status_code', None) if 'response' in locals() else None,
             "response_text": getattr(response, 'text', 'N/A')[:200] if 'response' in locals() else 'N/A'  # For debug
