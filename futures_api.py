@@ -12,9 +12,11 @@ from typing import Dict, List, Optional, Any
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from urllib.parse import urlparse, urlencode
 from dotenv import load_dotenv
+import logging
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
 
 class FuturesAPI:
     """CoinSwitch Futures Trading API Client"""
@@ -73,40 +75,40 @@ class FuturesAPI:
         return signature_bytes.hex()
     
     def _make_request(self, method: str, endpoint: str, params: Dict = None, payload: Dict = None) -> Dict:
-        """Make authenticated API request"""
-        signature = self._generate_signature(method, endpoint, params, payload)
+        """Make authenticated API request WITH EPOCH HEADER (2024 req)."""
+        signature, epoch_ms = self._generate_signature(method, endpoint, params, payload)
         
         url = self.base_url + endpoint
-        if method == "GET" and params:
-            url += ('&', '?')[urlparse(endpoint).query == ''] + urlencode(params)
-        
         headers = {
-            'Content-Type': 'application/json',
-            'X-AUTH-SIGNATURE': signature,
-            'X-AUTH-APIKEY': self.api_key
+            "X-AUTH-APIKEY": self.api_key,
+            "X-AUTH-SIGNATURE": signature,
+            "X-AUTH-EPOCH": str(epoch_ms),  # Required header
+            "Content-Type": "application/json",
         }
         
         try:
-            response = requests.request(method, url, headers=headers, json=payload if payload else {})
+            if method == "GET":
+                response = requests.get(url, params=params, headers=headers, timeout=10)
+            elif method == "POST":
+                response = requests.post(url, json=payload, headers=headers, timeout=10)
+            elif method == "DELETE":
+                response = requests.delete(url, json=payload, headers=headers, timeout=10)
+            else:
+                raise ValueError(f"Unsupported method: {method}")
+            
             response.raise_for_status()
             return response.json()
-            except requests.exceptions.RequestException as e:
-                error_msg = f"API request failed ({method} {endpoint}): {e}"
-                if 'response' in locals():
-                    error_msg += f" | Status: {response.status_code} | Body: {response.text[:500]}..."  # Trunc raw body
-                logger.error(error_msg)
-                return {
-                    "error": str(e),
-                    "status_code": getattr(response, 'status_code', None),
-                    "response_text": getattr(response, 'text', 'N/A')[:200]  # For debug
-                }
-
-            if hasattr(e, 'response') and e.response is not None:
-                try:
-                    error_response['response'] = e.response.json()
-                except:
-                    error_response['response'] = e.response.text
-            return error_response
+        
+        except requests.exceptions.RequestException as e:
+            error_msg = f"API request failed ({method} {endpoint}): {e}"
+            if 'response' in locals() and response:
+                error_msg += f" | Status: {response.status_code} | Body: {response.text[:500]}..."  # Trunc raw body for debug
+            logger.error(error_msg)
+            return {
+                "error": str(e),
+                "status_code": getattr(response, 'status_code', None) if 'response' in locals() else None,
+                "response_text": getattr(response, 'text', 'N/A')[:200] if 'response' in locals() else 'N/A'  # For debug
+            }
     
     # ============ ORDER MANAGEMENT ============
     
