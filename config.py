@@ -2,6 +2,7 @@
 Configuration - Z-Score Imbalance Iceberg Hunter Strategy (2025 Real Version)
 
 Core edge:
+
 - Orderbook imbalance ≥65%
 - Wall strength ≥4.2× average
 - Taker delta Z-score ≥2.8
@@ -22,8 +23,8 @@ load_dotenv()
 COINSWITCH_API_KEY = os.getenv("COINSWITCH_API_KEY")
 COINSWITCH_SECRET_KEY = os.getenv("COINSWITCH_SECRET_KEY")
 
+# Hard fail on missing credentials – no fallbacks, no synthetic data.
 if not COINSWITCH_API_KEY or not COINSWITCH_SECRET_KEY:
-    # Hard fail on missing credentials – no fallbacks, no synthetic data.
     raise ValueError("API credentials not found in .env file")
 
 # ============================================================================
@@ -37,14 +38,12 @@ EXCHANGE = "EXCHANGE_2"
 # Leverage (aggressive, real scalper standard)
 LEVERAGE = 25
 
-# Position sizing: percentage of available margin per trade
+# Position sizing: percentage of available margin per trade (legacy cap)
 BALANCE_USAGE_PERCENTAGE = 30  # Use 30% of margin per trade
 
 # Per-trade margin bounds (USDT)
-MIN_MARGIN_PER_TRADE = 4  # Minimum margin (USDT)
-MAX_MARGIN_PER_TRADE = 10_000  # Safety cap (USDT)
-
-TRADING_ENABLED = True  # Master switch for live trading
+MIN_MARGIN_PER_TRADE = 4        # Minimum margin (USDT)
+MAX_MARGIN_PER_TRADE = 10_000   # Safety cap (USDT)
 
 # Legacy HF fields kept for compatibility with other modules (not used directly
 # by the current Z-Score strategy implementation, but referenced by some
@@ -59,23 +58,17 @@ TAKE_PROFIT_PERCENTAGE = 0.10
 # Strategy operates on tick / depth data; candles are only for HTF/LTF trend,
 # ATR, and Oracle features.
 TIMEFRAME = "tick"
-CANDLE_INTERVAL = 1  # Used for orderbook pair name only
-CANDLE_LIMIT = 200  # Not used directly by strategy
-MIN_CANDLES_FOR_TRADING = 50  # Not used by current strategy logic
 
-# Core tick loop sleep in main.py
+CANDLE_INTERVAL = 1          # Used for orderbook pair name only
+CANDLE_LIMIT = 200           # Not used directly by strategy
+MIN_CANDLES_FOR_TRADING = 50 # Not used by current strategy logic
+
+# Core tick loop sleep in main.py (legacy; will be superseded by WS callbacks)
 POSITION_CHECK_INTERVAL = 0.12  # 120 ms tick interval
 
 # ============================================================================
 # TRADING RULES / DAILY RISK
 # ============================================================================
-
-# RISK MANAGER CONSTANTS (REQUIRED)
-MAX_CONCURRENT_POSITIONS = 3
-MAX_DAILY_TRADES = 100  
-MAX_DAILY_LOSS = 50.0
-MIN_MARGIN_PER_TRADE = 4.0  
-MAX_MARGIN_PER_TRADE = 10000.0
 
 # Only one position open at a time for this scalper.
 ONE_POSITION_AT_A_TIME = True
@@ -92,10 +85,12 @@ MAX_DAILY_LOSS = 2_000  # Daily loss cap (USDT)
 # ============================================================================
 
 LOG_LEVEL = "INFO"
+
 ENABLE_EXCEL_LOGGING = True
 EXCEL_LOG_FILE = "zscore_iceberg_hunter_log.xlsx"
-ENABLE_TRADING = True  # Hard on/off switch for live order placement
-AUTO_CLOSE_ON_ERROR = True  # Emergency flat on critical failure
+
+ENABLE_TRADING = True          # Hard on/off switch for live order placement
+AUTO_CLOSE_ON_ERROR = True     # Emergency flat on critical failure
 EMERGENCY_STOP_ENABLED = True  # Global kill-switch support
 
 # API rate limits – used by infrastructure layers, not strategy math directly.
@@ -119,7 +114,7 @@ WALL_DEPTH_LEVELS = 20
 # IMBALANCE_THRESHOLD = 0.65 ≈ 82% bid share
 IMBALANCE_THRESHOLD = 0.65
 
-# Delta Z-score threshold (aggressor pressure) - BASE value
+# Base Delta Z-score threshold (aggressor pressure)
 DELTA_Z_THRESHOLD = 2.1
 
 # Taker delta window (seconds)
@@ -131,12 +126,12 @@ ZONE_TICKS = 12
 # Price touch confirmation distance to wall in ticks
 PRICE_TOUCH_THRESHOLD_TICKS = 4
 
-# Wall volume strength (multiples of average depth volume) - BASE value
+# Base wall volume strength (multiples of average depth volume)
 MIN_WALL_VOLUME_MULT = 4.2
 
-# Exit thresholds (ROI on margin) - BASE values
-PROFIT_TARGET_ROI = 0.10  # +10.0% on margin
-STOP_LOSS_ROI = -0.03  # -3.0% on margin
+# Exit thresholds (ROI on margin) – BASELINE (pre‑regime)
+PROFIT_TARGET_ROI = 0.10   # +10.0% on margin
+STOP_LOSS_ROI = -0.03      # -3.0% on margin
 
 # Wall degradation exit (fraction of entry wall volume)
 WALL_DEGRADE_EXIT = 0.0005
@@ -149,77 +144,6 @@ SLIPPAGE_TICKS_ASSUMED = 1
 
 # Population statistics window for Z-score (seconds) – used by strategy.py
 Z_SCORE_POPULATION_SEC = 360
-
-# ============================================================================
-# VOL-REGIME DETECTION & DYNAMIC GATES (NEW)
-# ============================================================================
-
-# ATR% thresholds for regime classification
-VOL_REGIME_LOW_THRESHOLD = 0.0015  # <0.15% ATR = LOW volatility
-VOL_REGIME_HIGH_THRESHOLD = 0.003  # >0.30% ATR = HIGH volatility
-# Between these = NEUTRAL regime
-
-# Dynamic Z-score & Delta threshold scaling per regime
-# Formula: base_z + scaling_factor * (atr_pct - low_threshold) / (high_threshold - low_threshold)
-# Clamped to regime-specific bounds
-VOL_REGIME_Z_LOW = 1.8  # Z threshold for LOW vol
-VOL_REGIME_Z_HIGH = 2.3  # Z threshold for HIGH vol
-VOL_REGIME_Z_BASE = 2.1  # Z threshold for NEUTRAL vol
-
-# Dynamic wall multiplier per regime
-VOL_REGIME_WALL_MULT_LOW = 4.2  # Higher requirement in LOW vol (more reliable)
-VOL_REGIME_WALL_MULT_HIGH = 3.8  # Lower requirement in HIGH vol (spoof veto)
-VOL_REGIME_WALL_MULT_BASE = 4.0  # NEUTRAL regime
-
-# Dynamic TP/SL per regime (percentage multipliers on base ROI)
-# HIGH vol: wider stops, wider targets
-VOL_REGIME_TP_MULT_HIGH = 1.4  # +40% on TP
-VOL_REGIME_SL_MULT_HIGH = 0.9  # -10% tighter SL (more aggressive)
-
-# LOW/NEUTRAL vol: tighter scalp
-VOL_REGIME_TP_MULT_LOW = 1.1  # +10% on TP
-VOL_REGIME_SL_MULT_LOW = 0.97  # -3% tighter SL
-
-# Trail stop in high vol after profit threshold
-VOL_REGIME_TRAIL_PROFIT_THRESHOLD = 0.10  # After +10% profit, trail to entry +0.05%
-VOL_REGIME_TRAIL_BUFFER = 0.0005  # 0.05% buffer above entry
-
-# Vol-based position sizing (Kelly-style adjustment)
-# HIGH vol = smaller position, LOW vol = larger position
-VOL_REGIME_SIZE_HIGH_PCT = 0.15  # 15% of balance in HIGH vol
-VOL_REGIME_SIZE_LOW_PCT = 0.20  # 20% of balance in LOW vol
-
-# ============================================================================
-# WEIGHTED SCORE GAUNTLET (NEW)
-# ============================================================================
-
-# Enable weighted scoring instead of binary AND gates
-ENABLE_WEIGHTED_SCORING = True
-
-# Minimum total score (0-1) required for entry
-WEIGHTED_SCORE_ENTRY_THRESHOLD = 0.70
-
-# Individual signal weights (must sum to 1.0 for base 5 signals)
-# Base signals: Imbalance, Wall, Z-Score, Touch, Trend
-WEIGHT_IMBALANCE = 0.25
-WEIGHT_WALL = 0.20
-WEIGHT_ZSCORE = 0.30
-WEIGHT_TOUCH = 0.10
-WEIGHT_TREND = 0.15
-
-# Data Fusion expansion weights (added on top of base 65%)
-# CVD, LV_avg, Hurst/BOS, LSTM probability
-WEIGHT_CVD = 0.10
-WEIGHT_LV = 0.05
-WEIGHT_HURST_BOS = 0.10
-WEIGHT_LSTM = 0.10
-
-# Score decay exit: rescore position hold, exit if score <0.5
-SCORE_DECAY_EXIT_THRESHOLD = 0.5
-SCORE_DECAY_CHECK_INTERVAL_SEC = 120  # Check every 2 minutes
-
-# Win probability overlay threshold (data-derived filter)
-WIN_PROB_THRESHOLD = 0.6  # Only enter if combined win_prob > 0.6
 
 # ============================================================================
 # TREND / VOLATILITY FILTERS
@@ -280,37 +204,99 @@ MAKER_FEE_RATE = 0.0003
 TAKER_FEE_RATE = 0.00065
 
 # ============================================================================
-# SESSION + VOLATILITY-AWARE DYNAMIC PARAMETERS (ORIGINAL)
+# SESSION + VOLATILITY-AWARE DYNAMIC PARAMETERS (EXISTING)
 # ============================================================================
 
 # Session windows in UTC hours: (start_hour, end_hour) — 24h clock,
 # inclusive of start, exclusive of end
-ASIA_SESSION_UTC = (0, 8)  # 00:00–08:00 UTC
-LONDON_SESSION_UTC = (8, 16)  # 08:00–16:00 UTC
-NEW_YORK_SESSION_UTC = (16, 24)  # 16:00–24:00 UTC
+ASIA_SESSION_UTC = (0, 8)       # 00:00–08:00 UTC
+LONDON_SESSION_UTC = (8, 16)    # 08:00–16:00 UTC
+NEW_YORK_SESSION_UTC = (16, 24) # 16:00–24:00 UTC
 
 # Dynamic behaviour switches
 ENABLE_SESSION_DYNAMIC_PARAMS = True
 ENABLE_TP_TIGHTENING = True
 
 # Session-mode defaults (major sessions: Asia, London, New York)
-SESSION_SLIPPAGE_TICKS = 1  # 1–2 ticks in major sessions
+SESSION_SLIPPAGE_TICKS = 1        # 1–2 ticks in major sessions
 SESSION_PROFIT_TARGET_ROI = 0.10  # 10% TP
-SESSION_STOP_LOSS_ROI = -0.03  # -3% SL
+SESSION_STOP_LOSS_ROI = -0.03     # -3% SL
 
 # Off-session / low-volatility bounds
-MIN_ATR_PCT_FOR_FULL_TP = 0.005  # 0.5% ATR ~ enough juice for full 10% RR
-VERY_LOW_ATR_PCT = 0.002  # Very quiet conditions; use near TP and minimal slippage
+MIN_ATR_PCT_FOR_FULL_TP = 0.005   # 0.5% ATR ~ enough juice for full 10% RR
+VERY_LOW_ATR_PCT = 0.002          # Very quiet conditions; use near TP and minimal slippage
+
 OFFSESSION_SLIPPAGE_TICKS_LOW_VOL = 0  # Minimal slippage when ATR is very low
-OFFSESSION_SLIPPAGE_TICKS_BASE = 1  # Base slippage for off-session
-OFFSESSION_FULL_TP_ROI = 0.08  # Example: cap at 8% in dead hours (optional)
-OFFSESSION_NEAR_TP_ROI = 0.06  # Example: 6% TP when ATR is extremely low
+OFFSESSION_SLIPPAGE_TICKS_BASE = 1     # Base slippage for off-session
+
+OFFSESSION_FULL_TP_ROI = 0.08   # Example: cap at 8% in dead hours (optional)
+OFFSESSION_NEAR_TP_ROI = 0.06   # Example: 6% TP when ATR is extremely low
 
 # TP tightening after stagnation (must be <= MAX_HOLD_MINUTES to be reachable)
-DYNAMIC_TP_MINUTES = 60  # Check for TP tightening after 60 min
-DYNAMIC_TP_NEAR_ROI = 0.06  # e.g. tighten to 6% when >50% TP is already reached
-DYNAMIC_TP_REQUIRED_PROGRESS = 0.5  # 50% of full TP before tightening
-DYNAMIC_TP_MIN_ATR_PCT = 0.003  # Consider "no volatility" below this ATR%
+DYNAMIC_TP_MINUTES = 60               # Check for TP tightening after 60 min
+DYNAMIC_TP_NEAR_ROI = 0.06            # e.g. tighten to 6% when >50% TP is already reached
+DYNAMIC_TP_REQUIRED_PROGRESS = 0.5    # 50% of full TP before tightening
+DYNAMIC_TP_MIN_ATR_PCT = 0.003        # Consider "no volatility" below this ATR%
+
+# ============================================================================
+# NEW: VOLATILITY REGIME CLASSIFIER + REGIME-AWARE PARAMETERS
+# ============================================================================
+
+# ATR% regime thresholds:
+# - LOW:    atr_pct < ATR_LOW_THRESHOLD
+# - HIGH:   atr_pct > ATR_HIGH_THRESHOLD
+# - NEUTRAL: otherwise
+#
+# Example: LOW < 0.15%, HIGH > 0.30%, NEUTRAL in between.
+ATR_LOW_THRESHOLD = 0.0015   # 0.15%
+ATR_HIGH_THRESHOLD = 0.0030  # 0.30%
+
+# Regime-aware scaling of Delta Z threshold.
+# Base DELTA_Z_THRESHOLD is 2.1.
+# Dynamic formula (for reference, implemented in strategy/data_manager):
+#   z_dynamic = 2.1 + 0.3 * (atr_pct - 0.0015) / 0.0015, clamped into [1.8, 2.3]
+DELTA_Z_THRESHOLD_LOW = 1.8
+DELTA_Z_THRESHOLD_HIGH = 2.3
+
+# Regime-aware wall multiplier adjustments.
+# - HIGH VOL: walls are weaker / more spoof-prone -> require *stronger* walls.
+# - LOW VOL: books are thicker, so reduce requirement slightly vs base.
+#
+# Implemented as multipliers to MIN_WALL_VOLUME_MULT in strategy:
+#   wall_mult_eff = MIN_WALL_VOLUME_MULT * REGIME_WALL_MULT[regime]
+REGIME_WALL_MULT = {
+    "LOW": 4.2,     # Slightly higher than base (locks low-vol walls)
+    "NEUTRAL": 4.0, # Near-base behaviour
+    "HIGH": 3.8,    # More forgiving on wall mult to avoid missing genuine swings
+}
+
+# Regime-aware TP/SL modifiers (applied on top of PROFIT_TARGET_ROI/STOP_LOSS_ROI).
+# HIGH: TP +40%, SL -10%; LOW/NEUTRAL: TP +10%, SL -3%.
+REGIME_TP_MULT = {
+    "LOW": 1.10,
+    "NEUTRAL": 1.10,
+    "HIGH": 1.40,
+}
+REGIME_SL_MULT = {
+    "LOW": 0.97,    # 3% tighter than base SL magnitude
+    "NEUTRAL": 0.97,
+    "HIGH": 0.90,   # 10% tighter than base SL magnitude
+}
+
+# Regime-aware position sizing using Kelly overlay.
+# Baseline Kelly factor: kelly_raw = 1 / (1 + atr_pct_5m)  [bounded later].
+# Then mapped into percentage-of-balance caps per regime:
+#   - HIGH  : up to 15% balance
+#   - LOW   : up to 20% balance
+#   - NEUTRAL: mid between low/high.
+VOL_POSITION_SIZE_CAP = {
+    "LOW": 0.20,       # 20% of available balance cap
+    "NEUTRAL": 0.18,   # 18% cap
+    "HIGH": 0.15,      # 15% cap
+}
+
+# Enable/disable volatility regime behaviour as a whole.
+ENABLE_VOL_REGIME_LOGIC = True
 
 # ============================================================================
 # DISPLAY
@@ -322,17 +308,17 @@ print("=" * 80)
 print(f" Symbol: {SYMBOL}")
 print(f" Timeframe: {TIMEFRAME}")
 print(f" Leverage: {LEVERAGE}x")
-print(f" Position Sizing: {BALANCE_USAGE_PERCENTAGE}% of margin per trade")
+print(f" Position Sizing (legacy cap): {BALANCE_USAGE_PERCENTAGE}% of margin per trade")
 print(f" Min Margin: {MIN_MARGIN_PER_TRADE} | Max: {MAX_MARGIN_PER_TRADE}")
 print("")
 print(" Strategy Constants (2024–2025 Tuning):")
 print(f" Imbalance Threshold: {IMBALANCE_THRESHOLD:.2f} (~82% bid share)")
-print(f" Wall Volume Mult: {MIN_WALL_VOLUME_MULT:.2f}×")
-print(f" Delta Z-Score Threshold: {DELTA_Z_THRESHOLD:.2f}")
+print(f" Wall Volume Mult (base): {MIN_WALL_VOLUME_MULT:.2f}×")
+print(f" Delta Z-Score Threshold (base): {DELTA_Z_THRESHOLD:.2f}")
 print(f" Zone Ticks: ±{ZONE_TICKS}")
 print(f" Touch Threshold: {PRICE_TOUCH_THRESHOLD_TICKS} ticks")
-print(f" Profit Target ROI: {PROFIT_TARGET_ROI * 100:.2f}%")
-print(f" Stop Loss ROI: {STOP_LOSS_ROI * 100:.2f}%")
+print(f" Profit Target ROI (base): {PROFIT_TARGET_ROI * 100:.2f}%")
+print(f" Stop Loss ROI (base): {STOP_LOSS_ROI * 100:.2f}%")
 print(f" Max Hold: {MAX_HOLD_MINUTES} minutes")
 print(f" Tick Size: {TICK_SIZE}")
 print(f" EMA Period (trend): {EMA_PERIOD}")
@@ -346,21 +332,20 @@ print(f" Lookback Bars: {HTF_LOOKBACK_BARS}")
 print(f" Min Trend Slope: {MIN_TREND_SLOPE * 100:.2f}%")
 print(f" Consistency Threshold: {CONSISTENCY_THRESHOLD * 100:.0f}%")
 print("")
-print(" VOL-REGIME DETECTION & DYNAMIC GATES:")
-print(f" LOW vol: <{VOL_REGIME_LOW_THRESHOLD*100:.2f}% ATR (Z={VOL_REGIME_Z_LOW}, Wall={VOL_REGIME_WALL_MULT_LOW}x)")
-print(f" HIGH vol: >{VOL_REGIME_HIGH_THRESHOLD*100:.2f}% ATR (Z={VOL_REGIME_Z_HIGH}, Wall={VOL_REGIME_WALL_MULT_HIGH}x)")
-print(f" NEUTRAL vol: between thresholds (Z={VOL_REGIME_Z_BASE}, Wall={VOL_REGIME_WALL_MULT_BASE}x)")
-print("")
-print(" WEIGHTED SCORE GAUNTLET:")
-print(f" Enabled: {ENABLE_WEIGHTED_SCORING}")
-print(f" Entry Threshold: {WEIGHTED_SCORE_ENTRY_THRESHOLD}")
-print(f" Weights: Imb={WEIGHT_IMBALANCE}, Wall={WEIGHT_WALL}, Z={WEIGHT_ZSCORE}, Touch={WEIGHT_TOUCH}, Trend={WEIGHT_TREND}")
-print(f" Data Fusion: CVD={WEIGHT_CVD}, LV={WEIGHT_LV}, Hurst/BOS={WEIGHT_HURST_BOS}, LSTM={WEIGHT_LSTM}")
-print("")
 print(" SESSION + VOLATILITY DYNAMICS:")
 print(f" Enabled: {ENABLE_SESSION_DYNAMIC_PARAMS}")
 print(f" Asia: {ASIA_SESSION_UTC[0]}:00–{ASIA_SESSION_UTC[1]}:00 UTC")
 print(f" London: {LONDON_SESSION_UTC[0]}:00–{LONDON_SESSION_UTC[1]}:00 UTC")
 print(f" New York: {NEW_YORK_SESSION_UTC[0]}:00–{NEW_YORK_SESSION_UTC[1]}:00 UTC")
 print(f" TP Tightening: {ENABLE_TP_TIGHTENING} (after {DYNAMIC_TP_MINUTES}min)")
+print("")
+print(" VOLATILITY REGIME LOGIC:")
+print(f" Enabled: {ENABLE_VOL_REGIME_LOGIC}")
+print(f" ATR Regimes: LOW < {ATR_LOW_THRESHOLD*100:.2f}% "
+      f"< NEUTRAL < {ATR_HIGH_THRESHOLD*100:.2f}% < HIGH")
+print(f" Z-Score Range by Regime: LOW={DELTA_Z_THRESHOLD_LOW:.2f}, "
+      f"BASE={DELTA_Z_THRESHOLD:.2f}, HIGH={DELTA_Z_THRESHOLD_HIGH:.2f}")
+print(f" TP Mult: {REGIME_TP_MULT}")
+print(f" SL Mult: {REGIME_SL_MULT}")
+print(f" Vol Position Caps: {VOL_POSITION_SIZE_CAP}")
 print("=" * 80 + "\n")
