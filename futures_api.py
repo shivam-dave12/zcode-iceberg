@@ -90,11 +90,17 @@ class FuturesAPI:
             response = requests.request(method, url, headers=headers, json=payload if payload else {})
             response.raise_for_status()
             return response.json()
-        except requests.exceptions.RequestException as e:
-            error_response = {
-                "error": str(e),
-                "status_code": getattr(e.response, 'status_code', None) if hasattr(e, 'response') else None,
-            }
+            except requests.exceptions.RequestException as e:
+                error_msg = f"API request failed ({method} {endpoint}): {e}"
+                if 'response' in locals():
+                    error_msg += f" | Status: {response.status_code} | Body: {response.text[:500]}..."  # Trunc raw body
+                logger.error(error_msg)
+                return {
+                    "error": str(e),
+                    "status_code": getattr(response, 'status_code', None),
+                    "response_text": getattr(response, 'text', 'N/A')[:200]  # For debug
+                }
+
             if hasattr(e, 'response') and e.response is not None:
                 try:
                     error_response['response'] = e.response.json()

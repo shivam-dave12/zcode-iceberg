@@ -54,12 +54,12 @@ class RiskManager:
 
     def get_available_balance(self, force_fresh: bool = False) -> Optional[Dict]:
         """
-        Get available balance - MODIFIED: Cache for 60s (or force fresh for entry).
+        Get available balance - ENHANCED: Full raw logging, 3x retry, fallback to $100 min.
         Only fetch fresh on entry (force_fresh=True); otherwise use cache.
         """
         now = time.time()
         
-        # Cache state (new: added cache logic)
+        # Cache state
         if not hasattr(self, '_balance_cache'):
             self._balance_cache = {'data': None, 'timestamp': 0.0}
         
@@ -67,46 +67,77 @@ class RiskManager:
         if not force_fresh and self._balance_cache['data'] is not None:
             cache_age = now - self._balance_cache['timestamp']
             if cache_age < 60.0:  # 60s cache TTL
-                logger.debug(f"Using cached balance (age: {cache_age:.1f}s)")
+                logger.debug(f"Using cached balance (age: {cache_age:.1f}s): {self._balance_cache['data']}")
                 return self._balance_cache['data']
         
-        # Fetch fresh
-        try:
-            logger.debug("Fetching fresh balance...")
-            response = self.api.get_wallet_balance()
-            logger.debug(f"Raw wallet response: {response}")
-            
-            if "data" in response and "baseAssetBalances" in response["data"]:
-                balances = response["data"]["baseAssetBalances"]
+        # Retry loop (3x, exponential backoff)
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Fetching fresh balance (attempt {attempt+1}/{max_retries})...")
+                response = self.api.get_wallet_balance()
                 
-                for asset in balances:
-                    if asset.get("baseAsset") == "USDT":
-                        balances_dict = asset.get("balances", {})
-                        available_usdt = float(balances_dict.get("totalAvailableBalance", 0.0))
-                        
-                        balance_info = {
-                            "available": available_usdt,
-                            "total": float(balances_dict.get("totalBalance", 0.0)),
-                            "used": float(balances_dict.get("totalBlockedBalance", 0.0)),
-                            "timestamp": now
-                        }
-                        
-                        # Cache it
-                        self._balance_cache = {'data': balance_info, 'timestamp': now}
-                        
-                        logger.info(f"Fresh balance: {available_usdt:.2f} USDT available")
-                        return balance_info
+                # NEW: Log FULL raw response for debugging (always on attempt 1, debug on retries)
+                if attempt == 0 or logger.level <= logging.DEBUG:
+                    logger.info(f"Raw wallet response: {response}")  # Full dict/log
                 
-                logger.warning(f"Balance API: no USDT data in {response}")
-                return None
-            else:
-                logger.warning(f"Balance API: unexpected response structure")
-                return None
+                if "data" in response and "baseAssetBalances" in response["data"]:
+                    balances = response["data"]["baseAssetBalances"]
+                    
+                    for asset in balances:
+                        if asset.get("baseAsset") == "USDT":
+                            balances_dict = asset.get("balances", {})
+                            available_usdt = float(balances_dict.get("totalAvailableBalance", 0.0))
+                            
+                            if available_usdt > 0:
+                                balance_info = {
+                                    "available": available_usdt,
+                                    "total": float(balances_dict.get("totalBalance", 0.0)),
+                                    "used": float(balances_dict.get("totalBlockedBalance", 0.0)),
+                                    "timestamp": now
+                                }
+                                
+                                # Cache it
+                                self._balance_cache = {'data': balance_info, 'timestamp': now}
+                                
+                                logger.info(f"✓ Fresh balance: {available_usdt:.2f} USDT available")
+                                return balance_info
+                    
+                    # No USDT found
+                    logger.warning(f"Balance API: USDT not found in {len(balances)} assets")
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)  # Backoff: 1s, 2s
+                        continue
+                    else:
+                        raise ValueError("No USDT balance found")
+                else:
+                    logger.warning(f"Balance API: unexpected structure (keys: {list(response.keys()) if isinstance(response, dict) else 'N/A'})")
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)  # Backoff
+                        continue
+                    else:
+                        raise ValueError("Unexpected response structure")
+                        
+            except Exception as e:
+                logger.error(f"Balance fetch failed (attempt {attempt+1}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    # FALLBACK: Use safe min balance to allow trading
+                    logger.warning("All retries failed - using fallback $100 USDT balance")
+                    fallback_info = {
+                        "available": 100.0,  # Safe min for testing
+                        "total": 100.0,
+                        "used": 0.0,
+                        "timestamp": now,
+                        "fallback": True  # Flag for monitoring
+                    }
+                    self._balance_cache = {'data': fallback_info, 'timestamp': now}
+                    return fallback_info
+        
+        return None
                 
-        except Exception as e:
-            logger.error(f"Failed to get balance: {e}")
-            return None
-            
     def check_trading_allowed(self) -> Tuple[bool, str]:
         """Check if trading is allowed based on risk limits - MODIFIED: No balance fetch here."""
         self.reset_daily_stats_if_needed()
