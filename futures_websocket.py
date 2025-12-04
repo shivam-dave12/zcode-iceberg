@@ -1,190 +1,228 @@
 """
-CoinSwitch Futures WebSocket Client
-Fully updated: Event-driven callbacks, robust reconnect, auth, error handling
+CoinSwitch Futures Trading WebSocket Plugin
+
+Real-time market data streaming for futures markets
+
+FINAL DEBUG VERSION: Logs every incoming message and callback execution
 """
 
-import websocket
-import json
-import threading
+import socketio
 import time
+import json
 import logging
-from typing import Optional, Callable, List, Dict, Tuple
-import config
+from typing import Callable, Dict, Optional, List
+from threading import Event
 
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 class FuturesWebSocket:
-    """
-    Production-grade WebSocket client with:
-    - Callbacks for book/trade/candle
-    - Exponential backoff reconnect
-    - Subscription persistence
-    - Auth support
-    - Thread-safe
-    """
+    """CoinSwitch Futures Trading WebSocket Client"""
 
-    def __init__(self,
-                 callback_book: Optional[Callable[[List[Tuple[float, float]], List[Tuple[float, float]]], None]] = None,
-                 callback_trade: Optional[Callable[[List[Dict]], None]] = None,
-                 callback_candle: Optional[Callable[[Dict], None]] = None):
-        self.ws = None
-        self.callback_book = callback_book
-        self.callback_trade = callback_trade
-        self.callback_candle = callback_candle
-        self.running = False
-        self.thread = None
-        self.base_url = "wss://stream.coinswitch.co/ws"
-        self.subscriptions = set()
-        self.reconnect_attempts = 0
-        self.max_reconnects = 5
+    BASE_URL = "https://ws.coinswitch.co"
+    HANDSHAKE_PATH = "/pro/realtime-rates-socket/futures/exchange_2"
+    NAMESPACE = "/exchange_2"
 
-    def connect(self) -> bool:
+    # Official event names from docs
+    EVENT_ORDERBOOK = "FETCH_ORDER_BOOK_CS_PRO"
+    EVENT_CANDLESTICK = "FETCH_CANDLESTICK_CS_PRO"
+    EVENT_TRADES = "FETCH_TRADES_CS_PRO"
+    EVENT_TICKER = "FETCH_TICKER_INFO_CS_PRO"
+
+    def __init__(self):
+        """Initialize Futures WebSocket client"""
+        self.sio = socketio.Client()
+        self.is_connected = False
+        self.stop_event = Event()
+
+        # Callback storage
+        self.orderbook_callbacks = []
+        self.candlestick_callbacks = []
+        self.trades_callbacks = []
+        self.ticker_callbacks = []
+
+        self._message_count = 0
+        self._setup_handlers()
+
+    def _setup_handlers(self):
+        """Setup WebSocket event handlers"""
+
+        @self.sio.event(namespace=self.NAMESPACE)
+        def connect():
+            self.is_connected = True
+            print(f"✓ Connected to futures market")
+            logger.info(f"WebSocket connected to {self.NAMESPACE}")
+
+        @self.sio.event(namespace=self.NAMESPACE)
+        def disconnect():
+            self.is_connected = False
+            print(f"✗ Disconnected from futures market")
+            logger.info("WebSocket disconnected")
+
+        @self.sio.event(namespace=self.NAMESPACE)
+        def connect_error(data):
+            print(f"✗ Connection error: {data}")
+            logger.error(f"Connection error: {data}")
+
+        # CATCH-ALL HANDLER to see every message
+        @self.sio.on('*', namespace=self.NAMESPACE)
+        def catch_all(event, *args):
+            self._message_count += 1
+            data = args[0] if args else None
+            logger.info(
+                f"[WS MSG #{self._message_count}] event='{event}' | "
+                f"data_type={type(data).__name__} | "
+                f"data_keys={list(data.keys()) if isinstance(data, dict) else 'N/A'}"
+            )
+            
+            # Log first 200 chars of data for debugging
+            data_str = str(data)[:200]
+            logger.debug(f"  data_sample: {data_str}")
+
+        # Orderbook handler (production)
+        @self.sio.on(self.EVENT_ORDERBOOK, namespace=self.NAMESPACE)
+        def on_orderbook(data):
+            # Ignore subscription acks
+            if isinstance(data, dict) and ("bids" in data and "asks" in data):
+                formatted = {
+                    "b": data["bids"],
+                    "a": data["asks"],
+                    "timestamp": data.get("timestamp"),
+                    "symbol": data.get("s"),
+                }
+                for callback in self.orderbook_callbacks:
+                    try:
+                        callback(formatted)
+                    except Exception:
+                        pass
+            # else: ignore acks
+
+        # Trades handler (production)
+        @self.sio.on(self.EVENT_TRADES, namespace=self.NAMESPACE)
+        def on_trades(data):
+            # Ignore subscription acks
+            if isinstance(data, dict) and all(k in data for k in ("E", "p", "q")):
+                formatted = {
+                    "p": data.get("p"),
+                    "q": data.get("q"),
+                    "T": data.get("E"),
+                    "m": data.get("m"),
+                    "s": data.get("s"),
+                }
+                for callback in self.trades_callbacks:
+                    try:
+                        callback(formatted)
+                    except Exception:
+                        pass
+
+        # Candlestick handler (official format - direct object)
+        @self.sio.on(self.EVENT_CANDLESTICK, namespace=self.NAMESPACE)
+        def on_candlestick(data):
+            logger.debug(f"[CANDLESTICK HANDLER] Callback fired! data_type={type(data).__name__}")
+            
+            try:
+                # Official format: Direct dict with "o", "h", "l", "c", "v", etc.
+                if isinstance(data, dict):
+                    for callback in self.candlestick_callbacks:
+                        try:
+                            callback(data)
+                        except Exception as e:
+                            logger.error(f"Error in candlestick callback: {e}", exc_info=True)
+                            
+            except Exception as e:
+                logger.error(f"Error in on_candlestick handler: {e}", exc_info=True)
+
+        # Ticker handler (official format - dict with multiple symbols)
+        @self.sio.on(self.EVENT_TICKER, namespace=self.NAMESPACE)
+        def on_ticker(data):
+            logger.debug(f"[TICKER HANDLER] Callback fired! data_type={type(data).__name__}")
+            
+            try:
+                # Official format: {"BTCUSDT": {...}, "ETHUSDT": {...}}
+                if isinstance(data, dict):
+                    for symbol, ticker_data in data.items():
+                        if isinstance(ticker_data, dict):
+                            for callback in self.ticker_callbacks:
+                                try:
+                                    callback(ticker_data)
+                                except Exception as e:
+                                    logger.error(f"Error in ticker callback: {e}", exc_info=True)
+                                    
+            except Exception as e:
+                logger.error(f"Error in on_ticker handler: {e}", exc_info=True)
+
+    def connect(self, timeout: int = 30) -> bool:
+        """Connect to WebSocket server"""
         try:
-            def on_open(ws):
-                logger.info("WebSocket CONNECTED – sending auth & subscriptions")
-                self._on_open(ws)
-
-            def on_message(ws, message):
-                self._on_message(message)
-
-            def on_error(ws, error):
-                logger.error(f"WebSocket ERROR: {error}")
-
-            def on_close(ws, code, msg):
-                logger.warning(f"WebSocket CLOSED: {code} – {msg}")
-                self.running = False
-                self._attempt_reconnect()
-
-            self.ws = websocket.WebSocketApp(
-                self.base_url,
-                on_open=on_open,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close
+            logger.info(f"Connecting to {self.BASE_URL} with namespace {self.NAMESPACE}...")
+            self.sio.connect(
+                url=self.BASE_URL,
+                namespaces=[self.NAMESPACE],
+                transports='websocket',
+                socketio_path=self.HANDSHAKE_PATH,
+                wait=True,
+                wait_timeout=timeout
             )
-
-            self.thread = threading.Thread(
-                target=self.ws.run_forever,
-                kwargs={"ping_interval": 30, "ping_timeout": 10}
-            )
-            self.thread.daemon = True
-            self.thread.start()
-
-            time.sleep(2)  # Allow connect
-            self.running = True
-            self.reconnect_attempts = 0
-            return True
-
+            return self.is_connected
         except Exception as e:
-            logger.error(f"WS connect failed: {e}", exc_info=True)
+            logger.error(f"Connection error: {e}", exc_info=True)
+            print(f"Connection error: {e}")
             return False
 
-    def _on_open(self, ws):
-        # Auth
-        auth_msg = {
-            "method": "AUTH",
-            "params": {"api_key": config.COINSWITCH_API_KEY},
-            "id": 0
-        }
-        ws.send(json.dumps(auth_msg))
-        time.sleep(0.5)
-
-        # Resubscribe
-        for sub in self.subscriptions:
-            ws.send(json.dumps(sub))
-        logger.info(f"Re-subscribed to {len(self.subscriptions)} streams")
-
-    def _on_message(self, message: str):
-        try:
-            data = json.loads(message)
-
-            if "stream" not in data:
-                if "id" in data:
-                    logger.debug(f"WS ACK/ID: {data.get('id')}")
-                return
-
-            stream = data["stream"].lower()
-
-            if "depth" in stream or "orderbook" in stream:
-                bids = [(float(p), float(q)) for p, q in data.get("bids", [])]
-                asks = [(float(p), float(q)) for p, q in data.get("asks", [])]
-                if self.callback_book:
-                    self.callback_book(bids, asks)
-
-            elif "trade" in stream:
-                trades = data.get("trades", [data])
-                if self.callback_trade:
-                    self.callback_trade(trades)
-
-            elif "kline" in stream or "candle" in stream:
-                k = data.get("k", {})
-                candle = {
-                    "ts": float(k.get("t", time.time() * 1000)),
-                    "close": float(k.get("c", 0.0))
-                }
-                if self.callback_candle:
-                    self.callback_candle(candle)
-
-        except Exception as e:
-            logger.error(f"WS message parse error: {e} | Raw: {message[:200]}")
-
-    def _attempt_reconnect(self):
-        if self.reconnect_attempts >= self.max_reconnects:
-            logger.error("Max reconnects reached – giving up")
-            return
-
-        self.reconnect_attempts += 1
-        backoff = min(60, 2 ** self.reconnect_attempts)
-        logger.warning(f"Reconnecting in {backoff}s (attempt {self.reconnect_attempts}/{self.max_reconnects})")
-        time.sleep(backoff)
-        self.connect()
-
-    # ------------------------------------------------------------------ #
-    # Subscription Methods
-    # ------------------------------------------------------------------ #
-
-    def subscribe_orderbook(self, symbol: str):
-        sub = {
-            "method": "SUBSCRIBE",
-            "params": [f"{symbol.lower()}@depth@100ms"],
-            "id": int(time.time() * 1000)
-        }
-        self.subscriptions.add(json.dumps(sub))
-        if self.ws and self.running:
-            self.ws.send(json.dumps(sub))
-        logger.info(f"Subscribed: orderbook {symbol}")
-
-    def subscribe_trades(self, symbol: str):
-        sub = {
-            "method": "SUBSCRIBE",
-            "params": [f"{symbol.lower()}@trade"],
-            "id": int(time.time() * 1000)
-        }
-        self.subscriptions.add(json.dumps(sub))
-        if self.ws and self.running:
-            self.ws.send(json.dumps(sub))
-        logger.info(f"Subscribed: trades {symbol}")
-
-    def subscribe_candles(self, symbol: str, interval: int):
-        sub = {
-            "method": "SUBSCRIBE",
-            "params": [f"{symbol.lower()}@kline_{interval}m"],
-            "id": int(time.time() * 1000)
-        }
-        self.subscriptions.add(json.dumps(sub))
-        if self.ws and self.running:
-            self.ws.send(json.dumps(sub))
-        logger.info(f"Subscribed: {interval}m candles {symbol}")
-
-    # ------------------------------------------------------------------ #
-    # Cleanup
-    # ------------------------------------------------------------------ #
-
     def disconnect(self):
-        self.running = False
-        if self.ws:
-            self.ws.close()
-            logger.info("WebSocket disconnected")
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=10)
-        self.subscriptions.clear()
+        """Disconnect from WebSocket"""
+        try:
+            self.stop_event.set()
+            if self.sio.connected:
+                self.sio.disconnect()
+            print("✓ Disconnected successfully")
+            logger.info("Disconnected successfully")
+        except Exception as e:
+            logger.error(f"Disconnect error: {e}")
+            print(f"Disconnect error: {e}")
+
+    def subscribe_orderbook(self, pair: str, callback: Callable = None):
+        """Subscribe to order book updates (pair: "BTCUSDT")"""
+        subscribe_data = {'event': 'subscribe', 'pair': pair}
+        if callback:
+            self.orderbook_callbacks.append(callback)
+        logger.info(f"Subscribing to orderbook: {pair}")
+        self.sio.emit(self.EVENT_ORDERBOOK, subscribe_data, namespace=self.NAMESPACE)
+        print(f"✓ Subscribed to orderbook: {pair}")
+
+    def subscribe_candlestick(self, pair: str, interval: int = 5, callback: Callable = None):
+        """Subscribe to candlestick updates (pair: "BTCUSDT_5")"""
+        pair_with_interval = f"{pair}_{interval}"
+        subscribe_data = {'event': 'subscribe', 'pair': pair_with_interval}
+        if callback:
+            self.candlestick_callbacks.append(callback)
+        logger.info(f"Subscribing to candlestick: {pair_with_interval}")
+        self.sio.emit(self.EVENT_CANDLESTICK, subscribe_data, namespace=self.NAMESPACE)
+        print(f"✓ Subscribed to candlestick: {pair_with_interval}")
+
+    def subscribe_trades(self, pair: str, callback: Callable = None):
+        """Subscribe to trade updates (pair: "BTCUSDT")"""
+        subscribe_data = {'event': 'subscribe', 'pair': pair}
+        if callback:
+            self.trades_callbacks.append(callback)
+        logger.info(f"Subscribing to trades: {pair}")
+        self.sio.emit(self.EVENT_TRADES, subscribe_data, namespace=self.NAMESPACE)
+        print(f"✓ Subscribed to trades: {pair}")
+
+    def subscribe_ticker(self, pair: str, callback: Callable = None):
+        """Subscribe to ticker updates (pair: "BTCUSDT")"""
+        subscribe_data = {'event': 'subscribe', 'pair': pair}
+        if callback:
+            self.ticker_callbacks.append(callback)
+        logger.info(f"Subscribing to ticker: {pair}")
+        self.sio.emit(self.EVENT_TICKER, subscribe_data, namespace=self.NAMESPACE)
+        print(f"✓ Subscribed to ticker: {pair}")
+
+    def wait(self):
+        """Keep connection alive"""
+        try:
+            self.sio.wait()
+        except KeyboardInterrupt:
+            print("\n✓ Shutting down...")
+            self.disconnect()
