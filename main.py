@@ -172,80 +172,45 @@ class ZScoreIcebergBot:
             # ═══════════════════════════════════════════════════════════
             logger.info("=" * 80)
             logger.info("📊 DATA WARMUP - Accumulating market data...")
-            logger.info("=" * 80)
-            
-            warmup_duration = 60  # seconds
+            # ✅ FIXED: 60s fixed warmup with klines check
+            warmup_duration = 60
             start_time = time.time()
             
             while time.time() - start_time < warmup_duration:
-                elapsed = time.time() - start_time
-                remaining = warmup_duration - elapsed
-                
-                # Check data readiness
-                vol_regime, atr_pct = self.data_manager.get_vol_regime()
-                htf_trend = (
-                    self.data_manager.get_htf_trend()
-                    if hasattr(self.data_manager, "get_htf_trend")
-                    else None
-                )
-                
-                # Get kline count safely
-                kline_count = 0
-                try:
-                    if hasattr(self.data_manager, "klines_1m"):
-                        kline_count = len(self.data_manager.klines_1m)
-                except:
-                    pass
-                
-                logger.info(
-                    f"⏳ Warmup: {elapsed:.0f}s/{warmup_duration}s | "
-                    f"Bars: {kline_count} | Vol: {vol_regime} | HTF: {htf_trend or 'NA'}"
-                )
-                
-                # Check if ready early (after 40s minimum)
-                if (
-                    elapsed >= 40
-                    and kline_count >= 40
-                    and vol_regime != "UNKNOWN"
-                    and htf_trend
-                    and htf_trend != "NA"
-                ):
-                    logger.info("✅ Data ready early! Proceeding...")
-                    break
-                
+                self.data_manager.maybe_train_lstm()  # Train if ready
+                if len(self.data_manager.klines_1m) >= 10:  # At least 10 1m candles
+                    logger.info(f"Warmup progress: {len(self.data_manager.klines_1m)} candles accumulated")
                 time.sleep(5)
             
-            logger.info("=" * 80)
             logger.info("✅ WARMUP COMPLETE - Bot ready to trade")
-            logger.info("=" * 80)
-            time.sleep(2)
             
-            # ═══════════════════════════════════════════════════════════
-            # ✅ FIXED: Notify controller of successful startup
-            # ═══════════════════════════════════════════════════════════
+            # ✅ FIXED: Notify controller AFTER warmup completes
             if self.controller is not None:
                 try:
                     self.controller.notify_bot_started()
                     logger.info("✅ Notified controller of successful startup")
                 except Exception as e:
-                    logger.error(
-                        f"Error notifying controller of startup completion: {e}",
-                        exc_info=True,
-                    )
+                    logger.error(f"Error notifying controller: {e}")
             
-            logger.info(
-                "Entering Z-Score main loop (EVENT-DRIVEN mode). "
-                "Strategy will only trade when imbalance, wall, delta, "
-                "and touch conditions all align."
-            )
-            
+            # Enter main loop (from original snippet logic)
             self.running = True
-            self._run_main_loop()
+            logger.info("Entering main tick loop...")
+            while self.running:
+                self.strategy.on_tick(
+                    data_manager=self.data_manager,
+                    order_manager=self.order_manager,
+                    risk_manager=self.risk_manager,
+                )
+                self._check_stream_health()
+                self._maybe_send_telegram_report()
+                time.sleep(config.POSITION_CHECK_INTERVAL)
+            
+            logger.info("Main loop exited normally")
         
         except Exception as e:
-            logger.error(f"Error starting Z-Score bot: {e}", exc_info=True)
+            logger.error(f"Fatal error in start(): {e}", exc_info=True)
             
-            # ✅ FIXED: Notify controller of startup failure
+            # ✅ FIXED: Notify controller of failure
             if self.controller is not None:
                 try:
                     self.controller._bot_start_failed_event.set()
@@ -256,103 +221,20 @@ class ZScoreIcebergBot:
             self.stop()
     
     def _register_event_callbacks(self) -> None:
-        """
-        Register event-driven callbacks on WebSocket data updates.
-        This enables sub-50ms strategy updates on fresh orderbook/trade data.
-        """
+        """Register WebSocket event callbacks (from original)."""
         if self._callbacks_registered:
             return
         
-        try:
-            ws = self.data_manager.ws
-            
-            if not ws:
-                logger.warning("WebSocket not initialized; cannot register callbacks")
-                return
-            
-            logger.info("Registering event-driven callbacks on WebSocket...")
-            
-            # Store references to original callbacks from data_manager
-            original_orderbook_cb = self.data_manager._on_orderbook
-            original_trade_cb = self.data_manager._on_trade
-            
-            # Create enhanced callbacks that trigger strategy after data update
-            def enhanced_orderbook_callback(data):
-                try:
-                    # First, update data_manager state (original callback)
-                    original_orderbook_cb(data)
-                    
-                    # Then trigger strategy update (event-driven)
-                    self._on_data_update()
-                except Exception as e:
-                    logger.error(f"Error in enhanced orderbook callback: {e}", exc_info=True)
-            
-            def enhanced_trade_callback(data):
-                try:
-                    # First, update data_manager state
-                    original_trade_cb(data)
-                    
-                    # Then trigger strategy update
-                    self._on_data_update()
-                except Exception as e:
-                    logger.error(f"Error in enhanced trade callback: {e}", exc_info=True)
-            
-            # Replace the data_manager callbacks with enhanced versions
-            self.data_manager._on_orderbook = enhanced_orderbook_callback
-            self.data_manager._on_trade = enhanced_trade_callback
-            
-            # Re-subscribe with new callbacks
-            ws.subscribe_orderbook(config.SYMBOL, callback=enhanced_orderbook_callback)
-            ws.subscribe_trades(config.SYMBOL, callback=enhanced_trade_callback)
-            
-            self._callbacks_registered = True
-            logger.info("✓ Event-driven callbacks registered (sub-50ms latency enabled)")
+        # Register callbacks to strategy
+        self.data_manager.on_orderbook_update = lambda data: self.strategy.on_orderbook_update(data)
+        self.data_manager.on_trade_update = lambda data: self.strategy.on_trade_update(data)
+        self.data_manager.on_candle_update = lambda data: self.strategy.on_candle_update(data)
         
-        except Exception as e:
-            logger.error(f"Error registering event callbacks: {e}", exc_info=True)
-    
-    def _on_data_update(self) -> None:
-        """
-        Called on every WebSocket data update (orderbook or trade).
-        Triggers strategy.on_tick() for instant decision-making.
-        """
-        if not self.running:
-            return
-        
-        try:
-            # Instant strategy update
-            self.strategy.on_tick(
-                data_manager=self.data_manager,
-                order_manager=self.order_manager,
-                risk_manager=self.risk_manager,
-            )
-        except Exception as e:
-            logger.error(f"Error in event-driven strategy update: {e}", exc_info=True)
-    
-    def _run_main_loop(self) -> None:
-        """
-        Minimal loop for health monitoring and periodic checks.
-        Strategy updates are now event-driven via WebSocket callbacks.
-        """
-        logger.info("=" * 80)
-        logger.info("BOT RUNNING - EVENT-DRIVEN MODE (Sub-50ms Latency)")
-        logger.info("=" * 80)
-        
-        while self.running:
-            try:
-                # Health checks only (no strategy polling)
-                self._check_stream_health()
-                self._maybe_send_telegram_report()
-                
-                # Sleep 1s between health checks
-                time.sleep(1.0)
-            
-            except Exception as e:
-                logger.error(f"Error in main loop: {e}", exc_info=True)
-                time.sleep(1.0)
+        self._callbacks_registered = True
+        logger.info("Event callbacks registered")
     
     def _check_stream_health(self) -> None:
-        """Monitor data_manager stats and restart streams if needed."""
+        """Check WebSocket stream health and restart if needed (verbatim from snippet)."""
         now_sec = time.time()
         
         if now_sec - self._last_stream_check_sec < 1.0:
@@ -447,7 +329,7 @@ class ZScoreIcebergBot:
             logger.error(f"Error in stream health check: {e}", exc_info=True)
     
     def stop(self) -> None:
-        """Clean shutdown."""
+        """Clean shutdown (verbatim from snippet)."""
         self.running = False
         
         try:
@@ -467,7 +349,7 @@ class ZScoreIcebergBot:
         logger.info("=" * 80)
     
     def _maybe_send_telegram_report(self) -> None:
-        """Send periodic Telegram report."""
+        """Send periodic Telegram report (verbatim from snippet)."""
         interval = getattr(telegram_config, "TELEGRAM_REPORT_INTERVAL_SEC", 900)
         
         if interval <= 0:

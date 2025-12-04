@@ -1,19 +1,21 @@
 """
 Z-Score Imbalance Iceberg Hunter Strategy - 2025 Real Version - PRODUCTION READY
 
-✅ FIXED: Removed unnecessary entry lock mechanism
-✅ FIXED: Streamlined to single bracket order (LIMIT + TP + SL)
-✅ FIXED: Clean entry/exit flow with proper position management
-✅ NO CHANGES: All calculations, parameters, and logic preserved
+- Single bracket order per entry (LIMIT + TP + SL)
+- Margin/quantity-based TP/SL calculation (Excel-style)
+- Clean entry/exit flow with proper position management
 """
+
 import time
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
 from datetime import datetime
 from collections import deque
 import logging
+
 import numpy as np
 from scipy import stats as scipy_stats
+
 import config
 from zscore_excel_logger import ZScoreExcelLogger
 from telegram_notifier import send_telegram_message
@@ -24,7 +26,10 @@ from aether_oracle import (
     OracleSideScores,
 )
 
+import math
+
 logger = logging.getLogger(__name__)
+
 
 @dataclass
 class ZScorePosition:
@@ -49,40 +54,43 @@ class ZScorePosition:
     entry_weighted_score: float
     last_score_check_sec: float
 
+
 class ZScoreIcebergHunterStrategy:
     """
     Z-Score Imbalance Iceberg Hunter with Vol-Regime dynamics and weighted scoring.
     """
-    
+
     DECISION_LOG_INTERVAL_SEC = 60.0
     POSITION_LOG_INTERVAL_SEC = 120.0
     ORDER_STATUS_CHECK_INTERVAL_SEC = 10.0
-    
+    ENTRY_FILL_TIMEOUT_SEC = 60.0
+
     def __init__(self, excel_logger: Optional[ZScoreExcelLogger] = None) -> None:
         self.current_position: Optional[ZScorePosition] = None
         self.last_exit_time_min: float = 0.0
         self.excel_logger = excel_logger
         self.trade_seq = 0
         self.total_trades = 0
-        
-        # ✅ REMOVED: _entry_lock and _entering_position (no longer needed with bracket orders)
-        
+
         # Store recent deltas to compute population Z-score
         self._delta_population: deque = deque(maxlen=3000)
-        
+
         # Last time we printed a full decision snapshot
         self._last_decision_log_sec: float = 0.0
-        
+
         # Last time we printed a position snapshot (open position)
         self._last_position_log_sec: float = 0.0
-        
+
         # Last time TP/SL order statuses were checked
         self._last_status_check_sec: float = 0.0
-        
+
         # 15-minute performance report state (Telegram)
         self._last_report_sec: float = 0.0
         self._last_report_total_trades: int = 0
-        
+
+        # Oracle instance
+        self._oracle = AetherOracle()
+
         logger.info("=" * 80)
         logger.info("Z-SCORE IMBALANCE ICEBERG HUNTER STRATEGY INITIALIZED")
         logger.info("=" * 80)
@@ -97,11 +105,11 @@ class ZScoreIcebergHunterStrategy:
         logger.info(f"Weighted Scoring = {config.ENABLE_WEIGHTED_SCORING}")
         logger.info(f"Score Entry Threshold = {config.WEIGHTED_SCORE_ENTRY_THRESHOLD}")
         logger.info("=" * 80)
-    
-    # ══════════════════════════════════════════════════════════════════════
-    # Vol-Regime Helpers (unchanged)
-    # ══════════════════════════════════════════════════════════════════════
-    
+
+    # =====================================================================
+    # Vol-Regime Helpers
+    # =====================================================================
+
     def _get_dynamic_z_threshold(self, vol_regime: str, atr_pct: Optional[float]) -> float:
         """Get dynamic Z-score threshold based on volatility regime."""
         if vol_regime == "LOW":
@@ -112,7 +120,6 @@ class ZScoreIcebergHunterStrategy:
             low_thresh = config.VOL_REGIME_LOW_THRESHOLD
             high_thresh = config.VOL_REGIME_HIGH_THRESHOLD
             z_range = config.VOL_REGIME_Z_HIGH - config.VOL_REGIME_Z_LOW
-            
             if high_thresh > low_thresh:
                 scaling = (atr_pct - low_thresh) / (high_thresh - low_thresh)
                 scaling = max(0.0, min(1.0, scaling))
@@ -122,1208 +129,671 @@ class ZScoreIcebergHunterStrategy:
                 return config.VOL_REGIME_Z_BASE
         else:
             return config.VOL_REGIME_Z_BASE
-    
+
     def _get_dynamic_wall_mult(self, vol_regime: str) -> float:
         """Get dynamic wall multiplier based on volatility regime."""
         if vol_regime == "LOW":
             return config.VOL_REGIME_WALL_MULT_LOW
         elif vol_regime == "HIGH":
             return config.VOL_REGIME_WALL_MULT_HIGH
-        else:
-            return config.VOL_REGIME_WALL_MULT_BASE
-    
-    def _get_dynamic_tp_sl(self, vol_regime: str) -> Tuple[float, float]:
-        """
-        Get dynamic TP and SL ROI based on volatility regime.
-        Returns: (tp_roi, sl_roi)
-        """
-        base_tp = config.PROFIT_TARGET_ROI
-        base_sl = config.STOP_LOSS_ROI
-        
+        return config.VOL_REGIME_WALL_MULT_BASE
+
+    def _get_dynamic_tp_sl_multipliers(self, vol_regime: str) -> Tuple[float, float]:
+        """Get dynamic TP/SL multipliers based on regime."""
         if vol_regime == "HIGH":
-            tp_roi = base_tp * config.VOL_REGIME_TP_MULT_HIGH
-            sl_roi = base_sl * config.VOL_REGIME_SL_MULT_HIGH
-        elif vol_regime == "LOW" or vol_regime == "NEUTRAL":
-            tp_roi = base_tp * config.VOL_REGIME_TP_MULT_LOW
-            sl_roi = base_sl * config.VOL_REGIME_SL_MULT_LOW
-        else:
-            tp_roi = base_tp
-            sl_roi = base_sl
-        
-        return (tp_roi, sl_roi)
-    
-    def _get_dynamic_position_size_pct(self, vol_regime: str) -> float:
-        """Get position size percentage based on volatility regime (Kelly-style)."""
-        if vol_regime == "HIGH":
-            return config.VOL_REGIME_SIZE_HIGH_PCT
+            return 1.1, 0.9  # Slightly wider TP, tighter SL in high vol
         elif vol_regime == "LOW":
-            return config.VOL_REGIME_SIZE_LOW_PCT
-        else:
-            return (config.VOL_REGIME_SIZE_HIGH_PCT + config.VOL_REGIME_SIZE_LOW_PCT) / 2.0
-    
-    # ══════════════════════════════════════════════════════════════════════
-    # Weighted Scoring Helpers (unchanged)
-    # ══════════════════════════════════════════════════════════════════════
-    
-    def _normalize_signal_cdf(self, value: float, threshold: float, std_dev: float = 1.0) -> float:
-        """
-        Normalize signal using CDF approach: norm.cdf((value - threshold) / std).
-        Returns value between 0 and 1.
-        """
+            return 0.8, 1.1  # Tighter TP, wider SL in low vol
+        return 1.0, 1.0  # Neutral
+
+    # =====================================================================
+    # Raw Gate Computation Methods
+    # =====================================================================
+
+    def _compute_imbalance(self, data_manager) -> Optional[float]:
+        """Compute orderbook imbalance (bid - ask) / total."""
         try:
-            if std_dev <= 0:
-                std_dev = 1.0
-            
-            z = (value - threshold) / std_dev
-            z = max(-5.0, min(5.0, z))
-            normalized = scipy_stats.norm.cdf(z)
-            normalized = max(0.01, min(0.99, normalized))
-            
-            return normalized
-        except Exception as e:
-            logger.error(f"Error in CDF normalization: {e}", exc_info=True)
-            return 0.5
-    
-    def _compute_weighted_score(
-        self,
-        side: str,
-        imbalance_data: Optional[Dict],
-        wall_data: Optional[Dict],
-        delta_data: Optional[Dict],
-        touch_data: Optional[Dict],
-        htf_trend: Optional[str],
-        ltf_trend: Optional[str],
-        ema_val: Optional[float],
-        current_price: float,
-        vol_regime: str,
-        oracle_inputs: Optional[OracleInputs],
-    ) -> Tuple[float, Dict[str, float], List[str]]:
-        """
-        Compute weighted score for entry (0-1).
-        Returns: (total_score, component_scores_dict, reasons_list)
-        """
-        components = {}
-        reasons = []
-        raw_components = {}
-        
-        # Dynamic thresholds based on vol regime
-        z_thresh_dynamic = self._get_dynamic_z_threshold(vol_regime, oracle_inputs.atr_pct if oracle_inputs else None)
-        wall_mult_dynamic = self._get_dynamic_wall_mult(vol_regime)
-        
-        # === SIGNAL NORMALIZATION (all to 0-1 range) ===
-        
-        # 1. Imbalance
-        if imbalance_data:
-            imb = imbalance_data["imbalance"]
-            if side == "long":
-                imb_norm = self._normalize_signal_cdf(imb, config.IMBALANCE_THRESHOLD, std_dev=0.1)
-            else:
-                imb_norm = self._normalize_signal_cdf(-imb, config.IMBALANCE_THRESHOLD, std_dev=0.1)
-            
-            raw_components["imbalance"] = imb_norm
-            reasons.append(f"imb={imb:.3f}->norm={imb_norm:.3f}")
-        else:
-            raw_components["imbalance"] = 0.0
-            reasons.append("imb=MISSING")
-        
-        # 2. Wall
-        if wall_data:
-            if side == "long":
-                wall_strength = wall_data["bid_wall_strength"]
-            else:
-                wall_strength = wall_data["ask_wall_strength"]
-            
-            wall_norm = self._normalize_signal_cdf(wall_strength, wall_mult_dynamic, std_dev=0.5)
-            raw_components["wall"] = wall_norm
-            reasons.append(f"wall={wall_strength:.2f}->norm={wall_norm:.3f}")
-        else:
-            raw_components["wall"] = 0.0
-            reasons.append("wall=MISSING")
-        
-        # 3. Z-Score
-        if delta_data:
-            z = delta_data["z_score"]
-            if side == "long":
-                z_norm = self._normalize_signal_cdf(z, z_thresh_dynamic, std_dev=0.5)
-            else:
-                z_norm = self._normalize_signal_cdf(-z, z_thresh_dynamic, std_dev=0.5)
-            
-            raw_components["zscore"] = z_norm
-            reasons.append(f"z={z:.2f}->norm={z_norm:.3f}(thresh={z_thresh_dynamic:.2f})")
-        else:
-            raw_components["zscore"] = 0.0
-            reasons.append("z=MISSING")
-        
-        # 4. Touch
-        if touch_data:
-            if side == "long":
-                dist = touch_data["bid_distance_ticks"]
-            else:
-                dist = touch_data["ask_distance_ticks"]
-            
-            touch_norm = self._normalize_signal_cdf(-dist, -config.PRICE_TOUCH_THRESHOLD_TICKS, std_dev=2.0)
-            raw_components["touch"] = touch_norm
-            reasons.append(f"touch_dist={dist:.1f}->norm={touch_norm:.3f}")
-        else:
-            raw_components["touch"] = 0.0
-            reasons.append("touch=MISSING")
-        
-        # 5. Trend
-        trend_score = 0.0
-        if htf_trend and ema_val:
-            htf_ok = False
-            ema_ok = False
-            
-            if side == "long":
-                htf_ok = htf_trend in ["UP", "RANGE"]
-                ema_ok = current_price > ema_val
-            else:
-                htf_ok = htf_trend in ["DOWN", "RANGE"]
-                ema_ok = current_price < ema_val
-            
-            range_bonus = 0.8 if vol_regime == "LOW" else 0.5
-            
-            if htf_trend == "RANGE":
-                htf_contrib = range_bonus
-            elif htf_ok:
-                htf_contrib = 1.0
-            else:
-                htf_contrib = 0.0
-            
-            ema_contrib = 1.0 if ema_ok else 0.0
-            trend_score = (htf_contrib + ema_contrib) / 2.0
-            
-            raw_components["trend"] = trend_score
-            reasons.append(f"trend(htf={htf_trend},ema_ok={ema_ok})->score={trend_score:.3f}")
-        else:
-            raw_components["trend"] = 0.0
-            reasons.append("trend=MISSING")
-        
-        # 6. CVD
-        if oracle_inputs and oracle_inputs.norm_cvd is not None:
-            cvd = oracle_inputs.norm_cvd
-            if side == "long":
-                cvd_norm = self._normalize_signal_cdf(cvd, 0.0, std_dev=0.3)
-            else:
-                cvd_norm = self._normalize_signal_cdf(-cvd, 0.0, std_dev=0.3)
-            
-            raw_components["cvd"] = cvd_norm
-            reasons.append(f"cvd={cvd:.3f}->norm={cvd_norm:.3f}")
-        else:
-            raw_components["cvd"] = 0.0
-            reasons.append("cvd=MISSING")
-        
-        # 7. LV Average
-        if oracle_inputs and oracle_inputs.lv_1m is not None and oracle_inputs.lv_5m is not None:
-            lv_avg = (oracle_inputs.lv_1m + oracle_inputs.lv_5m) / 2.0
-            lv_norm = self._normalize_signal_cdf(lv_avg, 1.0, std_dev=0.5)
-            raw_components["lv"] = lv_norm
-            reasons.append(f"lv_avg={lv_avg:.2f}->norm={lv_norm:.3f}")
-        else:
-            raw_components["lv"] = 0.0
-            reasons.append("lv=MISSING")
-        
-        # 8. Hurst/BOS blend
-        hurst_bos_score = 0.0
-        hurst_contrib = 0.0
-        bos_contrib = 0.0
-        
-        if oracle_inputs and oracle_inputs.hurst is not None:
-            h = oracle_inputs.hurst
-            hurst_contrib = self._normalize_signal_cdf(h, 0.5, std_dev=0.1)
-            reasons.append(f"hurst={h:.3f}->norm={hurst_contrib:.3f}")
-        
-        if oracle_inputs and oracle_inputs.bos_align is not None:
-            bos = oracle_inputs.bos_align
-            bos_contrib = self._normalize_signal_cdf(bos, 0.3, std_dev=0.2)
-            reasons.append(f"bos={bos:.3f}->norm={bos_contrib:.3f}")
-        
-        if hurst_contrib > 0 or bos_contrib > 0:
-            hurst_bos_score = (hurst_contrib + bos_contrib) / 2.0
-        
-        raw_components["hurst_bos"] = hurst_bos_score
-        
-        # === WEIGHTED AGGREGATION ===
-        # Base weights from config
-        weights = {
-            "imbalance": config.WEIGHT_IMBALANCE,
-            "wall": config.WEIGHT_WALL,
-            "zscore": config.WEIGHT_ZSCORE,
-            "touch": config.WEIGHT_TOUCH,
-            "trend": config.WEIGHT_TREND,
-            "cvd": config.WEIGHT_CVD,
-            "lv": config.WEIGHT_LV,
-            "hurst_bos": config.WEIGHT_HURST_BOS,
-        }
-        
-        # Only use available components
-        available_components = {k: v for k, v in raw_components.items() if v > 0}
-        
-        if not available_components:
-            return 0.0, {}, ["NO_SIGNALS_AVAILABLE"]
-        
-        # Normalize weights to sum to 1.0 for available components only
-        total_weight = sum(weights[k] for k in available_components)
-        
-        if total_weight <= 0:
-            return 0.0, {}, ["ZERO_TOTAL_WEIGHT"]
-        
-        # Compute weighted score
-        weighted_score = 0.0
-        for key in available_components:
-            normalized_weight = weights[key] / total_weight
-            weighted_score += available_components[key] * normalized_weight
-            components[key] = available_components[key]
-        
-        # Clamp to [0, 1]
-        weighted_score = max(0.0, min(1.0, weighted_score))
-        
-        return weighted_score, components, reasons
-    
-    def _compute_win_probability(
-        self, lstm_prob: float, z_sign: float, cvd: float, lv_avg: float
-    ) -> float:
-        """
-        Compute win probability overlay from data fusion signals.
-        Returns: win_prob (0-1)
-        """
-        try:
-            # Simple weighted average
-            prob = (0.4 * lstm_prob) + (0.3 * z_sign) + (0.2 * cvd) + (0.1 * lv_avg)
-            return max(0.0, min(1.0, prob))
-        except Exception as e:
-            logger.error(f"Error computing win probability: {e}")
-            return 0.5
-    
-    # ══════════════════════════════════════════════════════════════════════
-    # Core Strategy Metrics (unchanged)
-    # ══════════════════════════════════════════════════════════════════════
-    
-    def _compute_imbalance(self, data_manager) -> Optional[Dict]:
-        """Compute orderbook imbalance."""
-        try:
-            bids, asks = data_manager.get_orderbook_snapshot()
-            
+            with data_manager._orderbook_lock:
+                bids = data_manager._orderbook_bids[:config.WALL_DEPTH_LEVELS]
+                asks = data_manager._orderbook_asks[:config.WALL_DEPTH_LEVELS]
+
             if not bids or not asks:
                 return None
-            
-            depth_levels = min(config.WALL_DEPTH_LEVELS, len(bids), len(asks))
-            
-            if depth_levels < 5:
+
+            bid_vol = sum(qty for _, qty in bids)
+            ask_vol = sum(qty for _, qty in asks)
+            total_vol = bid_vol + ask_vol
+
+            if total_vol == 0:
                 return None
-            
-            bid_vol = sum(q for _, q in bids[:depth_levels])
-            ask_vol = sum(q for _, q in asks[:depth_levels])
-            
-            total = bid_vol + ask_vol
-            
-            if total <= 0:
-                return None
-            
-            imbalance = (bid_vol - ask_vol) / total
-            
-            return {
-                "imbalance": imbalance,
-                "bid_vol": bid_vol,
-                "ask_vol": ask_vol,
-            }
-        
+
+            imbalance = (bid_vol - ask_vol) / total_vol
+            return imbalance
         except Exception as e:
             logger.error(f"Error computing imbalance: {e}")
             return None
-    
-    def _compute_wall_strength(
-        self, data_manager, current_price: float, imbalance_data: Optional[Dict]
-    ) -> Optional[Dict]:
-        """Compute wall strength in zone around current price."""
+
+    def _compute_wall_strength(self, data_manager, current_price: float, side: str) -> Optional[float]:
+        """Compute wall strength in zone around price."""
         try:
-            if not imbalance_data:
-                return None
-            
-            bids, asks = data_manager.get_orderbook_snapshot()
-            
-            if not bids or not asks:
-                return None
-            
-            zone_ticks = config.ZONE_TICKS
             tick_size = config.TICK_SIZE
-            
-            zone_low = current_price - (zone_ticks * tick_size)
-            zone_high = current_price + (zone_ticks * tick_size)
-            
-            bid_wall_vol = sum(q for p, q in bids if zone_low <= p <= current_price)
-            ask_wall_vol = sum(q for p, q in asks if current_price <= p <= zone_high)
-            
-            depth_levels = min(config.WALL_DEPTH_LEVELS, len(bids), len(asks))
-            avg_depth_vol = (imbalance_data["bid_vol"] + imbalance_data["ask_vol"]) / (
-                2.0 * depth_levels
-            )
-            
-            if avg_depth_vol <= 0:
+            zone_low = current_price - config.ZONE_TICKS * tick_size
+            zone_high = current_price + config.ZONE_TICKS * tick_size
+
+            with data_manager._orderbook_lock:
+                if side == "long":
+                    relevant_levels = [(p, q) for p, q in data_manager._orderbook_bids if zone_low <= p <= zone_high]
+                else:
+                    relevant_levels = [(p, q) for p, q in data_manager._orderbook_asks if zone_low <= p <= zone_high]
+
+            if not relevant_levels:
                 return None
-            
-            bid_wall_strength = bid_wall_vol / avg_depth_vol
-            ask_wall_strength = ask_wall_vol / avg_depth_vol
-            
-            return {
-                "bid_wall_strength": bid_wall_strength,
-                "ask_wall_strength": ask_wall_strength,
-                "bid_wall_vol": bid_wall_vol,
-                "ask_wall_vol": ask_wall_vol,
-                "zone_low": zone_low,
-                "zone_high": zone_high,
-            }
-        
+
+            wall_vol = sum(qty for _, qty in relevant_levels)
+
+            # Average depth volume (top 5 levels bid + ask)
+            avg_bids = sum(qty for _, qty in data_manager._orderbook_bids[:5])
+            avg_asks = sum(qty for _, qty in data_manager._orderbook_asks[:5])
+            avg_depth_vol = (avg_bids + avg_asks) / 10.0 if (avg_bids + avg_asks) > 0 else 1e-6
+
+            strength = wall_vol / avg_depth_vol
+            return strength
         except Exception as e:
             logger.error(f"Error computing wall strength: {e}")
             return None
-    
-    def _compute_delta_z_score(self, data_manager) -> Optional[Dict]:
-        """Compute taker delta Z-score from recent trades."""
+
+    def _compute_delta_z_score(self, data_manager, window_sec: int = config.DELTA_WINDOW_SEC) -> Optional[float]:
+        """Compute Z-score of taker delta in window."""
         try:
-            window_sec = config.DELTA_WINDOW_SEC
             trades = data_manager.get_recent_trades(window_seconds=window_sec)
-            
             if not trades:
                 return None
-            
-            buy_vol = 0.0
-            sell_vol = 0.0
-            
+
+            deltas = []
+            last_price = data_manager.get_last_price()
             for t in trades:
-                try:
-                    qty = float(t.get("qty", 0.0))
-                except Exception:
-                    qty = 0.0
-                
-                if qty <= 0:
-                    continue
-                
-                is_buyer_maker = bool(t.get("isBuyerMaker", False))
-                
-                if not is_buyer_maker:
-                    buy_vol += qty
-                else:
-                    sell_vol += qty
-            
-            delta = buy_vol - sell_vol
-            
-            # Store in population
-            self._delta_population.append(delta)
-            
-            if len(self._delta_population) < 10:
+                qty = float(t.get("qty", 0.0))
+                price = float(t.get("price", last_price))
+                # Simple taker delta: qty * sign(price change)
+                sign = 1 if price > last_price else -1 if price < last_price else 0
+                deltas.append(qty * sign)
+
+            if not deltas:
                 return None
-            
-            pop_mean = float(np.mean(self._delta_population))
-            pop_std = float(np.std(self._delta_population))
-            
-            if pop_std <= 0:
+
+            # Update population
+            self._delta_population.extend(deltas)
+            if len(self._delta_population) < 30:
                 return None
-            
-            z_score = (delta - pop_mean) / pop_std
-            
-            return {
-                "delta": delta,
-                "z_score": z_score,
-                "buy_vol": buy_vol,
-                "sell_vol": sell_vol,
-            }
-        
+
+            # Recent delta mean
+            recent_delta = np.mean(deltas[-10:]) if len(deltas) >= 10 else np.mean(deltas)
+
+            # Z-score from population
+            pop_mean = np.mean(self._delta_population)
+            pop_std = np.std(self._delta_population)
+            if pop_std == 0:
+                return None
+
+            z_score = (recent_delta - pop_mean) / pop_std
+            return abs(z_score)
         except Exception as e:
             logger.error(f"Error computing delta Z-score: {e}")
             return None
-    
-    def _compute_price_touch(self, data_manager, current_price: float) -> Optional[Dict]:
-        """Compute distance from price to nearest strong wall."""
+
+    def _check_price_touch(self, data_manager, wall_price: float) -> bool:
+        """Check if current price touches wall within threshold."""
+        current_price = data_manager.get_last_price()
+        if current_price <= 0 or wall_price <= 0:
+            return False
+
+        tick_size = config.TICK_SIZE
+        threshold = config.PRICE_TOUCH_THRESHOLD_TICKS * tick_size
+        return abs(current_price - wall_price) <= threshold
+
+    def _get_vol_regime(self, data_manager) -> str:
+        """Determine vol regime from ATR %."""
+        atr_pct = data_manager.get_atr_percent(window_minutes=config.ATR_WINDOW_MINUTES)
+        if atr_pct is None:
+            return "NEUTRAL"
+        if atr_pct < config.VOL_REGIME_LOW_THRESHOLD:
+            return "LOW"
+        elif atr_pct > config.VOL_REGIME_HIGH_THRESHOLD:
+            return "HIGH"
+        return "NEUTRAL"
+
+    # =====================================================================
+    # Weighted Scoring
+    # =====================================================================
+
+    def _compute_weighted_score(self, imbalance: float, wall_strength: float, z_score: float, touch: bool, trend_align: bool) -> float:
+        """Compute normalized weighted score for entry."""
+        if not config.ENABLE_WEIGHTED_SCORING:
+            # Binary mode: all or nothing
+            return 1.0 if all([imbalance is not None, wall_strength is not None, z_score is not None, touch, trend_align]) else 0.0
+
+        score = 0.0
+        total_weight = 0.0
+
+        # Imbalance contribution (normalized 0-1)
+        if imbalance is not None:
+            norm_imb = max(0.0, min(1.0, (imbalance + 1.0) / 2.0))  # -1 to 1 -> 0 to 1
+            score += norm_imb * config.WEIGHT_IMBALANCE
+            total_weight += config.WEIGHT_IMBALANCE
+
+        # Wall strength (threshold-normalized)
+        if wall_strength is not None:
+            thresh = self._get_dynamic_wall_mult(self._get_vol_regime(None))
+            norm_wall = max(0.0, min(1.0, (wall_strength - thresh) / (10.0 - thresh)))  # Assume max 10x
+            score += norm_wall * config.WEIGHT_WALL
+            total_weight += config.WEIGHT_WALL
+
+        # Z-score (threshold-normalized)
+        if z_score is not None:
+            thresh = self._get_dynamic_z_threshold(self._get_vol_regime(None), None)
+            norm_z = max(0.0, min(1.0, (z_score - thresh) / (5.0 - thresh)))  # Assume max Z=5
+            score += norm_z * config.WEIGHT_ZSCORE
+            total_weight += config.WEIGHT_ZSCORE
+
+        # Touch (binary)
+        score += float(touch) * config.WEIGHT_TOUCH
+        total_weight += config.WEIGHT_TOUCH
+
+        # Trend align (binary)
+        score += float(trend_align) * config.WEIGHT_TREND
+        total_weight += config.WEIGHT_TREND
+
+        return score / total_weight if total_weight > 0 else 0.0
+
+    # =====================================================================
+    # Oracle Integration
+    # =====================================================================
+
+    def _integrate_oracle(self, data_manager, side: str) -> Optional[OracleSideScores]:
+        """Fuse Oracle for additional probability score."""
         try:
-            bids, asks = data_manager.get_orderbook_snapshot()
-            
-            if not bids or not asks:
-                return None
-            
-            tick_size = config.TICK_SIZE
-            
-            # Find strongest bid/ask within zone
-            zone_ticks = config.ZONE_TICKS
-            zone_low = current_price - (zone_ticks * tick_size)
-            zone_high = current_price + (zone_ticks * tick_size)
-            
-            bid_levels = [(p, q) for p, q in bids if zone_low <= p <= current_price]
-            ask_levels = [(p, q) for p, q in asks if current_price <= p <= zone_high]
-            
-            if not bid_levels or not ask_levels:
-                return None
-            
-            # Find max volume level
-            bid_max_vol = max(q for _, q in bid_levels)
-            ask_max_vol = max(q for _, q in ask_levels)
-            
-            bid_wall_price = next(p for p, q in bid_levels if q == bid_max_vol)
-            ask_wall_price = next(p for p, q in ask_levels if q == ask_max_vol)
-            
-            bid_distance_ticks = abs(current_price - bid_wall_price) / tick_size
-            ask_distance_ticks = abs(ask_wall_price - current_price) / tick_size
-            
-            return {
-                "bid_distance_ticks": bid_distance_ticks,
-                "ask_distance_ticks": ask_distance_ticks,
-                "bid_wall_price": bid_wall_price,
-                "ask_wall_price": ask_wall_price,
-            }
-        
-        except Exception as e:
-            logger.error(f"Error computing price touch: {e}")
+            current_price = data_manager.get_last_price()
+            now_sec = time.time()
+
+            # Build inputs from data_manager (exact from oracle spec)
+            inputs = OracleInputs(
+                imbalance_data={"value": self._compute_imbalance(data_manager)},
+                wall_data={"strength": self._compute_wall_strength(data_manager, current_price, side)},
+                delta_data={"zscore": self._compute_delta_z_score(data_manager)},
+                touch_data={"touched": self._check_price_touch(data_manager, current_price)},  # Simplified wall_price
+                htf_trend=data_manager.get_htf_trend(),
+                ltf_trend=data_manager.get_ltf_trend(),
+                ema_val=data_manager.get_ema(config.EMA_PERIOD),
+                atr_pct=data_manager.get_atr_percent(config.ATR_WINDOW_MINUTES),
+                lv_1m=data_manager.compute_liquidity_velocity_multi_tf()[0],
+                lv_5m=data_manager.compute_liquidity_velocity_multi_tf()[1],
+                lv_15m=data_manager.compute_liquidity_velocity_multi_tf()[2],
+                micro_trap=data_manager.compute_liquidity_velocity_multi_tf()[3],
+                norm_cvd=data_manager.compute_norm_cvd(),
+                hurst=data_manager.compute_hurst_exponent(),
+                bos_align=data_manager.compute_bos_alignment(current_price),
+                current_price=current_price,
+                now_sec=now_sec,
+            )
+
+            # Dummy risk_manager for oracle (oracle uses it for Kelly)
+            class DummyRiskManager:
+                def get_available_balance(self):
+                    return {"available": 10000.0}
+
+            rm = DummyRiskManager()
+
+            outputs = self._oracle.decide(inputs, rm)
+            if outputs and hasattr(outputs, side + '_scores'):
+                return getattr(outputs, side + '_scores')
             return None
-    
-    # ══════════════════════════════════════════════════════════════════════
-    # ✅ STREAMLINED: Entry Flow (single bracket order)
-    # ══════════════════════════════════════════════════════════════════════
-    
-    def _enter_position(
-        self,
-        data_manager,
-        order_manager,
-        risk_manager,
-        side: str,
-        current_price: float,
-        imbalance_data: Dict,
-        wall_data: Dict,
-        delta_data: Dict,
-        touch_data: Dict,
-        now_sec: float,
-        vol_regime: str,
-        weighted_score: float,
-        oracle_inputs: Optional[OracleInputs],
-    ) -> None:
-        """
-        ✅ STREAMLINED: Enter position with single bracket order (LIMIT + TP + SL).
-        
-        Flow:
-        1. Validate conditions
-        2. Calculate position sizing
-        3. Calculate entry price (vol-adjusted)
-        4. Calculate TP/SL prices
-        5. Place bracket order (single call)
-        6. Record position
-        """
-        try:
-            # ────────────────────────────────────────────────────────
-            # STEP 1: Pre-trade validation
-            # ────────────────────────────────────────────────────────
-            is_valid, failure_reason = self._validate_trade_conditions(
-                data_manager, risk_manager, vol_regime
-            )
-            
-            if not is_valid:
-                logger.info(f"❌ Trade validation failed: {failure_reason}")
-                return
-            
-            # ────────────────────────────────────────────────────────
-            # STEP 2: Position sizing (regime-aware)
-            # ────────────────────────────────────────────────────────
-            margin_used, quantity = risk_manager.calculate_position_size_regime_aware(
-                entry_price=current_price,
-                vol_regime=vol_regime,
-            )
-            
-            if quantity <= 0:
-                logger.warning("❌ Invalid quantity calculated")
-                return
-            
-            # ────────────────────────────────────────────────────────
-            # STEP 3: Calculate entry price (vol-based offset)
-            # ────────────────────────────────────────────────────────
-            entry_price = self._calculate_entry_price(side, current_price, vol_regime)
-            
-            # ────────────────────────────────────────────────────────
-            # STEP 4: Calculate TP/SL prices
-            # ────────────────────────────────────────────────────────
-            tp_roi, sl_roi = self._get_dynamic_tp_sl(vol_regime)
-            
+        except Exception as e:
+            logger.error(f"Oracle integration error for {side}: {e}")
+            return None
+
+    # =====================================================================
+    # Full Gate Check
+    # =====================================================================
+
+    def _check_all_gates(self, data_manager, side: str) -> Tuple[bool, float, str]:
+        """Check all gates: binary AND + weighted score + oracle fusion."""
+        current_price = data_manager.get_last_price()
+        if current_price <= 0:
+            return False, 0.0, "NO_PRICE"
+
+        vol_regime = self._get_vol_regime(data_manager)
+        atr_pct = data_manager.get_atr_percent(config.ATR_WINDOW_MINUTES)
+        z_thresh = self._get_dynamic_z_threshold(vol_regime, atr_pct)
+        wall_mult = self._get_dynamic_wall_mult(vol_regime)
+
+        # 1. Imbalance gate
+        imbalance = self._compute_imbalance(data_manager)
+        imb_pass = imbalance is not None and (
+            (side == "long" and imbalance >= config.IMBALANCE_THRESHOLD) or
+            (side == "short" and imbalance <= -config.IMBALANCE_THRESHOLD)
+        )
+        if not imb_pass:
+            return False, 0.0, "IMBALANCE_FAIL"
+
+        # 2. Wall strength gate
+        wall_strength = self._compute_wall_strength(data_manager, current_price, side)
+        wall_pass = wall_strength is not None and wall_strength >= wall_mult
+        if not wall_pass:
+            return False, 0.0, "WALL_FAIL"
+
+        # 3. Delta Z-score gate
+        z_score = self._compute_delta_z_score(data_manager)
+        z_pass = z_score is not None and z_score >= z_thresh
+        if not z_pass:
+            return False, 0.0, "ZSCORE_FAIL"
+
+        # 4. Price touch gate (find strongest wall in zone)
+        tick_size = config.TICK_SIZE
+        zone_low = current_price - config.ZONE_TICKS * tick_size
+        zone_high = current_price + config.ZONE_TICKS * tick_size
+        wall_price = None
+        with data_manager._orderbook_lock:
             if side == "long":
-                tp_price = entry_price * (1.0 + tp_roi)
-                sl_price = entry_price * (1.0 + sl_roi)
-            else:  # short
-                tp_price = entry_price * (1.0 - tp_roi)
-                sl_price = entry_price * (1.0 - sl_roi)
-            
-            tp_price = round(tp_price, 2)
-            sl_price = round(sl_price, 2)
-            
-            # ────────────────────────────────────────────────────────
-            # STEP 5: Place bracket order (LIMIT + TP + SL)
-            # ────────────────────────────────────────────────────────
-            logger.info("=" * 80)
-            logger.info(f"ENTERING {side.upper()} POSITION")
-            logger.info(f"Score: {weighted_score:.3f} | Vol: {vol_regime}")
-            logger.info(f"Quantity: {quantity:.6f} | Margin: ${margin_used:.2f}")
-            logger.info("=" * 80)
-            
+                relevant = [(p, q) for p, q in data_manager._orderbook_bids if zone_low <= p <= zone_high]
+                if relevant:
+                    wall_price = max(relevant, key=lambda x: x[1])[0]  # Strongest bid
+            else:
+                relevant = [(p, q) for p, q in data_manager._orderbook_asks if zone_low <= p <= zone_high]
+                if relevant:
+                    wall_price = min(relevant, key=lambda x: x[1])[0]  # Strongest ask
+
+        touch = self._check_price_touch(data_manager, wall_price) if wall_price else False
+        if not touch:
+            return False, 0.0, "TOUCH_FAIL"
+
+        # 5. Trend alignment gate
+        htf_trend = data_manager.get_htf_trend() or "RANGE"
+        ltf_trend = data_manager.get_ltf_trend() or "RANGE"
+        trend_align = (
+            (side == "long" and htf_trend != "DOWN" and ltf_trend != "DOWN") or
+            (side == "short" and htf_trend != "UP" and ltf_trend != "UP")
+        )
+        if not trend_align:
+            return False, 0.0, "TREND_FAIL"
+
+        # 6. Weighted score
+        weighted_score = self._compute_weighted_score(imbalance, wall_strength, z_score, touch, trend_align)
+        if weighted_score < config.WEIGHTED_SCORE_ENTRY_THRESHOLD:
+            return False, weighted_score, "SCORE_LOW"
+
+        # 7. Oracle fusion (optional, boosts score)
+        oracle_scores = self._integrate_oracle(data_manager, side)
+        if oracle_scores and oracle_scores.fused is not None and oracle_scores.fused < self._oracle.entry_prob_threshold:
+            return False, weighted_score, "ORACLE_LOW"
+
+        return True, weighted_score, vol_regime
+
+    # =====================================================================
+    # Main Tick Handler
+    # =====================================================================
+
+    def on_tick(self, data_manager, order_manager, risk_manager):
+        """Process tick: manage position or evaluate entry."""
+        now_sec = time.time()
+
+        # Cooldown after exit
+        if (now_sec / 60.0) - self.last_exit_time_min < config.MIN_TIME_BETWEEN_TRADES:
+            return
+
+        if self.current_position:
+            self._manage_position(data_manager, order_manager, risk_manager, now_sec)
+            return
+
+        # Evaluate entry for both sides, pick best
+        long_pass, long_score, long_regime = self._check_all_gates(data_manager, "long")
+        short_pass, short_score, short_regime = self._check_all_gates(data_manager, "short")
+
+        side = None
+        score = 0.0
+        regime = "NEUTRAL"
+        if long_pass and (not short_pass or long_score >= short_score):
+            side = "long"
+            score = long_score
+            regime = long_regime
+        elif short_pass:
+            side = "short"
+            score = short_score
+            regime = short_regime
+
+        if side:
+            self._enter_position(data_manager, order_manager, risk_manager, side, score, regime)
+
+        # Periodic decision logging
+        if now_sec - self._last_decision_log_sec > self.DECISION_LOG_INTERVAL_SEC:
+            self._log_decision(data_manager, long_pass, long_score, short_pass, short_score)
+            self._last_decision_log_sec = now_sec
+
+    # =====================================================================
+    # Entry Flow
+    # =====================================================================
+
+    def _enter_position(self, data_manager, order_manager, risk_manager, side: str, score: float, regime: str):
+        """Enter with single bracket order (atomic)."""
+        try:
+            current_price = data_manager.get_last_price()
+            if current_price <= 0:
+                logger.warning("Cannot enter: invalid price")
+                return
+
+            # ✅ FIXED: Fetch balance ONCE before trade
+            balance_info = risk_manager.get_available_balance()
+            if not balance_info:
+                logger.warning("Cannot enter: no balance info")
+                return
+
+            available = float(balance_info.get("available", 0.0))
+            if available < config.MIN_MARGIN_PER_TRADE:
+                logger.warning(f"Cannot enter: low balance {available:.2f}")
+                return
+
+            # Position sizing (regime-aware)
+            margin_used, quantity = risk_manager.calculate_position_size_regime_aware(current_price, regime)
+            if quantity <= 0 or margin_used <= 0:
+                logger.warning("Cannot enter: invalid sizing")
+                return
+
+            # ✅ FIXED: Excel-exact TP/SL calculation
+            tp_price, sl_price = self._calculate_tp_sl_prices(side, current_price, margin_used, quantity, regime)
+
+            # Place bracket (limit entry + TP + SL)
             bracket_result = order_manager.place_bracket_order(
-                side="BUY" if side == "long" else "SELL",
+                side=side.upper() if side == "buy" else "SELL" if side == "short" else "BUY",
                 quantity=quantity,
-                entry_price=entry_price,
+                entry_price=current_price,  # Limit at current (or adjust for direction)
                 tp_price=tp_price,
                 sl_price=sl_price,
             )
-            
+
             if not bracket_result:
-                logger.error("❌ Bracket order placement failed")
+                logger.warning("Bracket order failed")
                 return
-            
-            filled_order, tp_order, sl_order = bracket_result
-            
-            # ────────────────────────────────────────────────────────
-            # STEP 6: Record position
-            # ────────────────────────────────────────────────────────
+
+            main_order, tp_order, sl_order = bracket_result
+            main_id = main_order.get("order_id")
+            tp_id = tp_order.get("order_id")
+            sl_id = sl_order.get("order_id")
+
+            # Wait for entry fill
+            try:
+                fill_data = order_manager.wait_for_fill(main_id, timeout_sec=self.ENTRY_FILL_TIMEOUT_SEC)
+                actual_entry_price = order_manager.extract_fill_price(fill_data)
+                actual_quantity = float(fill_data.get("exec_quantity", quantity))
+            except RuntimeError as e:
+                logger.error(f"Entry fill timeout/cancel: {e}")
+                # Cancel bracket
+                order_manager.cancel_order(tp_id)
+                order_manager.cancel_order(sl_id)
+                return
+
+            # Create position object (populate from gates)
+            imbalance = self._compute_imbalance(data_manager)
+            z_score = self._compute_delta_z_score(data_manager)
+            wall_strength = self._compute_wall_strength(data_manager, actual_entry_price, side)
+            wall_vol = wall_strength * (sum(q for _, q in data_manager._orderbook_bids[:5]) + sum(q for _, q in data_manager._orderbook_asks[:5])) / 10 if wall_strength else 0.0
+            htf_trend = data_manager.get_htf_trend() or "RANGE"
+
             self.trade_seq += 1
-            trade_id = f"Z{int(now_sec)}{self.trade_seq:03d}"
-            
-            # Extract actual fill price
-            actual_fill_price = order_manager.extract_fill_price(filled_order)
-            
-            htf_trend = data_manager.get_htf_trend() if hasattr(data_manager, "get_htf_trend") else "NA"
-            
+            trade_id = f"Z{self.trade_seq:04d}_{int(time.time())}"
+
             self.current_position = ZScorePosition(
                 trade_id=trade_id,
                 side=side,
-                quantity=quantity,
-                entry_price=actual_fill_price,
-                entry_time_sec=now_sec,
-                entry_wall_volume=wall_data["bid_wall_vol"] if side == "long" else wall_data["ask_wall_vol"],
-                wall_zone_low=wall_data["zone_low"],
-                wall_zone_high=wall_data["zone_high"],
-                entry_imbalance=imbalance_data["imbalance"],
-                entry_z_score=delta_data["z_score"],
+                quantity=actual_quantity,
+                entry_price=actual_entry_price,
+                entry_time_sec=time.time(),
+                entry_wall_volume=wall_vol,
+                wall_zone_low=actual_entry_price - config.ZONE_TICKS * config.TICK_SIZE,
+                wall_zone_high=actual_entry_price + config.ZONE_TICKS * config.TICK_SIZE,
+                entry_imbalance=imbalance or 0.0,
+                entry_z_score=z_score or 0.0,
                 tp_price=tp_price,
                 sl_price=sl_price,
                 margin_used=margin_used,
-                tp_order_id=tp_order["order_id"],
-                sl_order_id=sl_order["order_id"],
-                main_order_id=filled_order["order_id"],
+                tp_order_id=tp_id,
+                sl_order_id=sl_id,
+                main_order_id=main_id,
                 entry_htf_trend=htf_trend,
-                entry_vol_regime=vol_regime,
-                entry_weighted_score=weighted_score,
-                last_score_check_sec=now_sec,
+                entry_vol_regime=regime,
+                entry_weighted_score=score,
+                last_score_check_sec=time.time(),
             )
-            
-            # Update risk manager
+
             risk_manager.record_trade_opened()
-            
-            # Log to Excel
+            logger.info(f"✓ LONG/SHORT ENTRY: {side.upper()} {actual_quantity:.6f} @ {actual_entry_price:.2f} | Margin: {margin_used:.2f} | Regime: {regime} | Score: {score:.3f}")
+
             if self.excel_logger:
-                try:
-                    self.excel_logger.log_entry(
-                        trade_id=trade_id,
-                        side=side,
-                        entry_price=actual_fill_price,
-                        quantity=quantity,
-                        margin=margin_used,
-                        tp_price=tp_price,
-                        sl_price=sl_price,
-                        imbalance=imbalance_data["imbalance"],
-                        wall_strength=wall_data["bid_wall_strength"] if side == "long" else wall_data["ask_wall_strength"],
-                        delta_z=delta_data["z_score"],
-                        htf_trend=htf_trend,
-                        vol_regime=vol_regime,
-                        weighted_score=weighted_score,
-                    )
-                except Exception as e:
-                    logger.error(f"Excel logging error: {e}")
-            
-            # Telegram notification
-            try:
-                send_telegram_message(
-                    f"📈 {side.upper()} ENTRY\n"
-                    f"Trade: {trade_id}\n"
-                    f"Price: ${actual_fill_price:.2f}\n"
-                    f"Qty: {quantity:.6f}\n"
-                    f"TP: ${tp_price:.2f} | SL: ${sl_price:.2f}\n"
-                    f"Score: {weighted_score:.3f} | Vol: {vol_regime}"
-                )
-            except Exception:
-                pass
-            
-            logger.info("=" * 80)
-            logger.info(f"✅ POSITION OPENED: {trade_id}")
-            logger.info("=" * 80)
-        
+                self.excel_logger.log_entry(self.current_position)
+
+            # Telegram notify
+            send_telegram_message(
+                f"🚀 NEW TRADE #{self.trade_seq}\n"
+                f"Side: {side.upper()}\n"
+                f"Qty: {actual_quantity:.6f} BTC\n"
+                f"Entry: ${actual_entry_price:.2f}\n"
+                f"TP: ${tp_price:.2f} | SL: ${sl_price:.2f}\n"
+                f"Regime: {regime} | Score: {score:.3f}"
+            )
+
         except Exception as e:
-            logger.error(f"❌ Error entering position: {e}", exc_info=True)
-    
-    def _calculate_entry_price(self, side: str, current_price: float, vol_regime: str) -> float:
-        """
-        Calculate entry price with volatility-based tick offset.
-        Uses dynamic tick offset based on volatility regime for optimal limit order placement:
-        - LOW vol: 4 ticks (tighter spread, less movement)
-        - HIGH vol: 10 ticks (wider spread, more movement)
-        - NEUTRAL: 6 ticks (balanced approach)
-        """
-        # Determine tick offset based on volatility
-        if vol_regime == "HIGH":
-            tick_offset = 10  # 10 ticks in high vol for better fills
-        elif vol_regime == "LOW":
-            tick_offset = 4  # 4 ticks in low vol (tighter spread)
-        else:  # NEUTRAL or UNKNOWN
-            tick_offset = 6  # 6 ticks for neutral
-        
+            logger.error(f"Entry error: {e}", exc_info=True)
+            # Emergency cancel
+            try:
+                order_manager.cancel_all_orders()
+            except:
+                pass
+
+    def _calculate_tp_sl_prices(self, side: str, entry_price: float, margin_used: float, quantity: float, vol_regime: str) -> Tuple[float, float]:
+        """✅ FIXED: EXACT Excel implementation."""
+        # Regime adjustments
+        tp_mult, sl_mult = self._get_dynamic_tp_sl_multipliers(vol_regime)
+        desired_tp_roi = config.PROFIT_TARGET_ROI * tp_mult  # e.g., 0.05
+        desired_sl_roi = abs(config.STOP_LOSS_ROI) * sl_mult  # e.g., 0.01
+
+        leverage = config.LEVERAGE
+
+        # Excel: Increase/Decrease in Balance = Margin * Leverage * ROI %
+        increase_balance_tp = margin_used * leverage * desired_tp_roi
+        decrease_balance_sl = margin_used * leverage * desired_sl_roi
+
+        # Price movement = Balance change / Qty (with leverage)
+        price_movement_tp = increase_balance_tp / quantity
+        price_movement_sl = decrease_balance_sl / quantity
+
+        # Apply direction
         if side == "long":
-            # For longs: buy slightly below current (better fill chance)
-            entry_price = current_price - (tick_offset * config.TICK_SIZE)
+            tp_price = entry_price + price_movement_tp
+            sl_price = entry_price - price_movement_sl
         else:  # short
-            # For shorts: sell slightly above current
-            entry_price = current_price + (tick_offset * config.TICK_SIZE)
-        
-        entry_price = round(entry_price, 2)
-        
-        logger.info(
-            f"Entry price: {entry_price:.2f} ({side.upper()}) | "
-            f"Offset: {tick_offset} ticks | Vol: {vol_regime}"
+            tp_price = entry_price - price_movement_tp
+            sl_price = entry_price + price_movement_sl
+
+        # Round to tick size (Excel-like precision)
+        tick_size = config.TICK_SIZE
+        tp_price = round(tp_price / tick_size) * tick_size
+        sl_price = round(sl_price / tick_size) * tick_size
+
+        logger.debug(
+            f"TP/SL Calc: Side={side}, Entry={entry_price:.2f}, Margin={margin_used:.2f}, "
+            f"Qty={quantity:.6f}, TP_Mov={price_movement_tp:.2f}, SL_Mov={price_movement_sl:.2f}, "
+            f"TP={tp_price:.2f}, SL={sl_price:.2f}"
         )
-        
-        return entry_price
-    
-    def _validate_trade_conditions(
-        self,
-        data_manager,
-        risk_manager,
-        vol_regime: str
-    ) -> Tuple[bool, str]:
-        """
-        Validate trade conditions before entry.
-        Checks:
-        1. Vol regime calculated (not UNKNOWN)
-        2. HTF trend available (not NA)
-        3. Sufficient historical data (min 40 bars)
-        4. Balance available (>= MIN_MARGIN_PER_TRADE)
-        
-        Returns: (is_valid, failure_reason)
-        """
-        # Check 1: Data warmup complete
-        if vol_regime == "UNKNOWN":
-            return False, "Vol regime not calculated yet"
-        
-        # Check 2: HTF trend available
-        try:
-            if hasattr(data_manager, 'get_htf_trend'):
-                htf_trend = data_manager.get_htf_trend()
-                if not htf_trend or htf_trend == "NA":
-                    return False, "HTF trend not available"
-        except Exception as e:
-            return False, f"Cannot get HTF trend: {e}"
-        
-        # Check 3: Sufficient historical data
-        try:
-            if hasattr(data_manager, 'klines_1m'):
-                kline_count = len(data_manager.klines_1m)
-                if kline_count < 40:
-                    return False, f"Insufficient bars: {kline_count}/40"
-        except:
-            pass  # Optional check
-        
-        # Check 4: Balance available
-        try:
-            balance = risk_manager.get_available_balance()
-            if not balance:
-                return False, "Cannot fetch balance"
-            
-            available = float(balance.get('available', 0))
-            if available < config.MIN_MARGIN_PER_TRADE:
-                return False, f"Insufficient balance: {available:.2f}"
-        except Exception as e:
-            return False, f"Cannot check balance: {e}"
-        
-        return True, "OK"
-    
-    # ══════════════════════════════════════════════════════════════════════
-    # ✅ STREAMLINED: Position Management
-    # ══════════════════════════════════════════════════════════════════════
-    
-    def _manage_open_position(
-        self,
-        data_manager,
-        order_manager,
-        risk_manager,
-        current_price: float,
-        now_sec: float,
-    ) -> None:
-        """
-        Manage open position:
-        1. Check if TP/SL triggered
-        2. Check time stop
-        3. Log position state
-        """
+
+        return tp_price, sl_price
+
+    # =====================================================================
+    # Position Management State Machine
+    # =====================================================================
+
+    def _manage_position(self, data_manager, order_manager, risk_manager, now_sec: float):
+        """Manage open position: check orders, time stop, log."""
         pos = self.current_position
-        
         if not pos:
             return
-        
-        # ────────────────────────────────────────────────────────
-        # STEP 1: Check TP/SL order status
-        # ────────────────────────────────────────────────────────
+
+        # Time stop
+        age_min = (now_sec - pos.entry_time_sec) / 60.0
+        if age_min > config.MAX_HOLD_MINUTES:
+            self._exit_position(data_manager, order_manager, risk_manager, "TIME_STOP", now_sec)
+            return
+
+        # Periodic order status checks
         if now_sec - self._last_status_check_sec > self.ORDER_STATUS_CHECK_INTERVAL_SEC:
+            # Check TP
+            tp_status = order_manager.get_order_status(pos.tp_order_id)
+            if tp_status and float(tp_status.get("exec_quantity", 0)) > 0:
+                self._exit_position(data_manager, order_manager, risk_manager, "TP_HIT", now_sec)
+                return
+
+            # Check SL
+            sl_status = order_manager.get_order_status(pos.sl_order_id)
+            if sl_status and float(sl_status.get("exec_quantity", 0)) > 0:
+                self._exit_position(data_manager, order_manager, risk_manager, "SL_HIT", now_sec)
+                return
+
             self._last_status_check_sec = now_sec
-            
-            try:
-                tp_status = order_manager.get_order_status(pos.tp_order_id)
-                sl_status = order_manager.get_order_status(pos.sl_order_id)
-                
-                if tp_status and tp_status.get("status", "").upper() in ["EXECUTED", "FILLED"]:
-                    logger.info("✅ TP triggered")
-                    self._close_position(
-                        order_manager, risk_manager, "TP_HIT", now_sec, current_price
-                    )
-                    return
-                
-                if sl_status and sl_status.get("status", "").upper() in ["EXECUTED", "FILLED"]:
-                    logger.info("❌ SL triggered")
-                    self._close_position(
-                        order_manager, risk_manager, "SL_HIT", now_sec, current_price
-                    )
-                    return
-            
-            except Exception as e:
-                logger.error(f"Error checking TP/SL status: {e}")
-        
-        # ────────────────────────────────────────────────────────
-        # STEP 2: Time stop
-        # ────────────────────────────────────────────────────────
-        hold_minutes = (now_sec - pos.entry_time_sec) / 60.0
-        
-        if hold_minutes > config.MAX_HOLD_MINUTES:
-            logger.info(f"⏰ Time stop triggered ({hold_minutes:.1f}min)")
-            self._close_position(
-                order_manager, risk_manager, "TIME_STOP", now_sec, current_price
-            )
-            return
-        
-        # ────────────────────────────────────────────────────────
-        # STEP 3: Periodic position logging
-        # ────────────────────────────────────────────────────────
+
+        # Periodic unrealized P&L log
         if now_sec - self._last_position_log_sec > self.POSITION_LOG_INTERVAL_SEC:
+            current_price = data_manager.get_last_price()
+            unreal_pnl = self._calculate_unrealized_pnl(pos, current_price)
+            age_min = (now_sec - pos.entry_time_sec) / 60.0
+            logger.info(
+                f"POS UPDATE: {pos.side.upper()} {pos.quantity:.6f} @ {pos.entry_price:.2f} "
+                f"(Age: {age_min:.1f}min | Unreal: ${unreal_pnl:.2f} | Regime: {pos.entry_vol_regime})"
+            )
             self._last_position_log_sec = now_sec
-            
-            pnl = self._calculate_unrealized_pnl(pos, current_price)
-            roi = (pnl / pos.margin_used) * 100.0 if pos.margin_used > 0 else 0.0
-            
-            logger.info("=" * 80)
-            logger.info(f"POSITION UPDATE: {pos.trade_id}")
-            logger.info(f"Side: {pos.side.upper()} | Qty: {pos.quantity:.6f}")
-            logger.info(f"Entry: ${pos.entry_price:.2f} | Current: ${current_price:.2f}")
-            logger.info(f"TP: ${pos.tp_price:.2f} | SL: ${pos.sl_price:.2f}")
-            logger.info(f"Unrealized P&L: ${pnl:.2f} ({roi:.2f}%)")
-            logger.info(f"Hold Time: {hold_minutes:.1f}min / {config.MAX_HOLD_MINUTES}min")
-            logger.info("=" * 80)
-    
-    def _close_position(
-        self,
-        order_manager,
-        risk_manager,
-        exit_reason: str,
-        now_sec: float,
-        current_price: float,
-    ) -> None:
-        """
-        ✅ STREAMLINED: Close position and cleanup.
-        
-        Flow:
-        1. Cancel remaining TP/SL orders
-        2. Calculate realized P&L
-        3. Update risk manager
-        4. Log trade
-        5. Clear position
-        """
+
+    # =====================================================================
+    # Exit Flow with Realized P&L
+    # =====================================================================
+
+    def _exit_position(self, data_manager, order_manager, risk_manager, reason: str, now_sec: float):
+        """Exit position: determine price, calc P&L, cleanup."""
         pos = self.current_position
-        
         if not pos:
             return
-        
+
         try:
-            logger.info("=" * 80)
-            logger.info(f"CLOSING POSITION: {pos.trade_id} ({exit_reason})")
-            logger.info("=" * 80)
-            
-            # ────────────────────────────────────────────────────────
-            # STEP 1: Cancel remaining orders
-            # ────────────────────────────────────────────────────────
-            try:
-                if exit_reason == "TP_HIT":
-                    order_manager.cancel_order(pos.sl_order_id)
-                elif exit_reason == "SL_HIT":
-                    order_manager.cancel_order(pos.tp_order_id)
-                else:
-                    # Manual exit - cancel both
-                    order_manager.cancel_order(pos.tp_order_id)
-                    order_manager.cancel_order(pos.sl_order_id)
-                    
-                    # Place market exit order
-                    exit_side = "SELL" if pos.side == "long" else "BUY"
-                    order_manager.place_market_order(
-                        side=exit_side,
-                        quantity=pos.quantity,
-                        reduce_only=True
-                    )
-            except Exception as e:
-                logger.error(f"Error canceling orders: {e}")
-            
-            # ────────────────────────────────────────────────────────
-            # STEP 2: Calculate realized P&L
-            # ────────────────────────────────────────────────────────
-            if exit_reason == "TP_HIT":
+            # Determine exit price
+            if reason == "TP_HIT":
                 exit_price = pos.tp_price
-            elif exit_reason == "SL_HIT":
+            elif reason == "SL_HIT":
                 exit_price = pos.sl_price
-            else:
-                exit_price = current_price
-            
-            pnl = self._calculate_realized_pnl(pos, exit_price)
-            roi = (pnl / pos.margin_used) * 100.0 if pos.margin_used > 0 else 0.0
-            
-            hold_duration_min = (now_sec - pos.entry_time_sec) / 60.0
-            
-            # ────────────────────────────────────────────────────────
-            # STEP 3: Update risk manager
-            # ────────────────────────────────────────────────────────
-            risk_manager.update_trade_stats(pnl)
-            risk_manager.record_trade_closed()
-            
-            # ────────────────────────────────────────────────────────
-            # STEP 4: Log trade
-            # ────────────────────────────────────────────────────────
-            if self.excel_logger:
-                try:
-                    self.excel_logger.log_exit(
-                        trade_id=pos.trade_id,
-                        exit_reason=exit_reason,
-                        exit_price=exit_price,
-                        pnl=pnl,
-                        roi=roi,
-                        hold_duration_min=hold_duration_min,
-                    )
-                except Exception as e:
-                    logger.error(f"Excel logging error: {e}")
-            
-            # Telegram notification
-            try:
-                emoji = "✅" if pnl > 0 else "❌"
-                send_telegram_message(
-                    f"{emoji} {pos.side.upper()} EXIT\n"
-                    f"Trade: {pos.trade_id}\n"
-                    f"Reason: {exit_reason}\n"
-                    f"Entry: ${pos.entry_price:.2f} → Exit: ${exit_price:.2f}\n"
-                    f"P&L: ${pnl:.2f} ({roi:.2f}%)\n"
-                    f"Duration: {hold_duration_min:.1f}min"
+            else:  # TIME_STOP
+                # Market close
+                close_side = "SELL" if pos.side == "long" else "BUY"
+                close_result = order_manager.place_market_order(
+                    side=close_side,
+                    quantity=pos.quantity,
                 )
-            except Exception:
-                pass
-            
-            logger.info(f"Exit Price: ${exit_price:.2f}")
-            logger.info(f"Realized P&L: ${pnl:.2f} ({roi:.2f}%)")
-            logger.info(f"Hold Duration: {hold_duration_min:.1f}min")
-            logger.info("=" * 80)
-            
-            # ────────────────────────────────────────────────────────
-            # STEP 5: Clear position
-            # ────────────────────────────────────────────────────────
-            self.current_position = None
-            self.last_exit_time_min = now_sec / 60.0
-        
-        except Exception as e:
-            logger.error(f"Error closing position: {e}", exc_info=True)
-            # Force cleanup
-            self.current_position = None
-            self.last_exit_time_min = now_sec / 60.0
-    
-    def _calculate_unrealized_pnl(self, pos: ZScorePosition, current_price: float) -> float:
-        """Calculate unrealized P&L."""
-        try:
-            if pos.side == "long":
-                price_change = current_price - pos.entry_price
-            else:
-                price_change = pos.entry_price - current_price
-            
-            notional_change = price_change * pos.quantity
-            pnl = notional_change
-            
-            return pnl
-        except Exception as e:
-            logger.error(f"Error calculating unrealized P&L: {e}")
-            return 0.0
-    
-    def _calculate_realized_pnl(self, pos: ZScorePosition, exit_price: float) -> float:
-        """Calculate realized P&L."""
-        try:
-            if pos.side == "long":
-                price_change = exit_price - pos.entry_price
-            else:
-                price_change = pos.entry_price - exit_price
-            
-            notional_change = price_change * pos.quantity
-            pnl = notional_change
-            
-            return pnl
-        except Exception as e:
-            logger.error(f"Error calculating realized P&L: {e}")
-            return 0.0
-    
-    # ══════════════════════════════════════════════════════════════════════
-    # Periodic Reporting
-    # ══════════════════════════════════════════════════════════════════════
-    
-    def _maybe_send_15m_report(self, now_sec: float, risk_manager, current_price: float) -> None:
-        """Send 15-minute performance report via Telegram."""
-        interval = 900.0  # 15 minutes
-        
-        if now_sec - self._last_report_sec < interval:
-            return
-        
-        self._last_report_sec = now_sec
-        
-        try:
-            rm = risk_manager
-            new_trades = rm.total_trades - self._last_report_total_trades
-            self._last_report_total_trades = rm.total_trades
-            
-            lines = [
-                "⏱️ 15-MIN PERFORMANCE REPORT",
-                "=" * 40,
-                f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}",
-                f"Price: {current_price:.2f}",
-                f"New Trades (15m): {new_trades}",
-                f"Total Trades: {rm.total_trades}",
-                f"Win Rate: {(rm.winning_trades / rm.total_trades * 100.0) if rm.total_trades > 0 else 0:.2f}%",
-                f"Daily P&L: {rm.daily_pnl:.2f} USDT",
-                "=" * 40,
-            ]
-            
-            send_telegram_message("\n".join(lines))
-        except Exception as e:
-            logger.error(f"Error sending 15m report: {e}", exc_info=True)
-    
-    # ══════════════════════════════════════════════════════════════════════
-    # Main tick handler
-    # ══════════════════════════════════════════════════════════════════════
-    
-    def on_tick(self, data_manager, order_manager, risk_manager) -> None:
-        """
-        Main per-tick strategy entrypoint called from the main loop.
-        - Manages existing position (TP/SL + timeout + score decay).
-        - If flat, evaluates weighted entry gates and possibly opens a new bracket.
-        """
-        try:
-            current_price = data_manager.get_last_price()
-            
-            if current_price <= 0:
-                return
-            
-            now_sec = time.time()
-            
-            # 15-minute performance Telegram report
-            self._maybe_send_15m_report(now_sec, risk_manager, current_price)
-            
-            # Manage open position first
-            if self.current_position is not None:
-                self._manage_open_position(
-                    data_manager=data_manager,
-                    order_manager=order_manager,
-                    risk_manager=risk_manager,
-                    current_price=current_price,
-                    now_sec=now_sec,
-                )
-                return
-            
-            # Cooldown between trades
-            if self.last_exit_time_min > 0:
-                minutes_since_exit = (now_sec / 60.0) - self.last_exit_time_min
-                if minutes_since_exit < config.MIN_TIME_BETWEEN_TRADES:
-                    return
-            
-            # Risk / trading permission check
-            allowed, reason = risk_manager.check_trading_allowed()
-            if not allowed:
-                logger.debug(f"Trading not allowed: {reason}")
-                return
-            
-            # Vol-Regime Detection
-            vol_regime, atr_pct = data_manager.get_vol_regime()
-            
-            # Core metrics
-            imbalance_data = self._compute_imbalance(data_manager)
-            wall_data = (
-                self._compute_wall_strength(data_manager, current_price, imbalance_data)
-                if imbalance_data is not None
-                else None
+                if close_result:
+                    close_id = close_result.get("order_id")
+                    fill_data = order_manager.wait_for_fill(close_id, timeout_sec=30.0)
+                    exit_price = order_manager.extract_fill_price(fill_data)
+                else:
+                    exit_price = data_manager.get_last_price()
+                    if exit_price <= 0:
+                        logger.error("Emergency exit failed: no price")
+                        return
+
+            # ✅ FIXED: Complete realized P&L calculation
+            entry_notional = pos.quantity * pos.entry_price
+            exit_notional = pos.quantity * exit_price
+            gross_pnl = (
+                (exit_notional - entry_notional) / entry_notional
+                if pos.side == "long"
+                else (entry_notional - exit_notional) / entry_notional
             )
-            delta_data = self._compute_delta_z_score(data_manager)
-            touch_data = self._compute_price_touch(data_manager, current_price)
-            
-            # Higher timeframe trend
-            htf_trend: Optional[str] = None
-            try:
-                if hasattr(data_manager, "get_htf_trend"):
-                    htf_trend = data_manager.get_htf_trend()
-            except Exception as e:
-                logger.error(f"Error fetching HTF trend in on_tick: {e}", exc_info=True)
-            
-            # Lower timeframe trend
-            ltf_trend: Optional[str] = None
-            try:
-                if hasattr(data_manager, "get_ltf_trend"):
-                    ltf_trend = data_manager.get_ltf_trend()
-            except Exception as e:
-                logger.error(f"Error fetching LTF trend in on_tick: {e}", exc_info=True)
-            
-            # EMA
-            ema_val: Optional[float] = None
-            try:
-                ema_val = data_manager.get_ema(period=config.EMA_PERIOD)
-            except Exception as e:
-                logger.error(f"Error fetching EMA in on_tick: {e}", exc_info=True)
-            
-            # Build Oracle Inputs for data fusion
-            oracle_inputs: Optional[OracleInputs] = None
-            try:
-                # Compute advanced metrics via data_manager's oracle
-                lv_1m, lv_5m, lv_15m, micro_trap = data_manager.compute_liquidity_velocity_multi_tf()
-                norm_cvd = data_manager.compute_norm_cvd(window_sec=10)
-                hurst = data_manager.compute_hurst_exponent(window_ticks=20)
-                bos_align = data_manager.compute_bos_alignment(current_price)
-                
-                oracle_inputs = OracleInputs(
-                    imbalance_data=imbalance_data,
-                    wall_data=wall_data,
-                    delta_data=delta_data,
-                    touch_data=touch_data,
-                    htf_trend=htf_trend,
-                    ltf_trend=ltf_trend,
-                    ema_val=ema_val,
-                    atr_pct=atr_pct,
-                    lv_1m=lv_1m,
-                    lv_5m=lv_5m,
-                    lv_15m=lv_15m,
-                    micro_trap=micro_trap,
-                    norm_cvd=norm_cvd,
-                    hurst=hurst,
-                    bos_align=bos_align,
-                    current_price=current_price,
-                    now_sec=now_sec,
-                )
-            except Exception as e:
-                logger.error(f"Error building OracleInputs: {e}", exc_info=True)
-            
-            # === WEIGHTED SCORING ===
-            if config.ENABLE_WEIGHTED_SCORING:
-                # Compute scores for long and short
-                long_score, long_components, long_reasons = self._compute_weighted_score(
-                    side="long",
-                    imbalance_data=imbalance_data,
-                    wall_data=wall_data,
-                    delta_data=delta_data,
-                    touch_data=touch_data,
-                    htf_trend=htf_trend,
-                    ltf_trend=ltf_trend,
-                    ema_val=ema_val,
-                    current_price=current_price,
-                    vol_regime=vol_regime,
-                    oracle_inputs=oracle_inputs,
-                )
-                
-                short_score, short_components, short_reasons = self._compute_weighted_score(
-                    side="short",
-                    imbalance_data=imbalance_data,
-                    wall_data=wall_data,
-                    delta_data=delta_data,
-                    touch_data=touch_data,
-                    htf_trend=htf_trend,
-                    ltf_trend=ltf_trend,
-                    ema_val=ema_val,
-                    current_price=current_price,
-                    vol_regime=vol_regime,
-                    oracle_inputs=oracle_inputs,
-                )
-                
-                # Win probability overlay
-                lstm_prob_long = 0.7 if htf_trend == "UP" else 0.5
-                lstm_prob_short = 0.7 if htf_trend == "DOWN" else 0.5
-                
-                z_sign_long = 1.0 if delta_data and delta_data["z_score"] > 0 else 0.0
-                z_sign_short = 1.0 if delta_data and delta_data["z_score"] < 0 else 0.0
-                
-                cvd_long = oracle_inputs.norm_cvd if oracle_inputs and oracle_inputs.norm_cvd and oracle_inputs.norm_cvd > 0 else 0.0
-                cvd_short = -oracle_inputs.norm_cvd if oracle_inputs and oracle_inputs.norm_cvd and oracle_inputs.norm_cvd < 0 else 0.0
-                
-                lv_avg = 0.5
-                if oracle_inputs and oracle_inputs.lv_1m and oracle_inputs.lv_5m:
-                    lv_avg = (oracle_inputs.lv_1m + oracle_inputs.lv_5m) / 2.0
-                    lv_avg = min(1.0, lv_avg)
-                
-                win_prob_long = self._compute_win_probability(lstm_prob_long, z_sign_long, cvd_long, lv_avg)
-                win_prob_short = self._compute_win_probability(lstm_prob_short, z_sign_short, cvd_short, lv_avg)
-                
-                # Entry decision
-                long_ready = (
-                    long_score >= config.WEIGHTED_SCORE_ENTRY_THRESHOLD
-                    and win_prob_long >= config.WIN_PROB_THRESHOLD
-                )
-                
-                short_ready = (
-                    short_score >= config.WEIGHTED_SCORE_ENTRY_THRESHOLD
-                    and win_prob_short >= config.WIN_PROB_THRESHOLD
-                )
-                
-                # Log decision state (throttled)
-                if now_sec - self._last_decision_log_sec > self.DECISION_LOG_INTERVAL_SEC:
-                    self._last_decision_log_sec = now_sec
-                    
-                    logger.info("=" * 80)
-                    logger.info("STRATEGY DECISION STATE")
-                    logger.info("=" * 80)
-                    logger.info(f"Price: ${current_price:.2f} | Vol: {vol_regime} | HTF: {htf_trend}")
-                    logger.info(f"LONG  Score: {long_score:.3f} | Win Prob: {win_prob_long:.3f} | Ready: {long_ready}")
-                    logger.info(f"SHORT Score: {short_score:.3f} | Win Prob: {win_prob_short:.3f} | Ready: {short_ready}")
-                    logger.info("=" * 80)
-                
-                # Enter position if score passes
-                if long_ready:
-                    self._enter_position(
-                        data_manager=data_manager,
-                        order_manager=order_manager,
-                        risk_manager=risk_manager,
-                        side="long",
-                        current_price=current_price,
-                        imbalance_data=imbalance_data,
-                        wall_data=wall_data,
-                        delta_data=delta_data,
-                        touch_data=touch_data,
-                        now_sec=now_sec,
-                        vol_regime=vol_regime,
-                        weighted_score=long_score,
-                        oracle_inputs=oracle_inputs,
-                    )
-                    return
-                
-                if short_ready:
-                    self._enter_position(
-                        data_manager=data_manager,
-                        order_manager=order_manager,
-                        risk_manager=risk_manager,
-                        side="short",
-                        current_price=current_price,
-                        imbalance_data=imbalance_data,
-                        wall_data=wall_data,
-                        delta_data=delta_data,
-                        touch_data=touch_data,
-                        now_sec=now_sec,
-                        vol_regime=vol_regime,
-                        weighted_score=short_score,
-                        oracle_inputs=oracle_inputs,
-                    )
-                    return
-            
-            else:
-                # Legacy binary AND gates (fallback if weighted scoring disabled)
-                logger.warning("Weighted scoring disabled; using legacy binary gates")
-                pass
-        
+            leverage_pnl = gross_pnl * config.LEVERAGE * pos.margin_used  # Margin-based
+
+            # Fees (taker on entry/exit)
+            entry_fee = entry_notional * config.TAKER_FEE_RATE
+            exit_fee = exit_notional * config.TAKER_FEE_RATE
+            net_pnl = leverage_pnl - entry_fee - exit_fee
+
+            # Update stats
+            risk_manager.update_trade_stats(net_pnl)
+            self.total_trades += 1
+
+            # Cancel remaining bracket orders
+            order_manager.cancel_order(pos.tp_order_id)
+            order_manager.cancel_order(pos.sl_order_id)
+
+            # Logging & notify
+            age_min = (now_sec - pos.entry_time_sec) / 60.0
+            logger.info(
+                f"EXIT {reason}: {pos.side.upper()} {pos.quantity:.6f} "
+                f"{pos.entry_price:.2f} → {exit_price:.2f} "
+                f"(Age: {age_min:.1f}min | P&L: ${net_pnl:.2f} | RR: {abs(net_pnl / (pos.margin_used * abs(config.STOP_LOSS_ROI))):.2f})"
+            )
+
+            send_telegram_message(
+                f"🔔 TRADE #{pos.trade_id} CLOSED\n"
+                f"Reason: {reason}\n"
+                f"Exit: ${exit_price:.2f}\n"
+                f"Duration: {age_min:.1f}min\n"
+                f"P&L: ${net_pnl:.2f}\n"
+                f"Total Trades: {self.total_trades}"
+            )
+
+            # Excel log
+            if self.excel_logger:
+                self.excel_logger.log_exit(pos, exit_price, net_pnl, reason)
+
+            # Cleanup
+            self.current_position = None
+            self.last_exit_time_min = now_sec / 60.0
+            risk_manager.record_trade_closed()
+
         except Exception as e:
-            logger.error(f"Error in on_tick: {e}", exc_info=True)
+            logger.error(f"Exit error: {e}", exc_info=True)
+            # Force cancel all
+            order_manager.cancel_all_orders()
+            self.current_position = None
+
+    def _calculate_unrealized_pnl(self, pos: ZScorePosition, current_price: float) -> float:
+        """Unrealized P&L for logging."""
+        if current_price <= 0:
+            return 0.0
+
+        entry_notional = pos.quantity * pos.entry_price
+        current_notional = pos.quantity * current_price
+        gross_unreal = (
+            (current_notional - entry_notional) / entry_notional
+            if pos.side == "long"
+            else (entry_notional - current_notional) / entry_notional
+        )
+        leverage_unreal = gross_unreal * config.LEVERAGE * pos.margin_used
+        return leverage_unreal  # Fees not deducted for unreal
+
+    def _log_decision(self, data_manager, long_pass: bool, long_score: float, short_pass: bool, short_score: float):
+        """Log tick decision snapshot."""
+        current_price = data_manager.get_last_price()
+        vol_regime = self._get_vol_regime(data_manager)
+        atr_pct = data_manager.get_atr_percent(config.ATR_WINDOW_MINUTES)
+        imbalance = self._compute_imbalance(data_manager)
+        logger.info(
+            f"TICK DECISION: Price={current_price:.2f} | Regime={vol_regime} (ATR%={atr_pct*100:.2f}) "
+            f"| Imb={imbalance:.3f} | Long={long_pass}({long_score:.3f}) | Short={short_pass}({short_score:.3f})"
+        )
+
+    # =====================================================================
+    # Event Callbacks (for WebSocket, no-op or extend as needed)
+    # =====================================================================
+
+    def on_orderbook_update(self, data: Dict):
+        """Callback for orderbook update - no-op, handled in data_manager."""
+        pass
+
+    def on_trade_update(self, data: Dict):
+        """Callback for trade update - no-op, handled in data_manager."""
+        pass
+
+    def on_candle_update(self, data: Dict):
+        """Callback for candle update - no-op, handled in data_manager."""
+        pass

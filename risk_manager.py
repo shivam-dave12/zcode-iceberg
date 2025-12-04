@@ -59,9 +59,9 @@ class RiskManager:
         """
         now = time.time()
         # GLOBAL RATE LIMIT - 1 call per 3 seconds MAX
-        if hasattr(self, '_last_balance_time') and now - self._last_balance_time < 3.0:
+        if now - self._last_balance_time < 3.0:
             logger.debug("Balance rate limited - using cache")
-            return getattr(self, '_cached_balance', None)
+            return self._cached_balance
         
         self._last_balance_time = now
         
@@ -88,11 +88,11 @@ class RiskManager:
                         return self._cached_balance
                 
                 logger.warning(f"Balance API no USDT data: {response}")
-                return getattr(self, '_cached_balance', None)
+                return self._cached_balance
         
         except Exception as e:
             logger.error(f"Failed to get balance: {e}")
-            return getattr(self, '_cached_balance', None)
+            return self._cached_balance
     
     def check_trading_allowed(self) -> Tuple[bool, str]:
         """Check if trading is allowed based on risk limits"""
@@ -131,6 +131,7 @@ class RiskManager:
         Returns:
             (margin_to_use, quantity_in_btc)
         """
+        # ✅ FIXED: Fetches balance internally (not passed as param)
         balance_info = self.get_available_balance()
         if not balance_info:
             logger.error("Cannot calculate position size without balance")
@@ -172,12 +173,14 @@ class RiskManager:
         self._reset_daily_stats_if_needed()
         
         self.daily_trades += 1
-        self.total_trades += 1  # ✅ FIXED: Update total_trades
+        # ✅ FIXED: Updates both daily and lifetime stats
+        self.total_trades += 1
         self.daily_pnl += pnl
         
         if pnl > 0:
             self.daily_wins += 1
-            self.winning_trades += 1  # ✅ FIXED: Update winning_trades
+            # ✅ FIXED: Update winning_trades
+            self.winning_trades += 1
             logger.info(f"✓ Winning trade: ${pnl:.2f}")
         else:
             self.daily_losses += 1
