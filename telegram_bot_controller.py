@@ -1,62 +1,83 @@
 # telegram_bot_controller.py
 """
-Telegram Bot Controller - small correctness and startup notification integration.
+Standalone Telegram Bot Controller
+Runs independently of the trading bot and can start/stop it via Telegram commands.
 
-Key fixes:
-- notify_bot_started() is lightweight and thread-safe (used by bot after warmup)
-- _bot_started_event and _bot_start_failed_event used properly by start flow
-- kept rest of controller behavior intact
+UPDATED: Added "logs" command to retrieve last 2 log entries.
 """
+
 import logging
 import threading
 import time
 import json
 import sys
+import os
 from typing import Optional, List
 from urllib import request, parse
 from datetime import datetime
 import telegram_config
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+
 
 class TelegramBotController:
+    """
+    Independent Telegram controller that can start/stop the trading bot.
+    Runs as a daemon and listens for commands even when bot is stopped.
+    """
+
     def __init__(self) -> None:
         self._token: Optional[str] = telegram_config.TELEGRAM_BOT_TOKEN
         self._chat_id: Optional[str] = telegram_config.TELEGRAM_CHAT_ID
         self.enabled: bool = bool(self._token and self._chat_id)
-        if not self.enabled:
-            logger.error("Telegram not configured")
-            sys.exit(1)
-        self._base_url = f"https://api.telegram.org/bot{self._token}"
-        self._last_update_id = 0
-        self._stop_polling = False
 
-        # Bot management
+        if not self.enabled:
+            logger.error(
+                "TelegramBotController disabled: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set"
+            )
+            sys.exit(1)
+
+        self._base_url: str = f"https://api.telegram.org/bot{self._token}"
+        self._last_update_id: int = 0
+        self._stop_polling: bool = False
+
+        # Bot instance control
         self.bot_instance = None
         self.bot_thread: Optional[threading.Thread] = None
-        self.bot_running = False
+        self.bot_running: bool = False
 
-        # Log buffer
+        # Log storage for "logs" command
         self._log_buffer: List[str] = []
-        self._log_buffer_max_size = 200
+        self._log_buffer_max_size: int = 100
+        self._log_file_handler: Optional[logging.FileHandler] = None
 
-        # startup events & error
+        logger.info("TelegramBotController initialized")
+
+        # Clear old messages on startup
+        self._clear_old_updates()
+
+        # Setup log capture
+        self._setup_log_capture()
+        # - _bot_start_error holds a short error message for user-facing reporting
         self._bot_started_event = threading.Event()
         self._bot_start_failed_event = threading.Event()
         self._bot_start_error: Optional[str] = None
 
-        logger.info("TelegramBotController initialized")
-        self._clear_old_updates()
-        self._setup_log_capture()
-
     def _setup_log_capture(self) -> None:
+        """Setup logging handler to capture logs into buffer."""
         try:
+            # Create a custom handler that writes to our buffer
             class BufferHandler(logging.Handler):
                 def __init__(self, buffer: List[str], max_size: int):
                     super().__init__()
                     self.buffer = buffer
                     self.max_size = max_size
+
                 def emit(self, record):
                     try:
                         msg = self.format(record)
@@ -65,34 +86,34 @@ class TelegramBotController:
                             self.buffer.pop(0)
                     except Exception:
                         pass
+
             buffer_handler = BufferHandler(self._log_buffer, self._log_buffer_max_size)
-            buffer_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+            buffer_handler.setFormatter(
+                logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+            )
             buffer_handler.setLevel(logging.INFO)
+
+            # Add to root logger
             root_logger = logging.getLogger()
             root_logger.addHandler(buffer_handler)
+
             logger.info("Log buffer capture initialized")
+
         except Exception as e:
-            logger.error(f"Error setting up log capture: {e}")
+            logger.error(f"Error setting up log capture: {e}", exc_info=True)
 
     def _clear_old_updates(self) -> None:
+        """Clear all pending updates to avoid processing old commands"""
         try:
+            logger.info("Clearing old Telegram messages...")
             updates = self._get_updates(timeout=1)
             if updates:
-                logger.info(f"Cleared {len(updates)} old updates")
-        except Exception:
-            pass
-
-    def notify_bot_started(self) -> None:
-        """
-        Called by bot AFTER warmup completes to signal successful startup.
-        Lightweight: sets event and logs.
-        """
-        try:
-            self._bot_started_event.set()
-            logger.info("Bot startup confirmed by ZScoreIcebergBot.")
+                count = len(updates)
+                logger.info(f"Cleared {count} old message(s)")
+            else:
+                logger.info("No old messages to clear")
         except Exception as e:
-            logger.error(f"notify_bot_started error: {e}")
-
+            logger.error(f"Error clearing old updates: {e}")
 
     def start_daemon(self) -> None:
         """Start the daemon controller"""
