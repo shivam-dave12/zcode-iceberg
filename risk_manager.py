@@ -1,7 +1,6 @@
 """
 Risk Manager - Handles position sizing, risk limits, and trade statistics
 """
-
 import time
 import logging
 from typing import Dict, Optional, Tuple
@@ -29,6 +28,10 @@ class RiskManager:
         self.daily_losses = 0
         self.last_reset_date = datetime.now().date()
         
+        # ✅ FIXED: Added missing attributes
+        self.total_trades = 0
+        self.winning_trades = 0
+        
         # Trade tracking
         self.open_trades = 0
         self.total_margin_used = 0.0
@@ -55,7 +58,6 @@ class RiskManager:
         Get available balance with CORRECT CoinSwitch API parsing (1 call per 3 seconds MAX)
         """
         now = time.time()
-        
         # GLOBAL RATE LIMIT - 1 call per 3 seconds MAX
         if hasattr(self, '_last_balance_time') and now - self._last_balance_time < 3.0:
             logger.debug("Balance rate limited - using cache")
@@ -66,8 +68,7 @@ class RiskManager:
         try:
             logger.debug("Fetching fresh balance...")
             response = self.api.get_wallet_balance()
-            
-            logger.debug(f"Raw wallet response: {response}")  # DEBUG
+            logger.debug(f"Raw wallet response: {response}")
             
             if "data" in response and "base_asset_balances" in response["data"]:
                 balances = response["data"]["base_asset_balances"]
@@ -83,17 +84,15 @@ class RiskManager:
                             "used": float(balances_dict.get("total_blocked_balance", 0.0)),
                             "timestamp": now
                         }
-                        
-                        logger.info(f"✓ Fresh balance: {available_usdt:.2f} USDT available")  # Changed to INFO
+                        logger.info(f"✓ Fresh balance: {available_usdt:.2f} USDT available")
                         return self._cached_balance
-            
-            logger.warning(f"Balance API no USDT data: {response}")
-            return getattr(self, '_cached_balance', None)
-            
+                
+                logger.warning(f"Balance API no USDT data: {response}")
+                return getattr(self, '_cached_balance', None)
+        
         except Exception as e:
             logger.error(f"Failed to get balance: {e}")
             return getattr(self, '_cached_balance', None)
-
     
     def check_trading_allowed(self) -> Tuple[bool, str]:
         """Check if trading is allowed based on risk limits"""
@@ -129,7 +128,6 @@ class RiskManager:
     ) -> Tuple[float, float]:
         """
         Calculate position size based on vol regime (NO balance_available param)
-        
         Returns:
             (margin_to_use, quantity_in_btc)
         """
@@ -157,7 +155,6 @@ class RiskManager:
         quantity = round(quantity, 6)
         
         logger.info(f"Regime-aware sizing: vol_regime={vol_regime}, usage={size_pct*100:.1f}%, margin={margin_to_use:.2f}, qty={quantity:.6f}")
-        
         return margin_to_use, quantity
     
     def record_trade_opened(self):
@@ -175,16 +172,19 @@ class RiskManager:
         self._reset_daily_stats_if_needed()
         
         self.daily_trades += 1
+        self.total_trades += 1  # ✅ FIXED: Update total_trades
         self.daily_pnl += pnl
         
         if pnl > 0:
             self.daily_wins += 1
+            self.winning_trades += 1  # ✅ FIXED: Update winning_trades
             logger.info(f"✓ Winning trade: ${pnl:.2f}")
         else:
             self.daily_losses += 1
             logger.info(f"✗ Losing trade: ${pnl:.2f}")
         
         logger.info(f"Daily stats: trades={self.daily_trades}, P&L={self.daily_pnl:.2f}, wins={self.daily_wins}, losses={self.daily_losses}")
+        logger.info(f"Lifetime stats: total_trades={self.total_trades}, winning_trades={self.winning_trades}")
     
     def get_daily_stats(self) -> Dict:
         """Get daily statistics"""

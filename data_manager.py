@@ -553,6 +553,9 @@ class ZScoreDataManager:
     def train_htf_lstm(self) -> None:
         """YOUR EXACT HTF LSTM TRAINING (EMA-slope labels)."""
         try:
+            if not hasattr(self, '_htf_5m_closes') or not hasattr(self, '_candles_lock'):
+                return
+            
             with self._candles_lock:
                 closes_list = list(self._htf_5m_closes)
                 if len(closes_list) < getattr(config, "HTF_LOOKBACK_BARS", 86):
@@ -696,6 +699,9 @@ class ZScoreDataManager:
     def train_ltf_lstm(self) -> None:
         """YOUR EXACT LTF LSTM TRAINING."""
         try:
+            # ✅ ADDED: Safety check
+            if not hasattr(self, '_ltf_1m_closes') or not hasattr(self, '_candles_lock'):
+                return    
             with self._candles_lock:
                 closes_list = list(self._ltf_1m_closes)
                 if len(closes_list) < getattr(config, "LTF_LOOKBACK_BARS", 30):

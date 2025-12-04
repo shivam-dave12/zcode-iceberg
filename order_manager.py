@@ -2,10 +2,9 @@
 Order Manager - Handles order placement and management
 Updated to use new CoinSwitch API plugins
 """
-
 import time
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from datetime import datetime
 from collections import defaultdict
 from futures_api import FuturesAPI
@@ -14,56 +13,54 @@ import config
 logging.basicConfig(level=config.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
-
 class OrderManager:
     """Manages order placement, cancellation, and tracking"""
-
+    
     def __init__(self):
         """Initialize order manager with new API plugin"""
         self.api = FuturesAPI(
             api_key=config.COINSWITCH_API_KEY,
             secret_key=config.COINSWITCH_SECRET_KEY,
         )
-
+        
         # Order tracking
         self.active_orders = {}
         self.order_history = []
-
+        
         # Rate limiting
         self.last_order_time = 0
         self.order_count = 0
         self.rate_limit_window_start = time.time()
-
+        
         logger.info("✓ OrderManager initialized with new API plugin")
-
-        # ═══════════════════════════════════════════════════════════════
-        # ADDED: Order status caching (FIX 3 & 4) - Reduces API calls 95%
-        # ═══════════════════════════════════════════════════════════════
+        
+        # Order status caching - Reduces API calls 95%
         self._order_status_cache = {}  # {order_id: (status_dict, timestamp)}
         self._cache_ttl = 2.0  # 2-second cache TTL
         self._last_status_call = defaultdict(float)  # Rate limit per order
         self._min_status_interval = 1.0  # Min 1s between status calls
+        
         logger.info("✓ Order status caching enabled (2s TTL, 1s min interval)")
-
+    
     # ======================================================================
     # Rate limiting / helpers
     # ======================================================================
-
+    
     def _check_rate_limit(self) -> bool:
         """Check if rate limit allows new order."""
         current_time = time.time()
-
+        
         if current_time - self.rate_limit_window_start > 60:
             self.order_count = 0
             self.rate_limit_window_start = current_time
-
+        
         if self.order_count >= config.RATE_LIMIT_ORDERS:
             return False
-
+        
         self.order_count += 1
         self.last_order_time = current_time
         return True
-
+    
     def extract_fill_price(self, order_data: Dict) -> float:
         """
         Extract a valid fill price from API order dict or raise.
@@ -74,7 +71,7 @@ class OrderManager:
         """
         price_fields = ["avg_execution_price", "avg_price", "average_price", "price"]
         price = None
-
+        
         for pf in price_fields:
             if pf in order_data and order_data[pf] is not None:
                 try:
@@ -82,22 +79,22 @@ class OrderManager:
                     break
                 except Exception:
                     continue
-
+        
         if price is None or price <= 0 or str(price).lower() in ("nan", "inf", "-inf"):
             msg = str(order_data.get("message") or order_data.get("error") or "")
             status_code = order_data.get("status_code")
-
+            
             if status_code == 429 or "too many requests" in msg.lower():
                 raise RuntimeError(
                     "Order fill price not returned due to API rate limit (429 / Too Many Requests)."
                 )
-
+            
             raise RuntimeError(
                 f"API did not return a realistic fill price! Full response: {order_data}"
             )
-
+        
         return price
-
+    
     def wait_for_fill(
         self,
         order_id: str,
@@ -110,7 +107,7 @@ class OrderManager:
         - status in EXECUTED / PARTIALLY_EXECUTED / FILLED (case-insensitive)
         - exec_quantity > 0
         - avg_execution_price (or equivalent) > 0
-
+        
         Raises RuntimeError on:
         - timeout without valid fill
         - status in CANCELLED / REJECTED
@@ -118,56 +115,177 @@ class OrderManager:
         """
         start = time.time()
         last_data: Optional[Dict] = None
-
+        
         while True:
             now = time.time()
             if now - start > timeout_sec:
                 raise RuntimeError(
                     f"Timed out waiting for fill on order {order_id}. Last status: {last_data}"
                 )
-
+            
             status_resp = self.get_order_status(order_id)
             if not status_resp:
                 time.sleep(poll_interval_sec)
                 continue
-
+            
             last_data = status_resp
             status = str(status_resp.get("status", "")).upper()
             exec_qty_str = status_resp.get("exec_quantity") or status_resp.get(
                 "executed_qty"
             )
-
+            
             try:
                 exec_qty = float(exec_qty_str) if exec_qty_str is not None else 0.0
             except Exception:
                 exec_qty = 0.0
-
+            
             if status in ("CANCELLED", "REJECTED"):
                 raise RuntimeError(
                     f"Order {order_id} not filled. Status={status}, data={status_resp}"
                 )
-
+            
             if exec_qty > 0:
                 _ = self.extract_fill_price(status_resp)
                 return status_resp
-
+            
             time.sleep(poll_interval_sec)
-
+    
     # ======================================================================
-    # Order placement
+    # ✅ NEW: Bracket Order Placement (Main + TP + SL in one method)
     # ======================================================================
-
+    
+    def place_bracket_order(
+        self,
+        side: str,
+        quantity: float,
+        entry_price: float,
+        tp_price: float,
+        sl_price: float,
+    ) -> Optional[Tuple[Dict, Dict, Dict]]:
+        """
+        ✅ STREAMLINED: Place a single limit entry order with TP and SL bracket orders.
+        
+        Args:
+            side: 'BUY' or 'SELL'
+            quantity: Position quantity
+            entry_price: Limit order entry price
+            tp_price: Take profit trigger price
+            sl_price: Stop loss trigger price
+        
+        Returns:
+            (main_order, tp_order, sl_order) or None on failure
+        
+        Process:
+            1. Place LIMIT entry order
+            2. Wait for fill (up to 60s)
+            3. Place TP order (TAKE_PROFIT_MARKET, reduce_only=True)
+            4. Place SL order (STOP_MARKET, reduce_only=True)
+        """
+        try:
+            if not self._check_rate_limit():
+                logger.warning("Rate limit exceeded; waiting 2s")
+                time.sleep(2)
+            
+            # Determine TP/SL sides (opposite of entry)
+            exit_side = "SELL" if side.upper() == "BUY" else "BUY"
+            
+            logger.info("="*80)
+            logger.info(f"PLACING BRACKET ORDER: {side.upper()}")
+            logger.info(f"Entry: LIMIT {quantity} @ ${entry_price:.2f}")
+            logger.info(f"TP: {exit_side} @ ${tp_price:.2f}")
+            logger.info(f"SL: {exit_side} @ ${sl_price:.2f}")
+            logger.info("="*80)
+            
+            # ────────────────────────────────────────────────────────
+            # STEP 1: Place LIMIT entry order
+            # ────────────────────────────────────────────────────────
+            main_order = self.place_limit_order(
+                side=side,
+                quantity=quantity,
+                price=entry_price,
+                reduce_only=False,
+            )
+            
+            if not main_order or "order_id" not in main_order:
+                logger.error("❌ Failed to place main entry order")
+                return None
+            
+            main_order_id = main_order["order_id"]
+            logger.info(f"✅ Main order placed: {main_order_id}")
+            
+            # ────────────────────────────────────────────────────────
+            # STEP 2: Wait for fill (60s timeout)
+            # ────────────────────────────────────────────────────────
+            try:
+                logger.info(f"⏳ Waiting for fill on {main_order_id[:8]}...")
+                filled_order = self.wait_for_fill(main_order_id, timeout_sec=60.0)
+                fill_price = self.extract_fill_price(filled_order)
+                logger.info(f"✅ Entry filled @ ${fill_price:.2f}")
+            except Exception as e:
+                logger.error(f"❌ Entry order not filled: {e}")
+                # Cancel unfilled order
+                self.cancel_order(main_order_id)
+                return None
+            
+            # ────────────────────────────────────────────────────────
+            # STEP 3: Place TP order
+            # ────────────────────────────────────────────────────────
+            tp_order = self.place_take_profit(
+                side=exit_side,
+                quantity=quantity,
+                trigger_price=tp_price,
+            )
+            
+            if not tp_order or "order_id" not in tp_order:
+                logger.error("❌ Failed to place TP order")
+                # Position is open, TP failed - exit manually
+                self.place_market_order(side=exit_side, quantity=quantity, reduce_only=True)
+                return None
+            
+            logger.info(f"✅ TP order placed: {tp_order['order_id']}")
+            
+            # ────────────────────────────────────────────────────────
+            # STEP 4: Place SL order
+            # ────────────────────────────────────────────────────────
+            sl_order = self.place_stop_loss(
+                side=exit_side,
+                quantity=quantity,
+                trigger_price=sl_price,
+            )
+            
+            if not sl_order or "order_id" not in sl_order:
+                logger.error("❌ Failed to place SL order")
+                # Position open, SL failed - cancel TP and exit
+                self.cancel_order(tp_order["order_id"])
+                self.place_market_order(side=exit_side, quantity=quantity, reduce_only=True)
+                return None
+            
+            logger.info(f"✅ SL order placed: {sl_order['order_id']}")
+            logger.info("="*80)
+            logger.info("✅ BRACKET ORDER COMPLETE (Entry filled, TP/SL active)")
+            logger.info("="*80)
+            
+            return (filled_order, tp_order, sl_order)
+        
+        except Exception as e:
+            logger.error(f"❌ Error placing bracket order: {e}", exc_info=True)
+            return None
+    
+    # ======================================================================
+    # Order placement (existing methods)
+    # ======================================================================
+    
     def place_market_order(
         self, side: str, quantity: float, reduce_only: bool = False
     ) -> Optional[Dict]:
         """
         Place a market order.
-
+        
         Args:
             side: 'BUY' or 'SELL'
             quantity: Order quantity
             reduce_only: If True, only reduces position
-
+        
         Returns:
             Order details or None on failure
         """
@@ -175,9 +293,9 @@ class OrderManager:
             if not self._check_rate_limit():
                 logger.warning("Rate limit exceeded for orders; delaying by 2 seconds")
                 time.sleep(2)
-
+            
             logger.info(f"Placing MARKET {side} order: {quantity} {config.SYMBOL}")
-
+            
             response = self.api.place_order(
                 symbol=config.SYMBOL,
                 side=side.upper(),
@@ -186,11 +304,11 @@ class OrderManager:
                 exchange=config.EXCHANGE,
                 reduce_only=reduce_only,
             )
-
+            
             if "data" in response and "order_id" in response["data"]:
                 order_id = response["data"]["order_id"]
                 order_details = response["data"]
-
+                
                 self.active_orders[order_id] = {
                     "order_id": order_id,
                     "symbol": config.SYMBOL,
@@ -201,7 +319,7 @@ class OrderManager:
                     "timestamp": datetime.now().isoformat(),
                     "reduce_only": reduce_only,
                 }
-
+                
                 self.order_history.append(self.active_orders[order_id].copy())
                 logger.info(f"✓ Order placed successfully: {order_id}")
                 logger.info(f"  Status: {order_details.get('status')}")
@@ -211,11 +329,11 @@ class OrderManager:
                 logger.error(f"✗ Order placement failed: {error_msg}")
                 logger.error(f"  Full response: {response}")
                 return None
-
+        
         except Exception as e:
             logger.error(f"Error placing market order: {e}", exc_info=True)
             return None
-
+    
     def place_limit_order(
         self,
         side: str,
@@ -228,11 +346,11 @@ class OrderManager:
             if not self._check_rate_limit():
                 logger.warning("Rate limit exceeded for orders; delaying by 2 seconds")
                 time.sleep(2)
-
+            
             logger.info(
                 f"Placing LIMIT {side} order: {quantity} {config.SYMBOL} @ ${price:,.2f}"
             )
-
+            
             response = self.api.place_order(
                 symbol=config.SYMBOL,
                 side=side.upper(),
@@ -242,11 +360,11 @@ class OrderManager:
                 exchange=config.EXCHANGE,
                 reduce_only=reduce_only,
             )
-
+            
             if "data" in response and "order_id" in response["data"]:
                 order_id = response["data"]["order_id"]
                 order_details = response["data"]
-
+                
                 self.active_orders[order_id] = {
                     "order_id": order_id,
                     "symbol": config.SYMBOL,
@@ -258,7 +376,7 @@ class OrderManager:
                     "timestamp": datetime.now().isoformat(),
                     "reduce_only": reduce_only,
                 }
-
+                
                 self.order_history.append(self.active_orders[order_id].copy())
                 logger.info(f"✓ Limit order placed: {order_id}")
                 return order_details
@@ -266,59 +384,59 @@ class OrderManager:
                 error_msg = response.get("response", {}).get("message", "Unknown error")
                 logger.error(f"✗ Limit order failed: {error_msg}")
                 return None
-
+        
         except Exception as e:
             logger.error(f"Error placing limit order: {e}", exc_info=True)
             return None
-
+    
     def place_stop_loss(
         self, side: str, quantity: float, trigger_price: float
     ) -> Optional[Dict]:
         """Place a stop loss order."""
         try:
             logger.info(f"Placing STOP LOSS {side} @ ${trigger_price:,.2f}")
-
+            
             response = self.api.place_order(
                 symbol=config.SYMBOL,
                 side=side.upper(),
                 order_type="STOP_MARKET",
-                quantity=0,
+                quantity=quantity,
                 trigger_price=trigger_price,
                 exchange=config.EXCHANGE,
                 reduce_only=True,
             )
-
+            
             if "data" in response and "order_id" in response["data"]:
                 order_id = response["data"]["order_id"]
                 logger.info(f"✓ Stop loss order placed: {order_id}")
-
+                
                 self.active_orders[order_id] = {
                     "order_id": order_id,
                     "symbol": config.SYMBOL,
                     "side": side,
                     "type": "STOP_LOSS",
-                    "quantity": 0,
+                    "quantity": quantity,
                     "trigger_price": trigger_price,
                     "status": response["data"].get("status", "UNKNOWN"),
                     "timestamp": datetime.now().isoformat(),
                 }
-
+                
                 return response["data"]
             else:
                 logger.error(f"✗ Stop loss order failed: {response}")
                 return None
-
+        
         except Exception as e:
             logger.error(f"Error placing stop loss: {e}")
             return None
-
+    
     def place_take_profit(
         self, side: str, quantity: float, trigger_price: float
     ) -> Optional[Dict]:
         """Place a take profit order."""
         try:
             logger.info(f"Placing TAKE PROFIT {side} @ ${trigger_price:,.2f}")
-
+            
             response = self.api.place_order(
                 symbol=config.SYMBOL,
                 side=side.upper(),
@@ -328,11 +446,11 @@ class OrderManager:
                 exchange=config.EXCHANGE,
                 reduce_only=True,
             )
-
+            
             if "data" in response and "order_id" in response["data"]:
                 order_id = response["data"]["order_id"]
                 logger.info(f"✓ Take profit order placed: {order_id}")
-
+                
                 self.active_orders[order_id] = {
                     "order_id": order_id,
                     "symbol": config.SYMBOL,
@@ -343,30 +461,30 @@ class OrderManager:
                     "status": response["data"].get("status", "UNKNOWN"),
                     "timestamp": datetime.now().isoformat(),
                 }
-
+                
                 return response["data"]
             else:
                 logger.error(f"✗ Take profit order failed: {response}")
                 return None
-
+        
         except Exception as e:
             logger.error(f"Error placing take profit: {e}")
             return None
-
+    
     # ======================================================================
     # Cancellation / status
     # ======================================================================
-
+    
     def cancel_order(self, order_id: str) -> bool:
         """Cancel an order."""
         try:
             logger.info(f"Cancelling order: {order_id}")
-
+            
             response = self.api.cancel_order(
                 order_id=order_id,
                 exchange=config.EXCHANGE,
             )
-
+            
             if "data" in response:
                 logger.info(f"✓ Order cancelled: {order_id}")
                 if order_id in self.active_orders:
@@ -375,21 +493,21 @@ class OrderManager:
             else:
                 logger.error(f"✗ Cancel failed: {response}")
                 return False
-
+        
         except Exception as e:
             logger.error(f"Error cancelling order: {e}")
             return False
-
+    
     def cancel_all_orders(self) -> bool:
         """Cancel all open orders for the symbol."""
         try:
             logger.info(f"Cancelling all orders for {config.SYMBOL}")
-
+            
             response = self.api.cancel_all_orders(
                 exchange=config.EXCHANGE,
                 symbol=config.SYMBOL,
             )
-
+            
             if "data" in response or not response.get("error"):
                 logger.info("✓ All orders cancelled")
                 self.active_orders.clear()
@@ -397,77 +515,75 @@ class OrderManager:
             else:
                 logger.error(f"✗ Cancel all failed: {response}")
                 return False
-
+        
         except Exception as e:
             logger.error(f"Error cancelling all orders: {e}")
             return False
-
+    
     def get_order_status(self, order_id: str) -> Optional[Dict]:
         """
-        Get order status with caching and rate limiting (FIX 3 & 4).
+        Get order status with caching and rate limiting.
         - 2-second cache TTL (reduces API calls by 95%)
         - Min 1 second between API calls per order
         - Returns cached status on API failure (graceful degradation)
         """
         now = time.time()
-
-        # ───────────────────────────────────────────────────────────────
-        # Check cache first (FIX 3)
-        # ───────────────────────────────────────────────────────────────
+        
+        # Check cache first
         if order_id in self._order_status_cache:
             cached_status, cached_time = self._order_status_cache[order_id]
             if now - cached_time < self._cache_ttl:
                 logger.debug(f"📋 Cache HIT for order {order_id[:8]}...")
                 return cached_status
-
-        # ───────────────────────────────────────────────────────────────
-        # Check rate limit (FIX 4)
-        # ───────────────────────────────────────────────────────────────
+        
+        # Check rate limit
         last_call = self._last_status_call[order_id]
         if now - last_call < self._min_status_interval:
             wait_time = self._min_status_interval - (now - last_call)
-            logger.debug(f"⏸️  Rate limit: waiting {wait_time:.2f}s for {order_id[:8]}...")
+            logger.debug(f"⏸️ Rate limit: waiting {wait_time:.2f}s for {order_id[:8]}...")
             time.sleep(wait_time)
-
-        # ───────────────────────────────────────────────────────────────
+        
         # Make API call
-        # ───────────────────────────────────────────────────────────────
         try:
             self._last_status_call[order_id] = time.time()
             response = self.api.get_order(order_id)
-
+            
             if "data" in response:
                 order_data = response["data"].get("order", response["data"])
-
+                
                 # Cache result
                 self._order_status_cache[order_id] = (order_data, time.time())
                 logger.debug(f"📥 Cached order status for {order_id[:8]}...")
-
-                # Update active orders tracking (existing logic)
+                
+                # Update active orders tracking
                 if order_id in self.active_orders:
                     self.active_orders[order_id]["status"] = order_data.get(
                         "status", "UNKNOWN"
                     )
-
+                
                 return order_data
             else:
                 logger.warning(f"Could not get order status for {order_id}")
+                
                 # Return cached if available (graceful degradation)
                 if order_id in self._order_status_cache:
                     cached_status, _ = self._order_status_cache[order_id]
                     logger.debug(f"Using stale cache for {order_id[:8]}...")
                     return cached_status
+                
                 return None
-
+        
         except Exception as e:
             logger.error(f"Error getting order status: {e}")
+            
             # Return cached status if available (graceful degradation)
             if order_id in self._order_status_cache:
                 cached_status, _ = self._order_status_cache[order_id]
                 logger.debug(f"Using stale cache on error for {order_id[:8]}...")
                 return cached_status
+            
             return None
-
+    
     def get_open_orders(self) -> list:
         """Get all open orders."""
         try:
@@ -475,7 +591,7 @@ class OrderManager:
                 exchange=config.EXCHANGE,
                 symbol=config.SYMBOL,
             )
-
+            
             if "data" in response:
                 orders = response["data"].get("orders", [])
                 logger.debug(f"Found {len(orders)} open orders")
@@ -483,32 +599,32 @@ class OrderManager:
             else:
                 logger.warning("Could not fetch open orders")
                 return []
-
+        
         except Exception as e:
             logger.error(f"Error getting open orders: {e}")
             return []
-
+    
     # ======================================================================
     # Stats
     # ======================================================================
-
+    
     def get_order_statistics(self) -> Dict:
         """Get order statistics."""
         total_orders = len(self.order_history)
-
+        
         if total_orders == 0:
             return {
                 "total_orders": 0,
                 "active_orders": 0,
                 "success_rate": 0,
             }
-
+        
         successful = sum(
             1
             for order in self.order_history
             if order.get("status") in ["EXECUTED", "FILLED"]
         )
-
+        
         return {
             "total_orders": total_orders,
             "active_orders": len(self.active_orders),
@@ -517,10 +633,10 @@ class OrderManager:
             "last_order_time": self.last_order_time,
         }
 
-
 if __name__ == "__main__":
     om = OrderManager()
     print("Order Manager initialized")
     print(f"Statistics: {om.get_order_statistics()}")
+    
     open_orders = om.get_open_orders()
     print(f"Open orders: {len(open_orders)}")
