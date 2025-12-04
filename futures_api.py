@@ -74,41 +74,41 @@ class FuturesAPI:
         
         return signature_bytes.hex()
     
-    def _make_request(self, method: str, endpoint: str, params: Dict = None, payload: Dict = None) -> Dict:
-        """Make authenticated API request WITH EPOCH HEADER (2024 req)."""
-        signature, epoch_ms = self._generate_signature(method, endpoint, params, payload)
+def _make_request(self, method: str, endpoint: str, params: Dict = None, payload: Dict = None) -> Dict:
+    """Make authenticated API request WITH EPOCH HEADER (2024 req)."""
+    signature, epoch_ms = self._generate_signature(method, endpoint, params, payload)
+    
+    url = self.base_url + endpoint
+    headers = {
+        "X-AUTH-APIKEY": self.api_key,
+        "X-AUTH-SIGNATURE": signature,
+        "X-AUTH-EPOCH": str(epoch_ms),  # Required header
+        "Content-Type": "application/json",
+    }
+    
+    try:
+        if method == "GET":
+            response = requests.get(url, params=params, headers=headers, timeout=10)
+        elif method == "POST":
+            response = requests.post(url, json=payload, headers=headers, timeout=10)
+        elif method == "DELETE":
+            response = requests.delete(url, json=payload, headers=headers, timeout=10)
+        else:
+            raise ValueError(f"Unsupported method: {method}")
         
-        url = self.base_url + endpoint
-        headers = {
-            "X-AUTH-APIKEY": self.api_key,
-            "X-AUTH-SIGNATURE": signature,
-            "X-AUTH-EPOCH": str(epoch_ms),  # Required header
-            "Content-Type": "application/json",
+        response.raise_for_status()
+        return response.json()
+    
+    except requests.exceptions.RequestException as e:
+        error_msg = f"API request failed ({method} {endpoint}): {e}"
+        if 'response' in locals() and response:
+            error_msg += f" | Status: {response.status_code} | Body: {response.text[:500]}..."  # Trunc raw body for debug
+        logger.error(error_msg)
+        return {
+            "error": str(e),
+            "status_code": getattr(response, 'status_code', None) if 'response' in locals() else None,
+            "response_text": getattr(response, 'text', 'N/A')[:200] if 'response' in locals() else 'N/A'  # For debug
         }
-        
-        try:
-            if method == "GET":
-                response = requests.get(url, params=params, headers=headers, timeout=10)
-            elif method == "POST":
-                response = requests.post(url, json=payload, headers=headers, timeout=10)
-            elif method == "DELETE":
-                response = requests.delete(url, json=payload, headers=headers, timeout=10)
-            else:
-                raise ValueError(f"Unsupported method: {method}")
-            
-            response.raise_for_status()
-            return response.json()
-        
-        except requests.exceptions.RequestException as e:
-            error_msg = f"API request failed ({method} {endpoint}): {e}"
-            if 'response' in locals() and response:
-                error_msg += f" | Status: {response.status_code} | Body: {response.text[:500]}..."  # Trunc raw body for debug
-            logger.error(error_msg)
-            return {
-                "error": str(e),
-                "status_code": getattr(response, 'status_code', None) if 'response' in locals() else None,
-                "response_text": getattr(response, 'text', 'N/A')[:200] if 'response' in locals() else 'N/A'  # For debug
-            }
     
     # ============ ORDER MANAGEMENT ============
     
