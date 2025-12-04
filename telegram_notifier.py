@@ -4,6 +4,7 @@ import logging
 import time
 from typing import Optional
 from urllib import request, parse
+
 import telegram_config
 
 logger = logging.getLogger(__name__)
@@ -12,6 +13,7 @@ logger = logging.getLogger(__name__)
 class TelegramNotifier:
     """
     Thin wrapper around Telegram Bot API sendMessage.
+
     - No external dependencies (uses stdlib urllib).
     - Completely no-op if token/chat_id are missing.
     """
@@ -51,7 +53,6 @@ class TelegramNotifier:
             ).encode("utf-8")
 
             req = request.Request(self._base_url, data=data, method="POST")
-
             with request.urlopen(req, timeout=5) as resp:
                 status = getattr(resp, "status", None)
                 if status is not None and status != 200:
@@ -61,7 +62,6 @@ class TelegramNotifier:
                         status,
                         body,
                     )
-
         except Exception as e:
             logger.error("Error sending Telegram message: %s", e, exc_info=True)
 
@@ -79,6 +79,7 @@ def send_telegram_message(text: str) -> None:
 class TelegramLogHandler(logging.Handler):
     """
     Logging handler that forwards WARNING/ERROR/CRITICAL records to Telegram.
+
     - Skips logs from this module to avoid recursion if Telegram send fails.
     - Has a simple global throttle to prevent message floods.
     """
@@ -111,7 +112,6 @@ class TelegramLogHandler(logging.Handler):
                 text = text[:max_len] + " ... [truncated]"
 
             send_telegram_message(text)
-
         except Exception:
             # Never let logging handler throw
             return
@@ -123,11 +123,11 @@ def install_global_telegram_log_handler(
 ) -> logging.Handler:
     """
     Attach a TelegramLogHandler to the root logger.
-    
+
     Args:
         level: Minimum level to forward (default WARNING).
         throttle_seconds: Min seconds between Telegram messages from this handler.
-                         Use 0.0 to disable throttling completely.
+                          Use 0.0 to disable throttling completely.
     """
     handler = TelegramLogHandler(level=level, throttle_seconds=throttle_seconds)
     formatter = logging.Formatter(
@@ -137,5 +137,4 @@ def install_global_telegram_log_handler(
 
     root_logger = logging.getLogger()
     root_logger.addHandler(handler)
-
     return handler

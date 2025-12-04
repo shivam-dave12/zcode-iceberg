@@ -1,258 +1,223 @@
 """
-Risk Manager - Handles position sizing, risk limits, and trade statistics
+Risk Manager - Manages position sizing and risk controls
+
+Updated to use new CoinSwitch API plugins
+
++ Balance caching and 429-safe behaviour for Z-Score Imbalance Iceberg Hunter
 """
-import time
+
 import logging
-from typing import Dict, Optional, Tuple
+import time
+from typing import Dict, Optional
 from datetime import datetime
-from collections import defaultdict
+
 from futures_api import FuturesAPI
 import config
 
+logging.basicConfig(level=config.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
 
 class RiskManager:
-    """Manages risk parameters and position sizing"""
+    """Manages risk controls and position sizing"""
 
     def __init__(self):
-        """Initialize risk manager"""
+        """Initialize risk manager with new API plugin"""
+
         self.api = FuturesAPI(
             api_key=config.COINSWITCH_API_KEY,
             secret_key=config.COINSWITCH_SECRET_KEY,
         )
-        
-        # Daily statistics
+
+        # Risk tracking
         self.daily_trades = 0
         self.daily_pnl = 0.0
-        self.daily_wins = 0
-        self.daily_losses = 0
-        self.last_reset_date = datetime.now().date()
-        
-        # FIXED: Added missing attributes
+        self.last_reset = datetime.utcnow()
+
         self.total_trades = 0
         self.winning_trades = 0
-        
-        # Trade tracking
-        self.open_trades = 0
-        self.total_margin_used = 0.0
-        
-        # REMOVED: Balance caching removed entirely - only fetch on demand
-        
-        logger.info("RiskManager initialized")
+        self.losing_trades = 0
 
-    def reset_daily_stats_if_needed(self):
-        """Reset daily statistics if new day"""
-        current_date = datetime.now().date()
-        if current_date != self.last_reset_date:
-            logger.info(f"New day detected - resetting daily stats (prev: {self.daily_trades} trades, P&L: {self.daily_pnl:.2f})")
-            self.daily_trades = 0
-            self.daily_pnl = 0.0
-            self.daily_wins = 0
-            self.daily_losses = 0
-            self.last_reset_date = current_date
+        # Balance cache (to avoid hammering wallet_balance endpoint)
+        self._balance_cache: Optional[Dict] = None
+        self._last_balance_fetch: float = 0.0
+        self._balance_cache_ttl_sec: float = 5.0
+        self._last_429_log: float = 0.0
 
-    def get_available_balance(self, force_fresh: bool = False) -> Optional[Dict]:
+        logger.info("âœ“ RiskManager initialized")
+
+    # ======================================================================
+    # Trading permissions
+    # ======================================================================
+
+    def check_trading_allowed(self) -> tuple:
         """
-        Get available balance - ENHANCED: Full raw logging, 3x retry, fallback to $100 min.
-        Only fetch fresh on entry (force_fresh=True); otherwise use cache.
+        Check if trading is allowed based on risk limits.
+
+        Returns:
+            (allowed: bool, reason: str)
         """
+        try:
+            self._reset_daily_counters()
+
+            if not config.ENABLE_TRADING:
+                return False, "Trading is disabled in config"
+
+            if self.daily_trades >= config.MAX_DAILY_TRADES:
+                return False, f"Daily trade limit reached ({config.MAX_DAILY_TRADES})"
+
+            if self.daily_pnl <= -config.MAX_DAILY_LOSS:
+                return False, f"Daily loss limit reached (${abs(self.daily_pnl):.2f})"
+
+            balance_info = self.get_available_balance()
+            if not balance_info:
+                return False, "No balance information available (API / rate-limit issue)"
+
+            if balance_info["available"] <= 0:
+                return False, "Insufficient balance"
+
+            if balance_info["available"] < config.MIN_MARGIN_PER_TRADE:
+                return False, (
+                    f"Available balance {balance_info['available']:.2f} "
+                    f"< MIN_MARGIN_PER_TRADE ({config.MIN_MARGIN_PER_TRADE})"
+                )
+
+            return True, "Trading allowed"
+
+        except Exception as e:
+            logger.error(f"Error checking trading permissions: {e}", exc_info=True)
+            return False, f"Error: {e}"
+
+    # ======================================================================
+    # Balance management
+    # ======================================================================
+
+    def get_available_balance(self) -> Optional[Dict]:
         now = time.time()
-        
-        # Cache state
-        if not hasattr(self, '_balance_cache'):
-            self._balance_cache = {'data': None, 'timestamp': 0.0}
-        
-        # Use cache if valid and not forced
-        if not force_fresh and self._balance_cache['data'] is not None:
-            cache_age = now - self._balance_cache['timestamp']
-            if cache_age < 60.0:  # 60s cache TTL
-                logger.debug(f"Using cached balance (age: {cache_age:.1f}s): {self._balance_cache['data']}")
-                return self._balance_cache['data']
-        
-        # Retry loop (3x, exponential backoff)
-        max_retries = 3
-        for attempt in range(max_retries):
+        # Use longer cache to avoid hammering endpoints
+        if self._balance_cache is not None and (now - self._last_balance_fetch) < getattr(self, "_balance_cache_ttl_sec", 30.0):
+            return self._balance_cache
+
+        backoff = 0.5
+        for attempt in range(4):
             try:
-                logger.info(f"Fetching fresh balance (attempt {attempt+1}/{max_retries})...")
                 response = self.api.get_wallet_balance()
-                
-                # NEW: Log FULL raw response for debugging (always on attempt 1, debug on retries)
-                if attempt == 0 or logger.level <= logging.DEBUG:
-                    logger.info(f"Raw wallet response: {response}")  # Full dict/log
-                
-                if "data" in response and "baseAssetBalances" in response["data"]:
-                    balances = response["data"]["baseAssetBalances"]
-                    
-                    for asset in balances:
-                        if asset.get("baseAsset") == "USDT":
-                            balances_dict = asset.get("balances", {})
-                            available_usdt = float(balances_dict.get("totalAvailableBalance", 0.0))
-                            
-                            if available_usdt > 0:
-                                balance_info = {
-                                    "available": available_usdt,
-                                    "total": float(balances_dict.get("totalBalance", 0.0)),
-                                    "used": float(balances_dict.get("totalBlockedBalance", 0.0)),
-                                    "timestamp": now
-                                }
-                                
-                                # Cache it
-                                self._balance_cache = {'data': balance_info, 'timestamp': now}
-                                
-                                logger.info(f"✓ Fresh balance: {available_usdt:.2f} USDT available")
-                                return balance_info
-                    
-                    # No USDT found
-                    logger.warning(f"Balance API: USDT not found in {len(balances)} assets")
-                    if attempt < max_retries - 1:
-                        time.sleep(2 ** attempt)  # Backoff: 1s, 2s
-                        continue
-                    else:
-                        raise ValueError("No USDT balance found")
-                else:
-                    logger.warning(f"Balance API: unexpected structure (keys: {list(response.keys()) if isinstance(response, dict) else 'N/A'})")
-                    if attempt < max_retries - 1:
-                        time.sleep(2 ** attempt)  # Backoff
-                        continue
-                    else:
-                        raise ValueError("Unexpected response structure")
-                        
-            except Exception as e:
-                logger.error(f"Balance fetch failed (attempt {attempt+1}): {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
+                # Some _make_request wrappers return error dicts with status_code
+                if isinstance(response, dict) and response.get("status_code") == 429:
+                    if now - self._last_429_log > 5.0:
+                        logger.error("Failed to get balance: 429 Too Many Requests. Using cached balance if available.")
+                        self._last_429_log = now
+                    time.sleep(backoff)
+                    backoff *= 2
                     continue
-                else:
-                    # FALLBACK: Use safe min balance to allow trading
-                    logger.warning("All retries failed - using fallback $100 USDT balance")
-                    fallback_info = {
-                        "available": 100.0,  # Safe min for testing
-                        "total": 100.0,
-                        "used": 0.0,
-                        "timestamp": now,
-                        "fallback": True  # Flag for monitoring
-                    }
-                    self._balance_cache = {'data': fallback_info, 'timestamp': now}
-                    return fallback_info
-        
-        return None
-                
-    def check_trading_allowed(self) -> Tuple[bool, str]:
-        """Check if trading is allowed based on risk limits - MODIFIED: No balance fetch here."""
-        self.reset_daily_stats_if_needed()
-        
-        # Check daily trade limit
-        if self.daily_trades >= config.MAX_DAILY_TRADES:
-            return False, f"Daily trade limit reached ({self.daily_trades}/{config.MAX_DAILY_TRADES})"
-        
-        # Check daily loss limit
-        if self.daily_pnl <= -config.MAX_DAILY_LOSS:
-            return False, f"Daily loss limit reached ({self.daily_pnl:.2f}/{-config.MAX_DAILY_LOSS})"
-        
-        # Check concurrent position limit
-        if self.open_trades >= config.MAX_CONCURRENT_POSITIONS:
-            return False, f"Max concurrent positions reached ({self.open_trades}/{config.MAX_CONCURRENT_POSITIONS})"
-        
-        # Balance check deferred to entry sizing (fetch fresh there)
-        return True, "OK"
 
+                if "data" in response:
+                    data = response["data"]
+                    base_balances = data.get("base_asset_balances", [])
+                    usdt_balance = next((b for b in base_balances if b.get("base_asset") == "USDT"), None)
+                    if usdt_balance:
+                        balances = usdt_balance.get("balances", {})
+                        result = {
+                            "total": float(balances.get("total_balance", 0)),
+                            "available": float(balances.get("total_available_balance", 0)),
+                            "blocked": float(balances.get("total_blocked_balance", 0)),
+                            "currency": "USDT",
+                        }
+                        self._balance_cache = result
+                        self._last_balance_fetch = now
+                        return result
+                    else:
+                        logger.warning("USDT balance not found in wallet response")
+                        return self._balance_cache
 
-    def calculate_position_size_regime_aware(
-        self,
-        entry_price: float,
-        vol_regime: str,
-    ) -> Tuple[float, float]:
+                logger.error(f"Failed to get balance: {response}")
+                return self._balance_cache
+
+            except Exception as e:
+                logger.error(f"Error getting balance (attempt {attempt+1}): {e}", exc_info=True)
+                time.sleep(backoff)
+                backoff *= 2
+
+        # After retries, return cached or None
+        return self._balance_cache
+
+    # ======================================================================
+    # Legacy HF position sizing (kept for compatibility)
+    # ======================================================================
+
+    def calculate_position_size(
+        self, entry_price: float, stop_loss_price: float, current_balance: float = None
+    ) -> float:
         """
-        Calculate position size based on vol regime - MODIFIED: Fetch fresh balance ONLY here (entry-time).
-        Returns: (margin_to_use, quantity_in_btc)
+        Legacy HF method (kept for compatibility), not used by Z-Score strategy.
         """
-        # Fetch fresh balance ONLY at entry
-        balance_info = self.get_available_balance(force_fresh=True)
-        if not balance_info:
-            logger.error("Cannot calculate position size without balance")
-            return 0.0, 0.0
-        
-        available = float(balance_info.get("available", 0.0))
-        
-        # Vol-regime sizing
-        if vol_regime == "HIGH":
-            size_pct = config.VOL_REGIME_SIZE_HIGH_PCT
-        elif vol_regime == "LOW":
-            size_pct = config.VOL_REGIME_SIZE_LOW_PCT
-        else:
-            size_pct = (config.VOL_REGIME_SIZE_HIGH_PCT + config.VOL_REGIME_SIZE_LOW_PCT) / 2.0
-        
-        margin_to_use = available * size_pct
-        margin_to_use = max(config.MIN_MARGIN_PER_TRADE, min(margin_to_use, config.MAX_MARGIN_PER_TRADE))
-        
-        # Calculate quantity (exact: notional = margin * leverage)
-        notional = margin_to_use * config.LEVERAGE
-        quantity = notional / entry_price
-        quantity = round(quantity, 6)  # BTC precision
-        
-        logger.info(f"Regime-aware sizing: vol_regime={vol_regime}, usage={size_pct*100:.1f}%, margin={margin_to_use:.2f}, qty={quantity:.6f}")
-        
-        return margin_to_use, quantity
-        
-    def record_trade_opened(self):
-        """Record that a trade was opened"""
-        self.open_trades += 1
-        logger.debug(f"Trade opened - open count: {self.open_trades}")
+        try:
+            if current_balance is None:
+                balance_info = self.get_available_balance()
+                if not balance_info:
+                    logger.error("Could not fetch balance for HF position sizing")
+                    return 0.001
+                current_balance = balance_info["available"]
 
-    def record_trade_closed(self):
-        """Record that a trade was closed"""
-        self.open_trades = max(0, self.open_trades - 1)
-        logger.debug(f"Trade closed - open count: {self.open_trades}")
+            risk_amount = min(20, current_balance * 0.02)
+            price_diff = abs(entry_price - stop_loss_price)
+            if price_diff == 0:
+                logger.warning("Stop loss same as entry price in HF calc")
+                return 0.001
+
+            position_size = risk_amount / price_diff
+            position_size = max(0.001, position_size)
+            position_size = min(2.0, position_size)
+
+            position_value = position_size * entry_price
+            if position_value > 50000:
+                position_size = 50000 / entry_price
+
+            logger.info(f"HF calc position size: {position_size:.6f} BTC")
+            return round(position_size, 6)
+
+        except Exception as e:
+            logger.error(f"Error calculating position size: {e}", exc_info=True)
+            return 0.001
+
+    # ======================================================================
+    # Trade statistics
+    # ======================================================================
 
     def update_trade_stats(self, pnl: float):
-        """Update daily trade statistics"""
-        self.reset_daily_stats_if_needed()
-        
+        """Update trade statistics."""
         self.daily_trades += 1
-        self.total_trades += 1  # FIXED: Update total_trades
+        self.total_trades += 1
         self.daily_pnl += pnl
-        
+
         if pnl > 0:
-            self.daily_wins += 1
-            self.winning_trades += 1  # FIXED: Update winning_trades
-            logger.info(f"✓ Winning trade: {pnl:.2f}")
+            self.winning_trades += 1
+            logger.info(f"âœ“ Winning trade: ${pnl:.2f}")
         else:
-            self.daily_losses += 1
-            logger.info(f"✗ Losing trade: {pnl:.2f}")
-        
-        logger.info(f"Daily stats: trades={self.daily_trades}, P&L={self.daily_pnl:.2f}, wins={self.daily_wins}, losses={self.daily_losses}")
-        logger.info(f"Lifetime stats: total_trades={self.total_trades}, winning_trades={self.winning_trades}")
+            self.losing_trades += 1
+            logger.info(f"âœ— Losing trade: ${pnl:.2f}")
 
-    def get_daily_stats(self) -> Dict:
-        """Get daily statistics"""
-        self.reset_daily_stats_if_needed()
-        
-        win_rate = (self.daily_wins / self.daily_trades * 100) if self.daily_trades > 0 else 0
-        
-        return {
-            "trades": self.daily_trades,
-            "pnl": self.daily_pnl,
-            "wins": self.daily_wins,
-            "losses": self.daily_losses,
-            "win_rate": win_rate,
-            "open_trades": self.open_trades,
-        }
+        logger.info(
+            f"Daily stats: trades={self.daily_trades}, "
+            f"P&L={self.daily_pnl:.2f}, "
+            f"wins={self.winning_trades}, losses={self.losing_trades}"
+        )
 
+    def record_trade_opened(self):
+        """Record that a new trade has been opened."""
+        logger.debug(
+            f"Trade opened. Daily trade count (including this open) will be "
+            f"{self.daily_trades + 1}"
+        )
 
-if __name__ == "__main__":
-    rm = RiskManager()
-    print("RiskManager initialized")
-    
-    # Test balance
-    balance = rm.get_available_balance()
-    if balance:
-        print(f"✓ Balance: {balance['available']:.2f} USDT available")
-    
-    # Test trading allowed
-    allowed, reason = rm.check_trading_allowed()
-    print(f"Trading allowed: {allowed} - {reason}")
-    
-    # Test stats
-    stats = rm.get_daily_stats()
-    print(f"Daily stats: {stats}")
+    # ======================================================================
+    # Daily reset
+    # ======================================================================
+
+    def _reset_daily_counters(self):
+        now = datetime.utcnow()
+        if now.date() > self.last_reset.date():
+            logger.info("Resetting daily counters")
+            self.daily_trades = 0
+            self.daily_pnl = 0.0
+            self.last_reset = now
