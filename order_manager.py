@@ -208,7 +208,7 @@ class OrderManager:
                 side=tp_side,
                 order_type="stop_market",  # Trigger at tp_price, market fill
                 quantity=quantity,
-                stop_price=tp_price,  # Trigger price
+                trigger_price=tp_price,  # Trigger price
                 exchange=config.EXCHANGE,
                 symbol=config.SYMBOL,
             )
@@ -228,7 +228,7 @@ class OrderManager:
                 side=sl_side,
                 order_type="stop_market",  # Trigger at sl_price, market fill
                 quantity=quantity,
-                stop_price=sl_price,  # Trigger price
+                trigger_price=sl_price,  # Trigger price
                 exchange=config.EXCHANGE,
                 symbol=config.SYMBOL,
             )
