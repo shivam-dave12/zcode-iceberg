@@ -1186,88 +1186,134 @@ class ZScoreDataManager:
         else:
             return "NEUTRAL"
 
-    # Add these methods to your existing ZScoreDataManager class (after getltftrend)
+    # ==================================================================
+    # Aether metrics: CVD, LV, Hurst, BOS, LSTM proxy
+    # ==================================================================
 
-    def getcumulativevolumedelta(self, window_seconds: int = 300) -> float:
-        """Calculate CVD from recent trades. Positive = buy pressure."""
-        trades = self.getrecenttrades(window_seconds)
+    def get_cumulative_volume_delta(self, window_seconds: int = 300) -> float:
+        """
+        Calculate cumulative volume delta (CVD) from recent trades.
+        Positive value = aggressive buy pressure, negative = sell.
+        """
+        trades = self.get_recent_trades(window_seconds)
         if not trades:
             return 0.0
-        delta = sum(
-            float(t.get('qty', 0.0)) if not t.get('isBuyerMaker', False) else -float(t.get('qty', 0.0))
-            for t in trades if t.get('qty', 0.0) > 0
-        )
-        return delta
 
-    def getliquidityvolatility(self, timeframe: str = '1m', window_bars: int = 20) -> float:
-        """Orderbook liquidity volatility across timeframes."""
-        bids, asks = self.getorderbooksnapshot()
+        delta = 0.0
+        for t in trades:
+            try:
+                qty = float(t.get("qty", 0.0))
+            except Exception:
+                qty = 0.0
+            if qty <= 0.0:
+                continue
+            is_buyer_maker = bool(t.get("isBuyerMaker", False))
+            # On most venues: maker side flag; if buyer is maker, trade was sell‑initiated
+            delta += qty if not is_buyer_maker else -qty
+
+        return float(delta)
+
+    def get_liquidity_volatility(self, timeframe: str = "1m", window_bars: int = 20) -> float:
+        """
+        Orderbook liquidity 'volatility' proxy.
+        Uses top‑of‑book size normalized by price; capped to [0, 1].
+        """
+        bids, asks = self.get_orderbook_snapshot()
         if not bids or not asks:
             return 0.0
-        
-        # Mid-price volatility proxy from tightest levels
-        bid_vol = sum(qty for _, qty in bids[:5])  # Top 5 bid levels
-        ask_vol = sum(qty for _, qty in asks[:5])  # Top 5 ask levels
-        total_vol = bid_vol + ask_vol
-        
-        # Normalize by price (BTC context)
-        price = self.getlastprice()
-        if price == 0:
-            return 0.0
-        
-        liq_ratio = total_vol * price / 1000000  # Scale to BTC equivalent
-        return min(1.0, liq_ratio / window_bars)  # Cap at 1.0
 
-    def gethurstexponent(self, window_seconds: int = 600) -> float:
-        """Hurst exponent from price path (0.5=random, >0.5=trending)."""
-        prices = [p for _, p in self.getpricewindow(window_seconds)]
+        # Top 5 levels on each side
+        bid_vol = sum(qty for _, qty in bids[:5])
+        ask_vol = sum(qty for _, qty in asks[:5])
+        total_vol = bid_vol + ask_vol
+        if total_vol <= 0.0:
+            return 0.0
+
+        price = self.get_last_price()
+        if price <= 0.0:
+            return 0.0
+
+        # BTC‑normalized liquidity ratio; rough but stable
+        liq_ratio = (total_vol * price) / 1_000_000.0
+        score = liq_ratio / max(1, window_bars)
+        return float(max(0.0, min(1.0, score)))
+
+    def get_hurst_exponent(self, window_seconds: int = 600) -> float:
+        """
+        Hurst exponent on recent prices.
+        0.5 ~ random walk, >0.5 trending, <0.5 mean‑reverting.
+        """
+        prices = [p for _, p in self.get_price_window(window_seconds)]
         if len(prices) < 20:
             return 0.5
-        
-        try:
-            import numpy as np
-            prices = np.array(prices)
-            lags = range(2, min(20, len(prices)//4))
-            rs = []
-            for lag in lags:
-                rets = np.diff(np.log(prices))
-                mean_ret = np.mean(rets)
-                deviations = rets - mean_ret
-                cum_dev = np.cumsum(deviations)
-                R = np.max(cum_dev) - np.min(cum_dev)
-                S = np.std(rets)
-                if S > 0:
-                    rs.append(np.log(R/S))
-            if rs:
-                return np.polyfit(np.log(lags), rs, 1)[0]
-        except:
-            pass
-        return 0.5
 
-    def getbossignal(self) -> int:
-        """Break of Structure: 1=bullish, -1=bearish, 0=neutral."""
-        if len(self.bos15mcloses) < 3:
+        try:
+            prices_arr = np.asarray(prices, dtype=np.float64)
+            log_p = np.log(prices_arr + 1e-8)
+            returns = np.diff(log_p)
+            if len(returns) < 10:
+                return 0.5
+
+            lags = list(range(2, min(20, len(returns) // 2)))
+            rs_values = []
+            for lag in lags:
+                seg = returns[-lag:]
+                if len(seg) < 2:
+                    continue
+                dev = seg - seg.mean()
+                cum_dev = np.cumsum(dev)
+                R = float(cum_dev.max() - cum_dev.min())
+                S = float(seg.std())
+                if S <= 1e-10 or R <= 0.0:
+                    continue
+                rs_values.append(np.log(R / S))
+
+            if len(rs_values) < 2:
+                return 0.5
+
+            hurst = np.polyfit(np.log(lags[:len(rs_values)]), rs_values, 1)[0]
+            return float(max(0.0, min(1.0, hurst)))
+        except Exception:
+            return 0.5
+
+    def get_bos_signal(self) -> int:
+        """
+        Break of Structure on 15m closes.
+        1 = bullish HH, -1 = bearish LL, 0 = neutral.
+        """
+        closes = list(self._bos_15m_closes)
+        if len(closes) < 3:
             return 0
-        
-        recent = [p for _, p in list(self.bos15mcloses)[-3:]]
-        if len(recent) >= 3:
-            if recent[-1] > recent[-2] > recent[-3]:  # Higher highs
-                return 1
-            elif recent[-1] < recent[-2] < recent[-3]:  # Lower lows
-                return -1
+
+        last3 = [p for _, p in closes[-3:]]
+        if last3[2] > last3[1] > last3[0]:
+            return 1
+        if last3[2] < last3[1] < last3[0]:
+            return -1
         return 0
 
-    def getlstmprediction(self, timeframe: str = '1m') -> float:
-        """LSTM directional prediction (-1 to +1)."""
-        if timeframe == '1m' and self.ltf1mcloses:
-            closes = [p for _, p in list(self.ltf1mcloses)[-20:]]
-        elif self.htf5mcloses:
-            closes = [p for _, p in list(self.htf5mcloses)[-20:]]
+    def get_lstm_prediction(self, timeframe: str = "1m") -> float:
+        """
+        LSTM proxy: normalized momentum in [-1, 1] over chosen TF.
+        AetherOracle treats this as directional model score.
+        """
+        if timeframe == "1m":
+            buf = self._ltf_1m_closes
+        elif timeframe == "5m":
+            buf = self._htf_5m_closes
+        elif timeframe == "15m":
+            buf = self._bos_15m_closes
         else:
             return 0.0
-        
+
+        closes = [p for _, p in list(buf)[-20:]]
         if len(closes) < 10:
             return 0.0
-        
-        # Simple momentum proxy (production LSTM would use trained model)
-        return (closes[-1] - closes[0]) / closes[0]
+
+        first = closes[0]
+        last = closes[-1]
+        if first <= 0.0:
+            return 0.0
+
+        momentum = (last - first) / first
+        return float(max(-1.0, min(1.0, momentum)))
