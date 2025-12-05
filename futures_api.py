@@ -388,56 +388,78 @@ class FuturesAPI:
             if "error" in wallet:
                 return wallet
             
-            # Parse wallet response based on actual API structure
-            # The response structure may vary - adjust based on your actual API
+            # Log raw response for debugging
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.debug(f"[BALANCE DEBUG] Raw wallet response: {wallet}")
+            
+            # Try different response structures
+            # Structure 1: Direct fields at top level
+            if "availableBalance" in wallet or "available" in wallet:
+                return {
+                    "available": float(wallet.get("availableBalance", wallet.get("available", 0))),
+                    "locked": float(wallet.get("frozenBalance", wallet.get("locked", 0))),
+                    "currency": currency
+                }
+            
+            # Structure 2: Data wrapper with direct fields
             if "data" in wallet:
                 data = wallet["data"]
-                
-                # If data is a dict with balances array
-                if isinstance(data, dict) and "balances" in data:
-                    for bal in data["balances"]:
-                        if bal.get("currency") == currency or bal.get("asset") == currency:
-                            return {
-                                "available": float(bal.get("available", bal.get("free", 0))),
-                                "locked": float(bal.get("locked", 0)),
-                                "currency": currency
-                            }
-                
-                # If data is a direct balance object
-                elif isinstance(data, dict):
-                    return {
-                        "available": float(data.get("available", data.get("availableBalance", 0))),
-                        "locked": float(data.get("locked", data.get("frozenBalance", 0))),
-                        "currency": currency
-                    }
+                if isinstance(data, dict):
+                    if "availableBalance" in data or "available" in data:
+                        return {
+                            "available": float(data.get("availableBalance", data.get("available", 0))),
+                            "locked": float(data.get("frozenBalance", data.get("locked", 0))),
+                            "currency": currency
+                        }
+                    
+                    # Structure 3: Balances array
+                    if "balances" in data:
+                        for bal in data["balances"]:
+                            if bal.get("currency") == currency or bal.get("asset") == currency:
+                                return {
+                                    "available": float(bal.get("availableBalance", bal.get("available", bal.get("free", 0)))),
+                                    "locked": float(bal.get("frozenBalance", bal.get("locked", 0))),
+                                    "currency": currency
+                                }
             
-            # If wallet is the direct data (no "data" wrapper)
-            elif isinstance(wallet, dict):
-                # Check if it has balances array
-                if "balances" in wallet:
-                    for bal in wallet["balances"]:
-                        if bal.get("currency") == currency or bal.get("asset") == currency:
-                            return {
-                                "available": float(bal.get("available", bal.get("free", 0))),
-                                "locked": float(bal.get("locked", 0)),
-                                "currency": currency
-                            }
-                # Direct balance fields
-                else:
-                    return {
-                        "available": float(wallet.get("available", wallet.get("availableBalance", 0))),
-                        "locked": float(wallet.get("locked", wallet.get("frozenBalance", 0))),
-                        "currency": currency
-                    }
+            # Structure 4: Direct balances array at top level
+            if "balances" in wallet:
+                for bal in wallet["balances"]:
+                    if bal.get("currency") == currency or bal.get("asset") == currency:
+                        return {
+                            "available": float(bal.get("availableBalance", bal.get("available", bal.get("free", 0)))),
+                            "locked": float(bal.get("frozenBalance", bal.get("locked", 0))),
+                            "currency": currency
+                        }
             
-            # If nothing matches, return error
+            # Structure 5: Result wrapper
+            if "result" in wallet:
+                result = wallet["result"]
+                if isinstance(result, dict):
+                    if "availableBalance" in result or "available" in result:
+                        return {
+                            "available": float(result.get("availableBalance", result.get("available", 0))),
+                            "locked": float(result.get("frozenBalance", result.get("locked", 0))),
+                            "currency": currency
+                        }
+            
+            # If nothing matches, log the full response and return error
+            logger.error(f"[BALANCE PARSING] Could not parse balance. Full response: {wallet}")
             return {
-                "error": "Could not parse wallet balance",
-                "raw_response": wallet
+                "error": "Could not parse wallet balance - check logs for raw response",
+                "raw_response": wallet,
+                "available": 0.0,
+                "locked": 0.0,
+                "currency": currency
             }
             
         except Exception as e:
-            return {"error": f"Exception getting balance: {str(e)}"}
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.exception(f"Exception getting balance: {e}")
+            return {"error": f"Exception getting balance: {str(e)}", "available": 0.0, "locked": 0.0, "currency": currency}
+
 
 
 if __name__ == "__main__":

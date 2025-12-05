@@ -366,46 +366,91 @@ class AetherOracle:
         htf_trend: Optional[str],
         ltf_trend: Optional[str],
     ) -> OracleInputs:
-        """
-        Gather all metrics for fusion.
-        """
-        ema_val = None
-        atr_pct = None
-        try:
-            ema_val = data_manager.get_ema(period=config.EMA_PERIOD)
-        except:
-            pass
-        try:
-            atr_pct = data_manager.get_atr_percent(window_minutes=config.ATR_WINDOW_MINUTES)
-        except:
-            pass
+        """Build oracle inputs with comprehensive error handling"""
         
-        lv_1m, lv_5m, lv_15m, micro_trap = self.compute_liquidity_velocity_multi_tf(data_manager)
-        norm_cvd = self.compute_norm_cvd(data_manager, window_sec=config.DELTA_WINDOW_SEC)
-        hurst = self.compute_hurst_exponent(data_manager, window_ticks=20)
-        bos_align = self.compute_bos_alignment(data_manager, current_price=current_price)
+        # Normalized CVD
+        norm_cvd = None
+        try:
+            cvd = data_manager.get_cumulative_volume_delta()
+            if cvd is not None:
+                norm_cvd = max(-1.0, min(1.0, cvd / 100.0))
+        except Exception as e:
+            logger.error(f"Error calculating CVD: {e}")
         
-        now_sec = time.time()
+        # Liquidity Volatility (1m, 5m, 15m)
+        lv_1m = None
+        lv_5m = None
+        lv_15m = None
+        try:
+            lv_1m = data_manager.get_liquidity_volatility(timeframe="1m")
+            logger.debug(f"[LV DEBUG] 1m: {lv_1m}")
+        except Exception as e:
+            logger.error(f"Error calculating LV 1m: {e}")
+        
+        try:
+            lv_5m = data_manager.get_liquidity_volatility(timeframe="5m")
+            logger.debug(f"[LV DEBUG] 5m: {lv_5m}")
+        except Exception as e:
+            logger.error(f"Error calculating LV 5m: {e}")
+        
+        try:
+            lv_15m = data_manager.get_liquidity_volatility(timeframe="15m")
+            logger.debug(f"[LV DEBUG] 15m: {lv_15m}")
+        except Exception as e:
+            logger.error(f"Error calculating LV 15m: {e}")
+        
+        # Hurst Exponent
+        hurst = None
+        try:
+            hurst = data_manager.get_hurst_exponent()
+        except Exception as e:
+            logger.error(f"Error calculating Hurst: {e}")
+        
+        # BOS (Break of Structure)
+        bos_signal = None
+        try:
+            bos_signal = data_manager.get_bos_signal()
+        except Exception as e:
+            logger.error(f"Error calculating BOS: {e}")
+        
+        # LSTM Predictions
+        lstm_1m = None
+        lstm_5m = None
+        lstm_15m = None
+        try:
+            lstm_1m = data_manager.get_lstm_prediction(timeframe="1m")
+        except Exception as e:
+            logger.error(f"Error getting LSTM 1m: {e}")
+        
+        try:
+            lstm_5m = data_manager.get_lstm_prediction(timeframe="5m")
+        except Exception as e:
+            logger.error(f"Error getting LSTM 5m: {e}")
+        
+        try:
+            lstm_15m = data_manager.get_lstm_prediction(timeframe="15m")
+        except Exception as e:
+            logger.error(f"Error getting LSTM 15m: {e}")
         
         return OracleInputs(
+            current_price=current_price,
             imbalance_data=imbalance_data,
             wall_data=wall_data,
             delta_data=delta_data,
             touch_data=touch_data,
             htf_trend=htf_trend,
             ltf_trend=ltf_trend,
-            ema_val=ema_val,
-            atr_pct=atr_pct,
+            norm_cvd=norm_cvd,
             lv_1m=lv_1m,
             lv_5m=lv_5m,
             lv_15m=lv_15m,
-            micro_trap=micro_trap,
-            norm_cvd=norm_cvd,
             hurst=hurst,
-            bos_align=bos_align,
-            current_price=current_price,
-            now_sec=now_sec,
+            bos_signal=bos_signal,
+            lstm_1m=lstm_1m,
+            lstm_5m=lstm_5m,
+            lstm_15m=lstm_15m,
         )
+
 
     def compute_side_scores(
         self,
