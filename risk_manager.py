@@ -51,15 +51,19 @@ class RiskManager:
             self.daily_losses = 0
             self.last_reset_date = current_date
     
-    def get_available_balance(self) -> Optional[Dict]:
+    def get_available_balance(self, force_refresh: bool = False) -> Optional[Dict]:
         """
         Get available balance with CORRECT CoinSwitch API parsing (1 call per 3 seconds MAX)
+        
+        Args:
+            force_refresh: If True, bypass cache and force fresh API call
+        
         Response format: response["data"]["base_asset_balances"][0]["balances"]["total_available_balance"]
         """
         now = time.time()
         
-        # GLOBAL RATE LIMIT - 1 call per 3 seconds MAX
-        if now - self._last_balance_time < 3.0:
+        # GLOBAL RATE LIMIT - 1 call per 3 seconds MAX (unless force_refresh)
+        if not force_refresh and now - self._last_balance_time < 3.0:
             logger.debug("Balance rate limited - using cache")
             return self._cached_balance
         
@@ -98,6 +102,7 @@ class RiskManager:
         except Exception as e:
             logger.error(f"Error fetching balance: {e}")
             return self._cached_balance
+
     
     def check_trading_allowed(self) -> Tuple[bool, str]:
         """Check if trading is allowed based on risk limits"""
