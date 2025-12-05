@@ -195,6 +195,16 @@ LOG_POSITION_INTERVAL_SEC = 180.0  # Log position every 3 min
 TELEGRAM_REPORT_INTERVAL_SEC = 900.0  # Telegram report every 15 min
 BALANCE_CACHE_TTL_SEC = 300.0  # Cache balance for 5 min
 
+
+# Risk limits (add at end if missing)
+MAX_CONCURRENT_POSITIONS = 1
+MAX_DAILY_TRADES = 100
+MAX_DAILY_LOSS = 50.0
+MIN_MARGIN_PER_TRADE = 4.0
+MAX_MARGIN_PER_TRADE = 10000.0
+
+
+
 # ============================================================================
 # DISPLAY
 # ============================================================================
