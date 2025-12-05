@@ -1171,16 +1171,20 @@ class ZScoreDataManager:
         return self._last_ltf_trend
 
 
-    def get_vol_regime(self, atr_pct: Optional[float] = None) -> str:
-        """Volatility regime classifier: LOW <0.15%, HIGH >0.30%, NEUTRAL else."""
+    def get_vol_regime(self, atr_pct: Optional[float]) -> str:
+        """
+        Classify volatility regime based on ATR%.
+        Returns: 'LOW', 'NEUTRAL', or 'HIGH'
+        """
         if atr_pct is None:
-            atr_pct = self.get_atr_percent()
-        if atr_pct is None:
-            return "NEUTRAL"  # Default neutral if no ATR data
+            return "NEUTRAL"
         
         if atr_pct < config.VOL_REGIME_LOW_ATR_PCT:
-            return "LOW"
+            regime = "LOW"
         elif atr_pct > config.VOL_REGIME_HIGH_ATR_PCT:
-            return "HIGH"
+            regime = "HIGH"
         else:
-            return "NEUTRAL"
+            regime = "NEUTRAL"
+        
+        logger.debug(f"[VOL-REGIME] ATR%={atr_pct*100:.3f}% → {regime}")
+        return regime

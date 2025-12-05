@@ -47,7 +47,7 @@ class FuturesWebSocket:
 
     def _setup_handlers(self):
         """Setup WebSocket event handlers"""
-
+        
         @self.sio.event(namespace=self.NAMESPACE)
         def connect():
             self.is_connected = True
@@ -65,92 +65,49 @@ class FuturesWebSocket:
             print(f"✗ Connection error: {data}")
             logger.error(f"Connection error: {data}")
 
-        # CATCH-ALL HANDLER to see every message
-        @self.sio.on('*', namespace=self.NAMESPACE)
-        def catch_all(event, *args):
-            self._message_count += 1
-            data = args[0] if args else None
-            logger.info(
-                f"[WS MSG #{self._message_count}] event='{event}' | "
-                f"data_type={type(data).__name__} | "
-                f"data_keys={list(data.keys()) if isinstance(data, dict) else 'N/A'}"
-            )
-            
-            # Log first 200 chars of data for debugging
-            data_str = str(data)[:200]
-            logger.debug(f"  data_sample: {data_str}")
-
-        # Orderbook handler (production)
+        # Orderbook - INSTANT callback trigger
         @self.sio.on(self.EVENT_ORDERBOOK, namespace=self.NAMESPACE)
         def on_orderbook(data):
-            # Ignore subscription acks
-            if isinstance(data, dict) and ("bids" in data and "asks" in data):
+            if isinstance(data, dict) and ("bids" in data or "b" in data):
                 formatted = {
-                    "b": data["bids"],
-                    "a": data["asks"],
+                    "b": data.get("bids", data.get("b", [])),
+                    "a": data.get("asks", data.get("a", [])),
                     "timestamp": data.get("timestamp"),
                     "symbol": data.get("s"),
                 }
                 for callback in self.orderbook_callbacks:
                     try:
                         callback(formatted)
-                    except Exception:
-                        pass
-            # else: ignore acks
+                    except Exception as e:
+                        logger.error(f"Orderbook callback error: {e}")
 
-        # Trades handler (production)
+        # Trades - INSTANT callback trigger
         @self.sio.on(self.EVENT_TRADES, namespace=self.NAMESPACE)
         def on_trades(data):
-            # Ignore subscription acks
-            if isinstance(data, dict) and all(k in data for k in ("E", "p", "q")):
+            if isinstance(data, dict) and "p" in data:
                 formatted = {
                     "p": data.get("p"),
                     "q": data.get("q"),
-                    "T": data.get("E"),
+                    "T": data.get("E", data.get("T")),
                     "m": data.get("m"),
                     "s": data.get("s"),
                 }
                 for callback in self.trades_callbacks:
                     try:
                         callback(formatted)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.error(f"Trade callback error: {e}")
 
-        # Candlestick handler (official format - direct object)
+        # Candlestick - INSTANT callback trigger
         @self.sio.on(self.EVENT_CANDLESTICK, namespace=self.NAMESPACE)
         def on_candlestick(data):
-            logger.debug(f"[CANDLESTICK HANDLER] Callback fired! data_type={type(data).__name__}")
-            
-            try:
-                # Official format: Direct dict with "o", "h", "l", "c", "v", etc.
-                if isinstance(data, dict):
-                    for callback in self.candlestick_callbacks:
-                        try:
-                            callback(data)
-                        except Exception as e:
-                            logger.error(f"Error in candlestick callback: {e}", exc_info=True)
-                            
-            except Exception as e:
-                logger.error(f"Error in on_candlestick handler: {e}", exc_info=True)
+            if isinstance(data, dict) and "c" in data:
+                for callback in self.candlestick_callbacks:
+                    try:
+                        callback(data)
+                    except Exception as e:
+                        logger.error(f"Candlestick callback error: {e}")
 
-        # Ticker handler (official format - dict with multiple symbols)
-        @self.sio.on(self.EVENT_TICKER, namespace=self.NAMESPACE)
-        def on_ticker(data):
-            logger.debug(f"[TICKER HANDLER] Callback fired! data_type={type(data).__name__}")
-            
-            try:
-                # Official format: {"BTCUSDT": {...}, "ETHUSDT": {...}}
-                if isinstance(data, dict):
-                    for symbol, ticker_data in data.items():
-                        if isinstance(ticker_data, dict):
-                            for callback in self.ticker_callbacks:
-                                try:
-                                    callback(ticker_data)
-                                except Exception as e:
-                                    logger.error(f"Error in ticker callback: {e}", exc_info=True)
-                                    
-            except Exception as e:
-                logger.error(f"Error in on_ticker handler: {e}", exc_info=True)
 
     def connect(self, timeout: int = 30) -> bool:
         """Connect to WebSocket server"""
