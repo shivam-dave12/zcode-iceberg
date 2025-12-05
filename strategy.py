@@ -1,6 +1,6 @@
 """
 Z-Score Strategy with comprehensive parameter logging every minute
-FIXED: Removed duplicate OracleInputs, improved error handling
+FINAL FIX: Corrected bos_signal → bos_align field access
 """
 
 import time
@@ -259,7 +259,10 @@ class ZScoreIcebergHunterStrategy:
         oracle_outputs: Optional[OracleOutputs],
         side: str,
     ) -> Tuple[float, List[str]]:
-        """Compute Aether fusion score."""
+        """
+        Compute Aether fusion score.
+        FIXED: Changed oracle_inputs.bos_signal → oracle_inputs.bos_align
+        """
         if oracle_inputs is None or oracle_outputs is None:
             return 0.0, ["aether=MISSING"]
         
@@ -287,7 +290,6 @@ class ZScoreIcebergHunterStrategy:
             components.append((lv_score, config.AETHER_LV_WEIGHT))
             reasons.append(f"lv={lv_score:.3f}")
         else:
-            # LV not available - log debug info
             logger.debug(f"[AETHER] LV data unavailable: 1m={oracle_inputs.lv_1m}, 5m={oracle_inputs.lv_5m}, 15m={oracle_inputs.lv_15m}")
             reasons.append("lv=N/A")
         
@@ -295,15 +297,25 @@ class ZScoreIcebergHunterStrategy:
         if oracle_inputs.hurst is not None:
             # Hurst > 0.5 = trending, < 0.5 = mean-reverting
             # Normalize to [0, 1] where 0.5 is neutral
-            hurst_score = abs(oracle_inputs.hurst - 0.5) * 2.0  # 0 = neutral, 1 = strong signal
+            hurst_score = abs(oracle_inputs.hurst - 0.5) * 2.0
             components.append((hurst_score, config.AETHER_HURST_BOS_WEIGHT * 0.5))
             reasons.append(f"hurst={hurst_score:.3f}")
         
-        # BOS Component
-        if oracle_inputs.bos_signal is not None:
-            bos_score = 1.0 if oracle_inputs.bos_signal == side else 0.0
+        # BOS Component - FIXED: Changed from bos_signal to bos_align
+        if oracle_inputs.bos_align is not None:
+            # bos_align is [0, 1] where 0.5 is neutral
+            # Convert to directional score for the side
+            if side == "long":
+                # For long: higher bos_align (bullish) is better
+                bos_score = oracle_inputs.bos_align
+            else:
+                # For short: lower bos_align (bearish) is better
+                bos_score = 1.0 - oracle_inputs.bos_align
+            
             components.append((bos_score, config.AETHER_HURST_BOS_WEIGHT * 0.5))
             reasons.append(f"bos={bos_score:.3f}")
+        else:
+            reasons.append("bos=N/A")
         
         # LSTM Component (average predictions)
         lstm_vals = [oracle_inputs.lstm_1m, oracle_inputs.lstm_5m, oracle_inputs.lstm_15m]
@@ -316,6 +328,8 @@ class ZScoreIcebergHunterStrategy:
                 lstm_score = max(0.0, min(1.0, (-lstm_avg + 1.0) / 2.0))
             components.append((lstm_score, config.AETHER_LSTM_WEIGHT))
             reasons.append(f"lstm={lstm_score:.3f}")
+        else:
+            reasons.append("lstm=N/A")
         
         # Calculate weighted average
         if not components:
@@ -326,7 +340,7 @@ class ZScoreIcebergHunterStrategy:
         aether_score = num / den if den > 0 else 0.0
         
         return aether_score, reasons
-
+        
     # ======================================================================
     # MAIN TICK HANDLER
     # ======================================================================
