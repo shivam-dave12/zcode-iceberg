@@ -373,92 +373,77 @@ class FuturesAPI:
 
     def get_balance(self, currency: str = "USDT") -> Dict:
         """
-        Get balance for specific currency (wrapper around get_wallet_balance)
-        
-        Args:
-            currency: Currency to get balance for (default: USDT)
-            
-        Returns:
-            Dict with 'available', 'locked', 'currency' keys
+        Get futures wallet balance for a base asset (e.g. USDT).
+
+        Uses the actual CoinSwitch response structure observed in logs:
+        {
+          "data": {
+            "base_asset_balances": [
+              {
+                "base_asset": "USDT",
+                "balances": {
+                  "total_balance": "100.6873",
+                  "total_available_balance": "100.6873",
+                  "total_blocked_balance": "0",
+                  "total_position_margin": "0",
+                  "total_open_order_margin": "0"
+                }
+              },
+              ...
+            ],
+            "asset": [ ... per-symbol rows ... ]
+          }
+        }
         """
+        result = {
+            "available": 0.0,
+            "locked": 0.0,
+            "currency": currency,
+        }
+
         try:
             wallet = self.get_wallet_balance()
-            
-            # Check for errors in response
-            if "error" in wallet:
-                return wallet
-            
-            # Log raw response for debugging
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.debug(f"[BALANCE DEBUG] Raw wallet response: {wallet}")
-            
-            # Try different response structures
-            # Structure 1: Direct fields at top level
-            if "availableBalance" in wallet or "available" in wallet:
-                return {
-                    "available": float(wallet.get("availableBalance", wallet.get("available", 0))),
-                    "locked": float(wallet.get("frozenBalance", wallet.get("locked", 0))),
-                    "currency": currency
-                }
-            
-            # Structure 2: Data wrapper with direct fields
-            if "data" in wallet:
-                data = wallet["data"]
-                if isinstance(data, dict):
-                    if "availableBalance" in data or "available" in data:
-                        return {
-                            "available": float(data.get("availableBalance", data.get("available", 0))),
-                            "locked": float(data.get("frozenBalance", data.get("locked", 0))),
-                            "currency": currency
-                        }
-                    
-                    # Structure 3: Balances array
-                    if "balances" in data:
-                        for bal in data["balances"]:
-                            if bal.get("currency") == currency or bal.get("asset") == currency:
-                                return {
-                                    "available": float(bal.get("availableBalance", bal.get("available", bal.get("free", 0)))),
-                                    "locked": float(bal.get("frozenBalance", bal.get("locked", 0))),
-                                    "currency": currency
-                                }
-            
-            # Structure 4: Direct balances array at top level
-            if "balances" in wallet:
-                for bal in wallet["balances"]:
-                    if bal.get("currency") == currency or bal.get("asset") == currency:
-                        return {
-                            "available": float(bal.get("availableBalance", bal.get("available", bal.get("free", 0)))),
-                            "locked": float(bal.get("frozenBalance", bal.get("locked", 0))),
-                            "currency": currency
-                        }
-            
-            # Structure 5: Result wrapper
-            if "result" in wallet:
-                result = wallet["result"]
-                if isinstance(result, dict):
-                    if "availableBalance" in result or "available" in result:
-                        return {
-                            "available": float(result.get("availableBalance", result.get("available", 0))),
-                            "locked": float(result.get("frozenBalance", result.get("locked", 0))),
-                            "currency": currency
-                        }
-            
-            # If nothing matches, log the full response and return error
-            logger.error(f"[BALANCE PARSING] Could not parse balance. Full response: {wallet}")
+
+            # Basic error pass-through
+            if not isinstance(wallet, dict):
+                return {"error": "wallet response not dict", "raw_response": wallet, **result}
+
+            data = wallet.get("data")
+            if not isinstance(data, dict):
+                return {"error": "wallet.data missing or not dict", "raw_response": wallet, **result}
+
+            base_list = data.get("base_asset_balances")
+            if not isinstance(base_list, list):
+                return {"error": "wallet.data.base_asset_balances missing or not list", "raw_response": wallet, **result}
+
+            # Find the entry for the requested base asset (USDT)
+            for entry in base_list:
+                if entry.get("base_asset") == currency:
+                    balances = entry.get("balances", {})
+                    total_avail_str = balances.get("total_available_balance", "0")
+                    total_blocked_str = balances.get("total_blocked_balance", "0")
+
+                    available = float(total_avail_str)
+                    locked = float(total_blocked_str)
+
+                    return {
+                        "available": available,
+                        "locked": locked,
+                        "currency": currency,
+                    }
+
+            # If we reach here, USDT was not found
             return {
-                "error": "Could not parse wallet balance - check logs for raw response",
+                "error": f"base_asset {currency} not found in base_asset_balances",
                 "raw_response": wallet,
-                "available": 0.0,
-                "locked": 0.0,
-                "currency": currency
+                **result,
             }
-            
+
         except Exception as e:
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.exception(f"Exception getting balance: {e}")
-            return {"error": f"Exception getting balance: {str(e)}", "available": 0.0, "locked": 0.0, "currency": currency}
+            return {
+                "error": f"Exception in get_balance: {e}",
+                **result,
+            }
 
 
 
