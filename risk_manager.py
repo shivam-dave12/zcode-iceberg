@@ -44,7 +44,7 @@ class RiskManager:
         self._balance_cache_ttl_sec: float = 5.0
         self._last_429_log: float = 0.0
 
-        logger.info("✓ RiskManager initialized")
+        logger.info("âœ“ RiskManager initialized")
 
     # ======================================================================
     # Trading permissions
@@ -93,108 +93,86 @@ class RiskManager:
     # ======================================================================
 
     def get_available_balance(self) -> Optional[Dict]:
-        """
-        Get available USDT futures wallet balance via new API.
-
-        - Uses a short cache (5 seconds) to respect rate limits.
-        - On 429 Too Many Requests, keeps and returns last cached value.
-        """
         now = time.time()
-
-        if (
-            self._balance_cache is not None
-            and (now - self._last_balance_fetch) < self._balance_cache_ttl_sec
-        ):
+        # Use longer cache to avoid hammering endpoints
+        if self._balance_cache is not None and (now - self._last_balance_fetch) < getattr(self, "_balance_cache_ttl_sec", 30.0):
             return self._balance_cache
 
-        try:
-            response = self.api.get_wallet_balance()
+        backoff = 0.5
+        for attempt in range(4):
+            try:
+                response = self.api.get_wallet_balance()
+                # Some _make_request wrappers return error dicts with status_code
+                if isinstance(response, dict) and response.get("status_code") == 429:
+                    if now - self._last_429_log > 5.0:
+                        logger.error("Failed to get balance: 429 Too Many Requests. Using cached balance if available.")
+                        self._last_429_log = now
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
 
-            if isinstance(response, dict) and response.get("status_code") == 429:
-                if now - self._last_429_log > 5.0:
-                    logger.error(
-                        "Failed to get balance: 429 Too Many Requests. "
-                        "Using cached balance if available."
-                    )
-                    self._last_429_log = now
+                if "data" in response:
+                    data = response["data"]
+                    base_balances = data.get("base_asset_balances", [])
+                    usdt_balance = next((b for b in base_balances if b.get("base_asset") == "USDT"), None)
+                    if usdt_balance:
+                        balances = usdt_balance.get("balances", {})
+                        result = {
+                            "total": float(balances.get("total_balance", 0)),
+                            "available": float(balances.get("total_available_balance", 0)),
+                            "blocked": float(balances.get("total_blocked_balance", 0)),
+                            "currency": "USDT",
+                        }
+                        self._balance_cache = result
+                        self._last_balance_fetch = now
+                        return result
+                    else:
+                        logger.warning("USDT balance not found in wallet response")
+                        return self._balance_cache
+
+                logger.error(f"Failed to get balance: {response}")
                 return self._balance_cache
 
-            if "data" in response:
-                data = response["data"]
-                base_balances = data.get("base_asset_balances", [])
-                usdt_balance = next(
-                    (b for b in base_balances if b.get("base_asset") == "USDT"),
-                    None,
-                )
+            except Exception as e:
+                logger.error(f"Error getting balance (attempt {attempt+1}): {e}", exc_info=True)
+                time.sleep(backoff)
+                backoff *= 2
 
-                if usdt_balance:
-                    balances = usdt_balance.get("balances", {})
-                    result = {
-                        "total": float(balances.get("total_balance", 0)),
-                        "available": float(balances.get("total_available_balance", 0)),
-                        "blocked": float(balances.get("total_blocked_balance", 0)),
-                        "currency": "USDT",
-                    }
-
-                    self._balance_cache = result
-                    self._last_balance_fetch = now
-
-                    logger.debug(
-                        "Wallet balance fetched: "
-                        f"total={result['total']:.4f}, "
-                        f"available={result['available']:.4f}, "
-                        f"blocked={result['blocked']:.4f}"
-                    )
-                    return result
-                else:
-                    logger.warning("USDT balance not found in wallet response")
-                    return self._balance_cache
-
-            logger.error(f"Failed to get balance: {response}")
-            return self._balance_cache
-
-        except Exception as e:
-            logger.error(f"Error getting balance: {e}", exc_info=True)
-            return self._balance_cache
+        # After retries, return cached or None
+        return self._balance_cache
 
     # ======================================================================
     # Legacy HF position sizing (kept for compatibility)
     # ======================================================================
 
-    def calculate_position_size(
-        self, entry_price: float, stop_loss_price: float, current_balance: float = None
-    ) -> float:
+    def calculate_position_size_vol_regime(
+        self, entry_price: float, regime: str, current_balance: float = None
+    ) -> tuple:
         """
-        Legacy HF method (kept for compatibility), not used by Z-Score strategy.
+        Calculate position size based on vol regime.
+        Returns: (quantity, margin_used)
         """
-        try:
-            if current_balance is None:
-                balance_info = self.get_available_balance()
-                if not balance_info:
-                    logger.error("Could not fetch balance for HF position sizing")
-                    return 0.001
-                current_balance = balance_info["available"]
+        if current_balance is None:
+            balance_info = self.get_available_balance()
+            if not balance_info:
+                logger.error("Could not fetch balance for vol-regime sizing")
+                return 0.001, 0.0
+            current_balance = balance_info["available"]
+        
+        if regime == "HIGH":
+            size_pct = config.VOL_REGIME_HIGH_SIZE_PCT / 100.0
+        else:
+            size_pct = config.VOL_REGIME_LOW_SIZE_PCT / 100.0
+        
+        margin_used = current_balance * size_pct
+        margin_used = max(config.MIN_MARGIN_PER_TRADE, min(margin_used, config.MAX_MARGIN_PER_TRADE))
+        
+        quantity = (margin_used * config.LEVERAGE) / entry_price
+        quantity = max(0.001, round(quantity, 6))
+        
+        logger.info(f"[VOL-SIZING] regime={regime}, size_pct={size_pct*100:.1f}%, margin={margin_used:.2f}, qty={quantity:.6f}")
+        return quantity, margin_used
 
-            risk_amount = min(20, current_balance * 0.02)
-            price_diff = abs(entry_price - stop_loss_price)
-            if price_diff == 0:
-                logger.warning("Stop loss same as entry price in HF calc")
-                return 0.001
-
-            position_size = risk_amount / price_diff
-            position_size = max(0.001, position_size)
-            position_size = min(2.0, position_size)
-
-            position_value = position_size * entry_price
-            if position_value > 50000:
-                position_size = 50000 / entry_price
-
-            logger.info(f"HF calc position size: {position_size:.6f} BTC")
-            return round(position_size, 6)
-
-        except Exception as e:
-            logger.error(f"Error calculating position size: {e}", exc_info=True)
-            return 0.001
 
     # ======================================================================
     # Trade statistics
@@ -208,10 +186,10 @@ class RiskManager:
 
         if pnl > 0:
             self.winning_trades += 1
-            logger.info(f"✓ Winning trade: ${pnl:.2f}")
+            logger.info(f"âœ“ Winning trade: ${pnl:.2f}")
         else:
             self.losing_trades += 1
-            logger.info(f"✗ Losing trade: ${pnl:.2f}")
+            logger.info(f"âœ— Losing trade: ${pnl:.2f}")
 
         logger.info(
             f"Daily stats: trades={self.daily_trades}, "

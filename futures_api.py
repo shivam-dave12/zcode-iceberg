@@ -343,6 +343,32 @@ class FuturesAPI:
         params = {"exchange": exchange}
         return self._make_request("GET", endpoint, params=params, payload={})
 
+    # -------------------------
+    # REST klines / candles API
+    # -------------------------
+    def get_klines(self, symbol: str, interval: int = 1, limit: int = 100, exchange: str = "EXCHANGE_2") -> Dict:
+        """
+        Retrieve historical klines/candles for warmup.
+          - symbol: "BTCUSDT"
+          - interval: minutes (1,5,15,...)
+          - limit: number of bars
+        Returns parsed JSON or error dict.
+        """
+        # Best-effort endpoint name / params (adjust if your exchange uses different names)
+        endpoint = "/trade/api/v2/futures/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": limit, "exchange": exchange}
+        try:
+            resp = self._make_request("GET", endpoint, params=params, payload={})
+            return resp
+        except Exception as e:
+            return {"error": str(e)}
+
+    # Alternate names some adapters use
+    def get_candles(self, symbol: str, interval: int = 1, limit: int = 100, exchange: str = "EXCHANGE_2") -> Dict:
+        return self.get_klines(symbol=symbol, interval=interval, limit=limit, exchange=exchange)
+
+    def fetch_klines(self, *args, **kwargs):
+        return self.get_klines(*args, **kwargs)
 
 if __name__ == "__main__":
     # Quick test
