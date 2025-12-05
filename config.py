@@ -34,7 +34,7 @@ TIMEFRAME = "tick"
 CANDLE_INTERVAL = 1
 CANDLE_LIMIT = 200
 MIN_CANDLES_FOR_TRADING = 50
-POSITION_CHECK_INTERVAL = 0.05  # 50ms event-driven
+POSITION_CHECK_INTERVAL = 0.05
 
 # ============================================================================
 # TRADING RULES / DAILY RISK
@@ -63,13 +63,13 @@ REQUEST_TIMEOUT = 30
 TICK_SIZE = 1.0
 WALL_DEPTH_LEVELS = 20
 IMBALANCE_THRESHOLD = 0.65
-DELTA_Z_THRESHOLD = 2.1  # Base (dynamically scaled by vol-regime)
+DELTA_Z_THRESHOLD = 2.1
 DELTA_WINDOW_SEC = 10
 ZONE_TICKS = 12
 PRICE_TOUCH_THRESHOLD_TICKS = 4
-MIN_WALL_VOLUME_MULT = 4.2  # Base (dynamically scaled)
-PROFIT_TARGET_ROI = 0.10
-STOP_LOSS_ROI = -0.03
+MIN_WALL_VOLUME_MULT = 4.2
+PROFIT_TARGET_ROI = 0.05  # 5% profit on margin
+STOP_LOSS_ROI = 0.01  # 1% loss on margin
 WALL_DEGRADE_EXIT = 0.0005
 MAX_HOLD_MINUTES = 10
 SLIPPAGE_TICKS_ASSUMED = 1
@@ -92,13 +92,13 @@ MIN_TREND_SLOPE = 0.0003
 CONSISTENCY_THRESHOLD = 0.60
 
 # ============================================================================
-# LTF TREND (1m) - DISABLED PER REQUEST
+# LTF TREND (1m) - DISABLED
 # ============================================================================
 LTF_EMA_SPAN = 12
 LTF_LOOKBACK_BARS = 30
 LTF_MIN_TREND_SLOPE = 0.0002
 LTF_CONSISTENCY_THRESHOLD = 0.52
-USE_LTF_TREND = False  # DISABLED - only HTF + EMA20
+USE_LTF_TREND = False
 
 # ============================================================================
 # FEE CONFIGURATION
@@ -129,10 +129,10 @@ DYNAMIC_TP_REQUIRED_PROGRESS = 0.5
 DYNAMIC_TP_MIN_ATR_PCT = 0.003
 
 # ============================================================================
-# VOLATILITY REGIME DETECTION (NEW)
+# VOLATILITY REGIME DETECTION
 # ============================================================================
-VOL_REGIME_LOW_ATR_PCT = 0.0015  # LOW < 0.15%
-VOL_REGIME_HIGH_ATR_PCT = 0.0030  # HIGH > 0.30%
+VOL_REGIME_LOW_ATR_PCT = 0.0015
+VOL_REGIME_HIGH_ATR_PCT = 0.0030
 VOL_REGIME_BASE_Z_THRESH = 2.1
 VOL_REGIME_Z_SCALE_FACTOR = 0.3
 VOL_REGIME_Z_NORMALIZE_PCT = 0.0015
@@ -140,42 +140,36 @@ VOL_REGIME_BASE_WALL_MULT = 4.2
 VOL_REGIME_HIGH_WALL_MULT = 3.8
 VOL_REGIME_LOW_WALL_MULT = 4.2
 
-# Dynamic TP/SL per regime
-VOL_REGIME_HIGH_TP_MULT = 1.40  # +40%
-VOL_REGIME_HIGH_SL_MULT = 0.90  # -10%
-VOL_REGIME_LOW_TP_MULT = 1.10  # +10%
-VOL_REGIME_LOW_SL_MULT = 0.97  # -3%
+VOL_REGIME_HIGH_TP_MULT = 1.40
+VOL_REGIME_HIGH_SL_MULT = 0.90
+VOL_REGIME_LOW_TP_MULT = 1.10
+VOL_REGIME_LOW_SL_MULT = 0.97
 
-# Position sizing per regime
 VOL_REGIME_HIGH_SIZE_PCT = 15.0
 VOL_REGIME_LOW_SIZE_PCT = 20.0
 
-# Trailing SL in HIGH vol
 HIGH_VOL_TRAIL_PROFIT_PCT = 0.10
 HIGH_VOL_TRAIL_BUFFER_PCT = 0.0005
 
 # ============================================================================
-# WEIGHTED SCORE GAUNTLET (NEW)
+# WEIGHTED SCORE GAUNTLET
 # ============================================================================
 SCORE_ENTRY_THRESHOLD = 0.75
 SCORE_EXIT_THRESHOLD = 0.50
 RANGE_BONUS_LOW = 0.8
 RANGE_BONUS_HIGH = 0.5
 
-# 5-signal core (65% weight)
 SCORE_IMB_WEIGHT = 0.25
 SCORE_WALL_WEIGHT = 0.20
 SCORE_Z_WEIGHT = 0.30
 SCORE_TOUCH_WEIGHT = 0.10
 SCORE_TREND_WEIGHT = 0.15
 
-# Aether 9-signal fusion (35% weight)
 AETHER_CVD_WEIGHT = 0.10
 AETHER_LV_WEIGHT = 0.05
 AETHER_HURST_BOS_WEIGHT = 0.10
 AETHER_LSTM_WEIGHT = 0.10
 
-# Win probability overlay
 WINPROB_BASE = 0.4
 WINPROB_LSTM_WEIGHT = 0.2
 WINPROB_Z_WEIGHT = 0.2
@@ -184,13 +178,30 @@ WINPROB_LV_WEIGHT = 0.1
 WINPROB_ENTRY_THRESHOLD = 0.6
 
 # ============================================================================
+# ADVANCED POSITION MANAGEMENT (NEW)
+# ============================================================================
+VOLATILE_ATR_THRESHOLD = 0.003  # 0.3% ATR = volatile
+POSITION_CHECK_INTERVAL_SEC = 5.0  # Check momentum/vol/trend every 5s
+FIRST_TP_WAIT_MINUTES = 10.0  # First 10 min wait
+SECOND_TP_WAIT_MINUTES = 10.0  # Second 10 min wait if conditions favorable
+HALF_TP_THRESHOLD = 0.5  # 50% of TP
+TP_BUFFER_PERCENT = 0.005  # 0.5% buffer when setting near TP
+
+# ============================================================================
+# LOGGING CONTROL (REDUCE SPAM)
+# ============================================================================
+LOG_DECISION_INTERVAL_SEC = 300.0  # Log decision every 5 min (not 1 min)
+LOG_POSITION_INTERVAL_SEC = 180.0  # Log position every 3 min
+TELEGRAM_REPORT_INTERVAL_SEC = 900.0  # Telegram report every 15 min
+BALANCE_CACHE_TTL_SEC = 300.0  # Cache balance for 5 min
+
+# ============================================================================
 # DISPLAY
 # ============================================================================
 print("\n" + "=" * 80)
-print("✓ Z-SCORE ICEBERG HUNTER - VOL-REGIME + WEIGHTED SCORE CONFIG LOADED")
+print("✓ Z-SCORE ICEBERG HUNTER CONFIG LOADED")
 print("=" * 80)
-print(f" Symbol: {SYMBOL} | Leverage: {LEVERAGE}x")
-print(f" VOL-REGIME: LOW<{VOL_REGIME_LOW_ATR_PCT*100:.2f}% HIGH>{VOL_REGIME_HIGH_ATR_PCT*100:.2f}%")
-print(f" SCORE THRESHOLD: Entry>{SCORE_ENTRY_THRESHOLD} Exit<{SCORE_EXIT_THRESHOLD}")
-print(f" EVENT-DRIVEN: {POSITION_CHECK_INTERVAL*1000:.0f}ms tick")
+print(f" TP/SL: Margin-based calculation ({PROFIT_TARGET_ROI*100:.1f}%/{STOP_LOSS_ROI*100:.1f}%)")
+print(f" Advanced Position Management: Enabled")
+print(f" Log intervals: Decision={LOG_DECISION_INTERVAL_SEC}s, Position={LOG_POSITION_INTERVAL_SEC}s")
 print("=" * 80 + "\n")

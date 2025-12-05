@@ -1,5 +1,6 @@
 """
-Z-Score Imbalance Iceberg Hunter Strategy - 2025 Vol-Regime + Weighted Score
+Z-Score Imbalance Iceberg Hunter Strategy - 2025 
+With Margin-based TP/SL and Advanced Position Management
 """
 
 import time
@@ -13,7 +14,7 @@ from scipy.stats import norm
 import config
 from zscore_excel_logger import ZScoreExcelLogger
 from telegram_notifier import send_telegram_message
-from aether_oracle import AetherOracle, OracleInputs, OracleOutputs, OracleSideScores
+from aether_oracle import AetherOracle, OracleInputs, OracleOutputs
 
 logger = logging.getLogger(__name__)
 
@@ -38,15 +39,20 @@ class ZScorePosition:
     main_filled: bool
     tp_reduced: bool
     entry_htf_trend: str
-    vol_regime: str  # NEW
-    entry_score: float  # NEW
+    vol_regime: str
+    entry_score: float
+    is_volatile: bool
+    tp_roi: float
+    sl_roi: float
+    last_momentum_check_sec: float
+    tp_adjustment_count: int
 
 
 class ZScoreIcebergHunterStrategy:
-    """Vol-Regime + Weighted Score + Event-Driven Strategy"""
+    """Vol-Regime + Weighted Score + Advanced Position Management"""
     
-    DECISION_LOG_INTERVAL_SEC = 60.0
-    POSITION_LOG_INTERVAL_SEC = 120.0
+    DECISION_LOG_INTERVAL_SEC = config.LOG_DECISION_INTERVAL_SEC
+    POSITION_LOG_INTERVAL_SEC = config.LOG_POSITION_INTERVAL_SEC
     ORDER_STATUS_CHECK_INTERVAL_SEC = 10.0
     ENTRY_FILL_TIMEOUT_SEC = 60.0
 
@@ -64,22 +70,57 @@ class ZScoreIcebergHunterStrategy:
         self._last_report_total_trades: int = 0
         
         logger.info("=" * 80)
-        logger.info("Z-SCORE VOL-REGIME + WEIGHTED SCORE STRATEGY INITIALIZED")
+        logger.info("Z-SCORE STRATEGY INITIALIZED")
+        logger.info("TP/SL: Margin-based calculation")
+        logger.info("Advanced Position Management: Enabled")
         logger.info("=" * 80)
-        logger.info(f"Score Entry Threshold: {config.SCORE_ENTRY_THRESHOLD}")
-        logger.info(f"Score Exit Threshold: {config.SCORE_EXIT_THRESHOLD}")
-        logger.info(f"Vol-Regime: LOW<{config.VOL_REGIME_LOW_ATR_PCT*100:.2f}% HIGH>{config.VOL_REGIME_HIGH_ATR_PCT*100:.2f}%")
-        logger.info("=" * 80)
+
+    # ======================================================================
+    # MARGIN-BASED TP/SL CALCULATION (PER IMAGE)
+    # ======================================================================
+    
+    def _calculate_tp_sl_prices(
+        self,
+        entry_price: float,
+        margin_used: float,
+        quantity: float,
+        side: str,
+        desired_profit_roi: float,
+        desired_sl_roi: float,
+    ) -> Tuple[float, float]:
+        """
+        Calculate TP/SL based on margin methodology from image.
+        
+        Formula:
+        - Qty = (Margin * Leverage) / Entry Price (already calculated)
+        - TP Price Movement = (Margin * Desired_Profit_ROI) / Qty
+        - TP = Entry ± TP Price Movement
+        - SL Price Movement = (Margin * Desired_SL_ROI) / Qty
+        - SL = Entry ∓ SL Price Movement
+        """
+        # Calculate price movements
+        tp_price_movement = (margin_used * desired_profit_roi) / quantity
+        sl_price_movement = (margin_used * desired_sl_roi) / quantity
+        
+        if side == "long":
+            tp_price = entry_price + tp_price_movement
+            sl_price = entry_price - sl_price_movement
+        else:
+            tp_price = entry_price - tp_price_movement
+            sl_price = entry_price + sl_price_movement
+        
+        logger.info(f"[TP/SL CALC] Margin={margin_used:.2f}, Qty={quantity:.6f}")
+        logger.info(f"  TP Movement: {tp_price_movement:.2f} → TP Price: {tp_price:.2f}")
+        logger.info(f"  SL Movement: {sl_price_movement:.2f} → SL Price: {sl_price:.2f}")
+        
+        return tp_price, sl_price
 
     # ======================================================================
     # VOLATILITY REGIME & DYNAMIC PARAMS
     # ======================================================================
     
     def _get_regime_params(self, data_manager, current_price: float) -> Dict:
-        """
-        Get dynamic params based on vol regime.
-        Returns: z_thresh, wall_mult, tp_mult, sl_mult, size_pct, trail_enabled, regime
-        """
+        """Get dynamic params based on vol regime."""
         atr_pct = None
         try:
             atr_pct = data_manager.get_atr_percent()
@@ -88,38 +129,31 @@ class ZScoreIcebergHunterStrategy:
         
         regime = data_manager.get_vol_regime(atr_pct) if hasattr(data_manager, 'get_vol_regime') else "NEUTRAL"
         
-        # Scale Z-threshold
         if regime == "LOW":
-            z_thresh = config.VOL_REGIME_BASE_Z_THRESH - 0.3  # 1.8
+            z_thresh = config.VOL_REGIME_BASE_Z_THRESH - 0.3
         elif regime == "HIGH":
-            z_thresh = config.VOL_REGIME_BASE_Z_THRESH + 0.3  # 2.4 (clamped formula)
+            z_thresh = config.VOL_REGIME_BASE_Z_THRESH + 0.3
         else:
             z_thresh = config.VOL_REGIME_BASE_Z_THRESH
         
-        # Wall multiplier
         if regime == "HIGH":
-            wall_mult = config.VOL_REGIME_HIGH_WALL_MULT  # 3.8x
+            wall_mult = config.VOL_REGIME_HIGH_WALL_MULT
         else:
-            wall_mult = config.VOL_REGIME_LOW_WALL_MULT  # 4.2x
+            wall_mult = config.VOL_REGIME_LOW_WALL_MULT
         
-        # TP/SL multipliers
         if regime == "HIGH":
-            tp_mult = config.VOL_REGIME_HIGH_TP_MULT  # 1.40 (+40%)
-            sl_mult = config.VOL_REGIME_HIGH_SL_MULT  # 0.90 (-10%)
+            tp_mult = config.VOL_REGIME_HIGH_TP_MULT
+            sl_mult = config.VOL_REGIME_HIGH_SL_MULT
             trail_enabled = True
         else:
-            tp_mult = config.VOL_REGIME_LOW_TP_MULT  # 1.10 (+10%)
-            sl_mult = config.VOL_REGIME_LOW_SL_MULT  # 0.97 (-3%)
+            tp_mult = config.VOL_REGIME_LOW_TP_MULT
+            sl_mult = config.VOL_REGIME_LOW_SL_MULT
             trail_enabled = False
         
-        # Position sizing %
         if regime == "HIGH":
-            size_pct = config.VOL_REGIME_HIGH_SIZE_PCT  # 15%
+            size_pct = config.VOL_REGIME_HIGH_SIZE_PCT
         else:
-            size_pct = config.VOL_REGIME_LOW_SIZE_PCT  # 20%
-        
-        logger.info(f"[VOL-REGIME] {regime}: z_thresh={z_thresh:.2f}, wall_mult={wall_mult:.2f}, "
-                    f"tp_mult={tp_mult:.2f}, sl_mult={sl_mult:.2f}, size_pct={size_pct:.1f}%, trail={trail_enabled}")
+            size_pct = config.VOL_REGIME_LOW_SIZE_PCT
         
         return {
             "regime": regime,
@@ -137,11 +171,7 @@ class ZScoreIcebergHunterStrategy:
     # ======================================================================
     
     def _compute_signal_score(self, value: float, threshold: float) -> float:
-        """
-        Normalize signal to [0, 1] using CDF.
-        score = norm.cdf((value - threshold) / std)
-        Simplified: assume std = threshold / 2
-        """
+        """Normalize signal to [0, 1] using CDF."""
         if threshold == 0:
             return 1.0 if value > 0 else 0.0
         std = abs(threshold) / 2.0
@@ -161,13 +191,9 @@ class ZScoreIcebergHunterStrategy:
         z_thresh: float,
         wall_mult: float,
     ) -> Tuple[float, List[str]]:
-        """
-        Compute 5-signal weighted core score (65% total).
-        Returns: (core_score, reasons)
-        """
+        """Compute 5-signal weighted core score."""
         reasons = []
         
-        # 1. Imbalance score (25%)
         imb_val = imbalance_data["imbalance"]
         if side == "long":
             imb_score = self._compute_signal_score(imb_val, config.IMBALANCE_THRESHOLD)
@@ -175,7 +201,6 @@ class ZScoreIcebergHunterStrategy:
             imb_score = self._compute_signal_score(-imb_val, config.IMBALANCE_THRESHOLD)
         reasons.append(f"imb={imb_score:.3f}")
         
-        # 2. Wall score (20%)
         if side == "long":
             wall_val = wall_data["bid_wall_strength"]
         else:
@@ -183,7 +208,6 @@ class ZScoreIcebergHunterStrategy:
         wall_score = self._compute_signal_score(wall_val, wall_mult)
         reasons.append(f"wall={wall_score:.3f}")
         
-        # 3. Z-score (30%)
         z_val = delta_data["z_score"]
         if side == "long":
             z_score = self._compute_signal_score(z_val, z_thresh)
@@ -191,7 +215,6 @@ class ZScoreIcebergHunterStrategy:
             z_score = self._compute_signal_score(-z_val, z_thresh)
         reasons.append(f"z={z_score:.3f}")
         
-        # 4. Touch score (10%)
         if side == "long":
             touch_dist = touch_data["bid_distance_ticks"]
         else:
@@ -199,13 +222,9 @@ class ZScoreIcebergHunterStrategy:
         touch_score = 1.0 if touch_dist <= config.PRICE_TOUCH_THRESHOLD_TICKS else 0.0
         reasons.append(f"touch={touch_score:.3f}")
         
-        # 5. Trend score (15%) with RANGE bonus
         trend_score = 1.0 if trend_ok else 0.0
-        # Apply RANGE bonus if HTF is RANGE
-        # (Will be applied in main logic based on htf_trend)
         reasons.append(f"trend={trend_score:.3f}")
         
-        # Weighted sum
         core_score = (
             imb_score * config.SCORE_IMB_WEIGHT +
             wall_score * config.SCORE_WALL_WEIGHT +
@@ -216,56 +235,39 @@ class ZScoreIcebergHunterStrategy:
         
         return core_score, reasons
 
-    # ======================================================================
-    # AETHER FUSION (9-signal)
-    # ======================================================================
-    
     def _compute_aether_fusion_score(
         self,
         oracle_inputs: Optional[OracleInputs],
         oracle_outputs: Optional[OracleOutputs],
         side: str,
     ) -> Tuple[float, List[str]]:
-        """
-        Compute Aether 9-signal fusion (35% weight).
-        Signals: CVD (10%), LV avg (5%), Hurst/BOS (10%), LSTM (10%)
-        Returns: (aether_score, reasons)
-        """
+        """Compute Aether 9-signal fusion."""
         if oracle_inputs is None or oracle_outputs is None:
             return 0.0, ["aether=MISSING"]
         
         reasons = []
         components = []
         
-        # CVD score (10%)
         if oracle_inputs.norm_cvd is not None:
             cvd_val = oracle_inputs.norm_cvd
             if side == "long":
-                cvd_score = max(0.0, min(1.0, (cvd_val + 1.0) / 2.0))  # Map [-1,1] to [0,1]
+                cvd_score = max(0.0, min(1.0, (cvd_val + 1.0) / 2.0))
             else:
                 cvd_score = max(0.0, min(1.0, (-cvd_val + 1.0) / 2.0))
             components.append((cvd_score, config.AETHER_CVD_WEIGHT))
             reasons.append(f"cvd={cvd_score:.3f}")
-        else:
-            reasons.append("cvd=MISS")
         
-        # LV average (5%)
         lv_vals = [oracle_inputs.lv_1m, oracle_inputs.lv_5m, oracle_inputs.lv_15m]
         lv_vals = [v for v in lv_vals if v is not None]
         if lv_vals:
             lv_avg = sum(lv_vals) / len(lv_vals)
-            # Normalize: higher LV = better liquidity (arbitrary scale)
-            lv_score = min(1.0, lv_avg / 100.0)  # Assume 100 is max
+            lv_score = min(1.0, lv_avg / 100.0)
             components.append((lv_score, config.AETHER_LV_WEIGHT))
             reasons.append(f"lv={lv_score:.3f}")
-        else:
-            reasons.append("lv=MISS")
         
-        # Hurst/BOS blend (10%)
         hurst_bos_vals = []
         if oracle_inputs.hurst is not None:
-            # Hurst: mean-reversion favors wall scalping (H < 0.5 better)
-            hurst_score = 1.0 - oracle_inputs.hurst  # Invert: lower H = higher score
+            hurst_score = 1.0 - oracle_inputs.hurst
             hurst_bos_vals.append(hurst_score)
         if oracle_inputs.bos_align is not None:
             hurst_bos_vals.append(oracle_inputs.bos_align)
@@ -273,10 +275,7 @@ class ZScoreIcebergHunterStrategy:
             hurst_bos_score = sum(hurst_bos_vals) / len(hurst_bos_vals)
             components.append((hurst_bos_score, config.AETHER_HURST_BOS_WEIGHT))
             reasons.append(f"hurst_bos={hurst_bos_score:.3f}")
-        else:
-            reasons.append("hurst_bos=MISS")
         
-        # LSTM up-prob (10%)
         if oracle_outputs:
             if side == "long" and oracle_outputs.long_scores.fused is not None:
                 lstm_score = oracle_outputs.long_scores.fused
@@ -288,12 +287,7 @@ class ZScoreIcebergHunterStrategy:
             if lstm_score is not None:
                 components.append((lstm_score, config.AETHER_LSTM_WEIGHT))
                 reasons.append(f"lstm={lstm_score:.3f}")
-            else:
-                reasons.append("lstm=MISS")
-        else:
-            reasons.append("lstm=MISS")
         
-        # Fused score
         if not components:
             return 0.0, reasons
         
@@ -303,10 +297,6 @@ class ZScoreIcebergHunterStrategy:
         
         return aether_score, reasons
 
-    # ======================================================================
-    # WIN PROBABILITY OVERLAY
-    # ======================================================================
-    
     def _compute_win_prob(
         self,
         lstm_score: float,
@@ -314,10 +304,7 @@ class ZScoreIcebergHunterStrategy:
         cvd_norm: float,
         lv_norm: float,
     ) -> float:
-        """
-        Win probability overlay:
-        wp = 0.4 + 0.2*lstm + 0.2*z_sign + 0.1*cvd + 0.1*lv
-        """
+        """Win probability overlay."""
         wp = (
             config.WINPROB_BASE +
             config.WINPROB_LSTM_WEIGHT * lstm_score +
@@ -328,13 +315,11 @@ class ZScoreIcebergHunterStrategy:
         return max(0.0, min(1.0, wp))
 
     # ======================================================================
-    # MAIN TICK HANDLER (EVENT-DRIVEN)
+    # MAIN TICK HANDLER
     # ======================================================================
     
     def on_tick(self, data_manager, order_manager, risk_manager) -> None:
-        """
-        Main per-tick strategy (called on WS callbacks).
-        """
+        """Main per-tick strategy."""
         try:
             current_price = data_manager.get_last_price()
             if current_price <= 0:
@@ -342,10 +327,10 @@ class ZScoreIcebergHunterStrategy:
             
             now_sec = time.time()
             
-            # 15-min report
+            # 15-min report (reduced spam)
             self._maybe_send_15m_report(now_sec, risk_manager, current_price)
             
-            # Manage open position (includes score decay exit)
+            # Manage open position
             if self.current_position is not None:
                 self._manage_open_position(
                     data_manager=data_manager,
@@ -377,13 +362,13 @@ class ZScoreIcebergHunterStrategy:
             delta_data = self._compute_delta_z_score(data_manager)
             touch_data = self._compute_price_touch(data_manager, current_price)
             
-            # HTF trend (LTF disabled per request)
+            # HTF trend
             htf_trend: Optional[str] = None
             try:
                 if hasattr(data_manager, "get_htf_trend"):
                     htf_trend = data_manager.get_htf_trend()
             except Exception as e:
-                logger.error(f"Error fetching HTF trend: {e}", exc_info=True)
+                logger.error(f"Error fetching HTF trend: {e}")
             
             # Oracle
             oracle_inputs: Optional[OracleInputs] = None
@@ -397,31 +382,11 @@ class ZScoreIcebergHunterStrategy:
                     delta_data=delta_data,
                     touch_data=touch_data,
                     htf_trend=htf_trend,
-                    ltf_trend=None,  # Disabled
+                    ltf_trend=None,
                 )
                 oracle_outputs = self._oracle.decide(oracle_inputs, risk_manager)
             except Exception as e:
-                logger.error(f"Oracle error: {e}", exc_info=True)
-            
-            # Excel log
-            if (
-                self.excel_logger
-                and imbalance_data is not None
-                and wall_data is not None
-                and delta_data is not None
-                and touch_data is not None
-            ):
-                self.excel_logger.log_parameters(
-                    timestamp=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                    current_price=current_price,
-                    imbalance_data=imbalance_data,
-                    wall_data=wall_data,
-                    delta_data=delta_data,
-                    touch_data=touch_data,
-                    decision="CHECK",
-                    reason="Core metrics computed",
-                    htf_trend=htf_trend,
-                )
+                logger.error(f"Oracle error: {e}")
             
             # Decision + entry
             self._try_entries_and_log(
@@ -443,7 +408,7 @@ class ZScoreIcebergHunterStrategy:
             logger.error(f"Error in on_tick: {e}", exc_info=True)
 
     # ======================================================================
-    # ENTRY DECISION WITH WEIGHTED SCORE
+    # ENTRY DECISION
     # ======================================================================
     
     def _try_entries_and_log(
@@ -461,42 +426,31 @@ class ZScoreIcebergHunterStrategy:
         oracle_inputs: Optional[OracleInputs],
         oracle_outputs: Optional[OracleOutputs],
     ) -> None:
-        """
-        Evaluate LONG/SHORT with weighted score gauntlet.
-        """
-        if (
-            imbalance_data is None
-            or wall_data is None
-            or delta_data is None
-            or touch_data is None
-        ):
+        """Evaluate LONG/SHORT with weighted score."""
+        if not all([imbalance_data, wall_data, delta_data, touch_data]):
             return
         
-        # Get regime params
         regime_params = self._get_regime_params(data_manager, current_price)
         regime = regime_params["regime"]
         z_thresh = regime_params["z_thresh"]
         wall_mult = regime_params["wall_mult"]
         
-        # EMA trend
         ema_val: Optional[float] = None
         try:
             ema_val = data_manager.get_ema(period=config.EMA_PERIOD)
-        except Exception:
+        except:
             pass
         
         trend_long_ok = (ema_val is not None and current_price > ema_val)
         trend_short_ok = (ema_val is not None and current_price < ema_val)
         
-        # RANGE bonus
         range_bonus = 1.0
         if htf_trend and htf_trend.upper() in ("RANGE", "RANGEBOUND"):
             if regime == "LOW":
-                range_bonus = config.RANGE_BONUS_LOW  # 0.8
+                range_bonus = config.RANGE_BONUS_LOW
             else:
-                range_bonus = config.RANGE_BONUS_HIGH  # 0.5
+                range_bonus = config.RANGE_BONUS_HIGH
         
-        # Compute core scores
         long_core, long_core_reasons = self._compute_weighted_score(
             imbalance_data, wall_data, delta_data, touch_data,
             trend_long_ok, "long", regime, z_thresh, wall_mult
@@ -509,7 +463,6 @@ class ZScoreIcebergHunterStrategy:
         )
         short_core *= range_bonus
         
-        # Aether fusion
         long_aether, long_aether_reasons = self._compute_aether_fusion_score(
             oracle_inputs, oracle_outputs, "long"
         )
@@ -517,11 +470,9 @@ class ZScoreIcebergHunterStrategy:
             oracle_inputs, oracle_outputs, "short"
         )
         
-        # Total scores (65% core + 35% aether)
         long_total = long_core * 0.65 + long_aether * 0.35
         short_total = short_core * 0.65 + short_aether * 0.35
         
-        # Win prob overlay
         lstm_long = oracle_outputs.long_scores.fused if (oracle_outputs and oracle_outputs.long_scores.fused) else 0.5
         lstm_short = oracle_outputs.short_scores.fused if (oracle_outputs and oracle_outputs.short_scores.fused) else 0.5
         
@@ -531,30 +482,26 @@ class ZScoreIcebergHunterStrategy:
         cvd_norm_long = (oracle_inputs.norm_cvd + 1.0) / 2.0 if (oracle_inputs and oracle_inputs.norm_cvd is not None) else 0.5
         cvd_norm_short = 1.0 - cvd_norm_long
         
-        lv_norm = 0.5  # Placeholder
+        lv_norm = 0.5
         
         winprob_long = self._compute_win_prob(lstm_long, z_norm_long, cvd_norm_long, lv_norm)
         winprob_short = self._compute_win_prob(lstm_short, z_norm_short, cvd_norm_short, lv_norm)
         
-        # Entry decision
         long_entry = (long_total > config.SCORE_ENTRY_THRESHOLD and 
                       winprob_long > config.WINPROB_ENTRY_THRESHOLD)
         short_entry = (short_total > config.SCORE_ENTRY_THRESHOLD and 
                        winprob_short > config.WINPROB_ENTRY_THRESHOLD)
         
-        # Reasons
-        long_reasons = [f"core={long_core:.3f}"] + long_core_reasons + [f"aether={long_aether:.3f}"] + long_aether_reasons + [f"total={long_total:.3f}", f"wp={winprob_long:.3f}"]
-        short_reasons = [f"core={short_core:.3f}"] + short_core_reasons + [f"aether={short_aether:.3f}"] + short_aether_reasons + [f"total={short_total:.3f}", f"wp={winprob_short:.3f}"]
+        long_reasons = [f"total={long_total:.3f}", f"wp={winprob_long:.3f}"]
+        short_reasons = [f"total={short_total:.3f}", f"wp={winprob_short:.3f}"]
         
-        # Log
+        # Log (reduced spam)
         self._log_decision_state(
             now_sec, current_price, data_manager,
-            imbalance_data, wall_data, delta_data, touch_data,
             long_entry, short_entry, long_reasons, short_reasons,
-            htf_trend, None, oracle_inputs, oracle_outputs, regime_params
+            regime_params
         )
         
-        # Enter
         if long_entry:
             self._enter_position(
                 data_manager, order_manager, risk_manager, "long", current_price,
@@ -587,10 +534,14 @@ class ZScoreIcebergHunterStrategy:
         regime_params: Dict,
         entry_score: float,
     ) -> None:
-        """Enter position with vol-regime sizing and TP/SL."""
+        """Enter position with margin-based TP/SL."""
         regime = regime_params["regime"]
         tp_mult = regime_params["tp_mult"]
         sl_mult = regime_params["sl_mult"]
+        atr_pct = regime_params.get("atr_pct", 0.0)
+        
+        # Check if volatile
+        is_volatile = (atr_pct is not None and atr_pct > config.VOLATILE_ATR_THRESHOLD)
         
         # Position sizing
         quantity, margin_used = risk_manager.calculate_position_size_vol_regime(
@@ -602,25 +553,23 @@ class ZScoreIcebergHunterStrategy:
             logger.error("Position sizing returned 0 quantity")
             return
         
-        # TP/SL prices
+        # TP/SL ROI (use base config values)
         base_tp_roi = config.PROFIT_TARGET_ROI
         base_sl_roi = config.STOP_LOSS_ROI
         
-        tp_roi = base_tp_roi * tp_mult
-        sl_roi = base_sl_roi * sl_mult
-        
-        if side == "long":
-            tp_price = current_price * (1 + tp_roi)
-            sl_price = current_price * (1 + sl_roi)
+        # Apply regime multipliers if not volatile
+        if not is_volatile:
+            tp_roi = base_tp_roi * tp_mult
+            sl_roi = base_sl_roi * sl_mult
         else:
-            tp_price = current_price * (1 - tp_roi)
-            sl_price = current_price * (1 - sl_roi)
+            # Volatile: use full base TP/SL (10%/3%)
+            tp_roi = base_tp_roi
+            sl_roi = base_sl_roi
         
         logger.info("=" * 80)
-        logger.info(f"ENTERING {side.upper()} POSITION | REGIME={regime}")
+        logger.info(f"ENTERING {side.upper()} | REGIME={regime} | VOLATILE={is_volatile}")
         logger.info(f"Price={current_price:.2f}, Qty={quantity:.6f}, Margin={margin_used:.2f}")
-        logger.info(f"TP={tp_price:.2f} (ROI={tp_roi*100:.2f}%), SL={sl_price:.2f} (ROI={sl_roi*100:.2f}%)")
-        logger.info(f"Entry Score={entry_score:.3f}")
+        logger.info(f"TP ROI={tp_roi*100:.2f}%, SL ROI={sl_roi*100:.2f}%")
         logger.info("=" * 80)
         
         # Place main order
@@ -644,6 +593,16 @@ class ZScoreIcebergHunterStrategy:
         except Exception as e:
             logger.error(f"Main order fill failed: {e}")
             return
+        
+        # Calculate TP/SL prices using margin-based formula
+        tp_price, sl_price = self._calculate_tp_sl_prices(
+            entry_price=entry_price,
+            margin_used=margin_used,
+            quantity=quantity,
+            side=side,
+            desired_profit_roi=tp_roi,
+            desired_sl_roi=sl_roi,
+        )
         
         # Place TP/SL
         tp_side = "SELL" if side == "long" else "BUY"
@@ -694,16 +653,20 @@ class ZScoreIcebergHunterStrategy:
             entry_htf_trend=htf_trend,
             vol_regime=regime,
             entry_score=entry_score,
+            is_volatile=is_volatile,
+            tp_roi=tp_roi,
+            sl_roi=sl_roi,
+            last_momentum_check_sec=now_sec,
+            tp_adjustment_count=0,
         )
         
         risk_manager.record_trade_opened()
         
         msg = (
-            f"🚀 {side.upper()} ENTRY | {regime}\n"
-            f"Price: {entry_price:.2f}\n"
-            f"Qty: {quantity:.6f} BTC\n"
-            f"TP: {tp_price:.2f} | SL: {sl_price:.2f}\n"
-            f"Score: {entry_score:.3f}"
+            f"🚀 {side.upper()} ENTRY\n"
+            f"Price: {entry_price:.2f} | Qty: {quantity:.6f}\n"
+            f"TP: {tp_price:.2f} ({tp_roi*100:.1f}%) | SL: {sl_price:.2f} ({sl_roi*100:.1f}%)\n"
+            f"Volatile: {is_volatile} | Score: {entry_score:.3f}"
         )
         try:
             send_telegram_message(msg)
@@ -713,7 +676,7 @@ class ZScoreIcebergHunterStrategy:
         logger.info(f"✓ Position opened: {self.current_position.trade_id}")
 
     # ======================================================================
-    # POSITION MANAGEMENT (SCORE DECAY + TRAILING SL)
+    # ADVANCED POSITION MANAGEMENT
     # ======================================================================
     
     def _manage_open_position(
@@ -725,10 +688,10 @@ class ZScoreIcebergHunterStrategy:
         now_sec: float,
     ) -> None:
         """
-        Manage open position:
-        - Score decay exit
-        - Trailing SL in HIGH vol
-        - TP/SL/time exits
+        Advanced position management:
+        - Check momentum/vol/trend every 5s
+        - After 10 min: adjust TP based on conditions
+        - Trailing SL
         """
         pos = self.current_position
         hold_sec = now_sec - pos.entry_time_sec
@@ -739,117 +702,206 @@ class ZScoreIcebergHunterStrategy:
             self._last_status_check_sec = now_sec
             self._check_bracket_exits(order_manager, risk_manager, current_price, now_sec)
         
-        # Score decay exit
-        if hold_min >= 2.0:  # After 2 min, start rescoring
-            self._check_score_decay_exit(
-                data_manager, order_manager, risk_manager, current_price, now_sec
-            )
+        # Calculate current profit %
+        direction = 1.0 if pos.side == "long" else -1.0
+        current_profit_pct = ((current_price - pos.entry_price) / pos.entry_price) * direction
         
-        # Trailing SL in HIGH vol
-        if pos.vol_regime == "HIGH":
-            self._check_trailing_sl(order_manager, current_price)
-        
-        # Time stop
-        if hold_min >= config.MAX_HOLD_MINUTES:
-            logger.warning(f"Time stop at {hold_min:.1f} min")
-            self._exit_position(
-                order_manager, risk_manager, current_price, "TIME_STOP", now_sec
+        # Check momentum/volatility/trend every 5 seconds
+        if now_sec - pos.last_momentum_check_sec >= config.POSITION_CHECK_INTERVAL_SEC:
+            pos.last_momentum_check_sec = now_sec
+            momentum_favorable, vol_favorable, trend_favorable = self._check_market_conditions(
+                data_manager, pos.side, current_price
             )
+            
+            # Log check
+            logger.info(f"[POSITION CHECK] {pos.trade_id} | Hold={hold_min:.1f}min | "
+                       f"Profit={current_profit_pct*100:.2f}% | "
+                       f"Momentum={momentum_favorable} Vol={vol_favorable} Trend={trend_favorable}")
+            
+            # Advanced TP management after 10 minutes
+            if hold_min >= config.FIRST_TP_WAIT_MINUTES and pos.tp_adjustment_count == 0:
+                self._manage_tp_after_10min(
+                    data_manager, order_manager, current_price, now_sec,
+                    momentum_favorable, vol_favorable, trend_favorable,
+                    current_profit_pct
+                )
+            
+            # Second check after 20 minutes
+            elif hold_min >= (config.FIRST_TP_WAIT_MINUTES + config.SECOND_TP_WAIT_MINUTES) and pos.tp_adjustment_count == 1:
+                self._manage_tp_after_20min(
+                    order_manager, current_price, current_profit_pct
+                )
 
-    def _check_score_decay_exit(
+    def _check_market_conditions(
+        self,
+        data_manager,
+        side: str,
+        current_price: float,
+    ) -> Tuple[bool, bool, bool]:
+        """
+        Check if momentum, volatility, and trend are favorable.
+        Returns: (momentum_favorable, vol_favorable, trend_favorable)
+        """
+        # Momentum: check Z-score direction
+        momentum_favorable = False
+        try:
+            delta_data = self._compute_delta_z_score(data_manager)
+            if delta_data:
+                z_score = delta_data["z_score"]
+                if side == "long" and z_score > 0:
+                    momentum_favorable = True
+                elif side == "short" and z_score < 0:
+                    momentum_favorable = True
+        except:
+            pass
+        
+        # Volatility: check if ATR is stable/favorable
+        vol_favorable = True  # Default to favorable
+        try:
+            atr_pct = data_manager.get_atr_percent()
+            if atr_pct is not None:
+                # Too high vol = unfavorable
+                if atr_pct > config.MAX_ATR_PERCENT:
+                    vol_favorable = False
+        except:
+            pass
+        
+        # Trend: check EMA alignment
+        trend_favorable = False
+        try:
+            ema_val = data_manager.get_ema(period=config.EMA_PERIOD)
+            if ema_val is not None:
+                if side == "long" and current_price > ema_val:
+                    trend_favorable = True
+                elif side == "short" and current_price < ema_val:
+                    trend_favorable = True
+        except:
+            pass
+        
+        return momentum_favorable, vol_favorable, trend_favorable
+
+    def _manage_tp_after_10min(
         self,
         data_manager,
         order_manager,
-        risk_manager,
         current_price: float,
         now_sec: float,
+        momentum_favorable: bool,
+        vol_favorable: bool,
+        trend_favorable: bool,
+        current_profit_pct: float,
     ) -> None:
         """
-        Rescore position; exit if score < threshold.
+        After 10 minutes, adjust TP based on conditions.
         """
         pos = self.current_position
         if pos is None:
             return
         
-        # Recompute core metrics
-        imbalance_data = self._compute_imbalance(data_manager)
-        wall_data = (
-            self._compute_wall_strength(data_manager, current_price, imbalance_data)
-            if imbalance_data is not None
-            else None
-        )
-        delta_data = self._compute_delta_z_score(data_manager)
-        touch_data = self._compute_price_touch(data_manager, current_price)
+        half_tp = pos.tp_roi * config.HALF_TP_THRESHOLD
         
-        if not all([imbalance_data, wall_data, delta_data, touch_data]):
+        all_favorable = momentum_favorable and vol_favorable and trend_favorable
+        
+        logger.info(f"[TP MANAGEMENT 10MIN] All favorable={all_favorable}, "
+                   f"Profit={current_profit_pct*100:.2f}%, HalfTP={half_tp*100:.2f}%")
+        
+        if all_favorable:
+            # All favorable: wait another 10 min
+            if current_profit_pct >= half_tp:
+                # Move SL to half TP
+                self._move_sl_to_half_tp(order_manager, current_price)
+                logger.info("[TP MANAGEMENT] All favorable + profit>halfTP: Moved SL to halfTP, waiting 10min more")
+            else:
+                logger.info("[TP MANAGEMENT] All favorable: Waiting 10min more")
+        else:
+            # Unfavorable: adjust TP
+            if current_profit_pct >= half_tp:
+                # Above half TP: set TP near current profit
+                new_tp_roi = current_profit_pct + config.TP_BUFFER_PERCENT
+                self._adjust_tp_order(order_manager, current_price, new_tp_roi)
+                logger.info(f"[TP MANAGEMENT] Unfavorable + profit>halfTP: New TP={new_tp_roi*100:.2f}%")
+            else:
+                # Below half TP: set TP to half TP
+                new_tp_roi = half_tp
+                self._adjust_tp_order(order_manager, current_price, new_tp_roi)
+                logger.info(f"[TP MANAGEMENT] Unfavorable + profit<halfTP: New TP=halfTP={new_tp_roi*100:.2f}%")
+        
+        pos.tp_adjustment_count = 1
+
+    def _manage_tp_after_20min(
+        self,
+        order_manager,
+        current_price: float,
+        current_profit_pct: float,
+    ) -> None:
+        """After 20 minutes, tighten TP if not hit."""
+        pos = self.current_position
+        if pos is None:
             return
         
-        # Get regime params
-        regime_params = self._get_regime_params(data_manager, current_price)
-        z_thresh = regime_params["z_thresh"]
-        wall_mult = regime_params["wall_mult"]
+        # Set TP very near current profit
+        new_tp_roi = current_profit_pct + config.TP_BUFFER_PERCENT
+        self._adjust_tp_order(order_manager, current_price, new_tp_roi)
+        logger.info(f"[TP MANAGEMENT 20MIN] Tightening TP to {new_tp_roi*100:.2f}%")
         
-        # EMA trend
-        ema_val = None
-        try:
-            ema_val = data_manager.get_ema(period=config.EMA_PERIOD)
-        except:
-            pass
+        pos.tp_adjustment_count = 2
+
+    def _move_sl_to_half_tp(self, order_manager, current_price: float) -> None:
+        """Move SL to half TP price."""
+        pos = self.current_position
+        if pos is None or pos.tp_reduced:
+            return
         
-        trend_ok = False
-        if pos.side == "long":
-            trend_ok = (ema_val is not None and current_price > ema_val)
-        else:
-            trend_ok = (ema_val is not None and current_price < ema_val)
+        half_tp_roi = pos.tp_roi * config.HALF_TP_THRESHOLD
+        direction = 1.0 if pos.side == "long" else -1.0
         
-        # Compute score
-        core_score, _ = self._compute_weighted_score(
-            imbalance_data, wall_data, delta_data, touch_data,
-            trend_ok, pos.side, regime_params["regime"], z_thresh, wall_mult
+        # Calculate half TP price
+        price_movement = pos.entry_price * half_tp_roi
+        new_sl_price = pos.entry_price + (price_movement * direction)
+        
+        # Cancel old SL
+        order_manager.cancel_order(pos.sl_order_id)
+        
+        # Place new SL
+        tp_side = "SELL" if pos.side == "long" else "BUY"
+        new_sl_order = order_manager.place_stop_loss(
+            side=tp_side,
+            quantity=pos.quantity,
+            trigger_price=new_sl_price,
         )
         
-        # Simple: use core only for decay (65%)
-        rescore = core_score * 0.65
-        
-        logger.info(f"[SCORE DECAY] rescore={rescore:.3f} (threshold={config.SCORE_EXIT_THRESHOLD})")
-        
-        if rescore < config.SCORE_EXIT_THRESHOLD:
-            logger.warning(f"Score decay exit: {rescore:.3f} < {config.SCORE_EXIT_THRESHOLD}")
-            self._exit_position(
-                order_manager, risk_manager, current_price, "SCORE_DECAY", now_sec
-            )
+        if new_sl_order:
+            pos.sl_order_id = new_sl_order.get("order_id", "")
+            pos.sl_price = new_sl_price
+            pos.tp_reduced = True
+            logger.info(f"✓ Moved SL to half TP: {new_sl_price:.2f}")
 
-    def _check_trailing_sl(self, order_manager, current_price: float) -> None:
-        """
-        Trailing SL in HIGH vol: after +10% profit, move SL to entry + 0.05%.
-        """
+    def _adjust_tp_order(self, order_manager, current_price: float, new_tp_roi: float) -> None:
+        """Adjust TP order to new ROI."""
         pos = self.current_position
-        if pos is None or pos.vol_regime != "HIGH":
+        if pos is None:
             return
         
         direction = 1.0 if pos.side == "long" else -1.0
-        pnl_roi = (current_price - pos.entry_price) * direction / pos.entry_price
+        price_movement = pos.entry_price * new_tp_roi
+        new_tp_price = pos.entry_price + (price_movement * direction)
         
-        if pnl_roi >= config.HIGH_VOL_TRAIL_PROFIT_PCT and not pos.tp_reduced:
-            # Move SL to entry + buffer
-            new_sl = pos.entry_price * (1 + config.HIGH_VOL_TRAIL_BUFFER_PCT * direction)
-            logger.info(f"[TRAIL SL] Moving SL to {new_sl:.2f} (entry+buffer)")
-            
-            # Cancel old SL
-            order_manager.cancel_order(pos.sl_order_id)
-            
-            # Place new SL
-            tp_side = "SELL" if pos.side == "long" else "BUY"
-            new_sl_order = order_manager.place_stop_loss(
-                side=tp_side,
-                quantity=pos.quantity,
-                trigger_price=new_sl,
-            )
-            
-            if new_sl_order:
-                pos.sl_order_id = new_sl_order.get("order_id", "")
-                pos.sl_price = new_sl
-                pos.tp_reduced = True  # Flag to avoid repeated updates
+        # Cancel old TP
+        order_manager.cancel_order(pos.tp_order_id)
+        
+        # Place new TP
+        tp_side = "SELL" if pos.side == "long" else "BUY"
+        new_tp_order = order_manager.place_take_profit(
+            side=tp_side,
+            quantity=pos.quantity,
+            trigger_price=new_tp_price,
+        )
+        
+        if new_tp_order:
+            pos.tp_order_id = new_tp_order.get("order_id", "")
+            pos.tp_price = new_tp_price
+            pos.tp_roi = new_tp_roi
+            logger.info(f"✓ Adjusted TP to: {new_tp_price:.2f} ({new_tp_roi*100:.2f}%)")
 
     def _check_bracket_exits(
         self,
@@ -922,7 +974,7 @@ class ZScoreIcebergHunterStrategy:
             f"🛑 EXIT {pos.side.upper()} | {reason}\n"
             f"Entry: {pos.entry_price:.2f} → Exit: {exit_price:.2f}\n"
             f"P&L: {pnl:.2f} USDT ({roi*100:.2f}%)\n"
-            f"Hold: {(now_sec - pos.entry_time_sec)/60.0:.1f} min"
+            f"Hold: {(now_sec - pos.entry_time_sec)/60.0:.1f}min"
         )
         try:
             send_telegram_message(msg)
@@ -933,7 +985,7 @@ class ZScoreIcebergHunterStrategy:
         self.current_position = None
 
     # ======================================================================
-    # CORE METRIC CALCULATORS (unchanged)
+    # CORE METRIC CALCULATORS
     # ======================================================================
     
     def _compute_imbalance(self, data_manager) -> Optional[Dict]:
@@ -1068,7 +1120,7 @@ class ZScoreIcebergHunterStrategy:
         }
 
     # ======================================================================
-    # LOGGING
+    # LOGGING (REDUCED SPAM)
     # ======================================================================
     
     def _log_decision_state(
@@ -1076,54 +1128,29 @@ class ZScoreIcebergHunterStrategy:
         now_sec: float,
         current_price: float,
         data_manager,
-        imbalance_data: Optional[Dict],
-        wall_data: Optional[Dict],
-        delta_data: Optional[Dict],
-        touch_data: Optional[Dict],
         long_ready: bool,
         short_ready: bool,
         long_reasons: List[str],
         short_reasons: List[str],
-        htf_trend: Optional[str],
-        ltf_trend: Optional[str],
-        oracle_inputs: Optional[OracleInputs],
-        oracle_outputs: Optional[OracleOutputs],
         regime_params: Optional[Dict],
     ) -> None:
-        """Log decision snapshot."""
+        """Log decision snapshot (every 5 min)."""
         if now_sec - self._last_decision_log_sec < self.DECISION_LOG_INTERVAL_SEC:
             return
         
         self._last_decision_log_sec = now_sec
         
         logger.info("-" * 80)
-        logger.info(f"DECISION @ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} | price={current_price:.2f}")
+        logger.info(f"DECISION @ {datetime.utcnow().strftime('%H:%M:%S')} | price={current_price:.2f}")
         
         if regime_params:
-            logger.info(f" VOL-REGIME: {regime_params['regime']} | ATR%={regime_params.get('atr_pct', 0)*100:.3f}%")
-            logger.info(f"  z_thresh={regime_params['z_thresh']:.2f}, wall_mult={regime_params['wall_mult']:.2f}")
-        
-        if imbalance_data:
-            logger.info(f" Imbalance: {imbalance_data['imbalance']:.3f}")
-        if wall_data:
-            logger.info(f" Wall: bid={wall_data['bid_wall_strength']:.2f}, ask={wall_data['ask_wall_strength']:.2f}")
-        if delta_data:
-            logger.info(f" Z-score: {delta_data['z_score']:.2f}")
-        if touch_data:
-            logger.info(f" Touch: bid={touch_data['bid_distance_ticks']:.1f}, ask={touch_data['ask_distance_ticks']:.1f}")
-        
-        if htf_trend:
-            logger.info(f" HTF Trend: {htf_trend}")
+            logger.info(f" Regime: {regime_params['regime']} | ATR={regime_params.get('atr_pct', 0)*100:.3f}%")
         
         if long_ready:
             logger.info(f" LONG READY: {' | '.join(long_reasons)}")
-        else:
-            logger.info(f" LONG BLOCKED: {' | '.join(long_reasons)}")
         
         if short_ready:
             logger.info(f" SHORT READY: {' | '.join(short_reasons)}")
-        else:
-            logger.info(f" SHORT BLOCKED: {' | '.join(short_reasons)}")
         
         logger.info("-" * 80)
 
@@ -1136,7 +1163,7 @@ class ZScoreIcebergHunterStrategy:
             self._last_report_total_trades = int(getattr(risk_manager, "total_trades", 0))
             return
         
-        if now_sec - self._last_report_sec < 900.0:
+        if now_sec - self._last_report_sec < config.TELEGRAM_REPORT_INTERVAL_SEC:
             return
         
         self._last_report_sec = now_sec
@@ -1144,9 +1171,6 @@ class ZScoreIcebergHunterStrategy:
         total_trades = int(getattr(risk_manager, "total_trades", 0))
         winning_trades = int(getattr(risk_manager, "winning_trades", 0))
         realized_pnl = float(getattr(risk_manager, "realized_pnl", 0.0))
-        
-        trades_since = max(0, total_trades - self._last_report_total_trades)
-        self._last_report_total_trades = total_trades
         
         win_rate = (winning_trades / total_trades) * 100.0 if total_trades > 0 else 0.0
         
@@ -1159,10 +1183,9 @@ class ZScoreIcebergHunterStrategy:
         
         msg = (
             f"📊 Z-Score 15m Report\n"
-            f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"Price: {current_price:.2f}\n"
             f"Trades: {total_trades} | WR: {win_rate:.1f}%\n"
-            f"Realized P&L: {realized_pnl:.2f}\n"
+            f"P&L: {realized_pnl:.2f}\n"
             f"Position: {pos_summary}"
         )
         try:
