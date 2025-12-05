@@ -1,6 +1,6 @@
 """
 Z-SCORE IMBALANCE ICEBERG HUNTER - Main Execution
-EVENT-DRIVEN with reduced API spam
+EVENT-DRIVEN with reduced API spam and comprehensive logging
 """
 
 import time
@@ -77,7 +77,7 @@ class ZScoreIcebergBot:
             signal.signal(signal.SIGTERM, self._signal_handler)
             logger.info("Signal handlers registered")
         
-        logger.info("Bot initialized\n")
+        logger.info("✓ Bot initialized\n")
 
     def _signal_handler(self, signum, frame) -> None:
         """Signal handler for graceful shutdown."""
@@ -177,6 +177,7 @@ class ZScoreIcebergBot:
             logger.info("=" * 80)
             logger.info("BOT RUNNING - EVENT-DRIVEN MODE")
             logger.info("Strategy reacts to WebSocket in <50ms")
+            logger.info("Comprehensive logging every 1 minute")
             logger.info("=" * 80)
             
             self.running = True
@@ -188,7 +189,7 @@ class ZScoreIcebergBot:
 
     def _run_main_loop(self) -> None:
         """Event-driven main loop (only health checks)."""
-        logger.info("Main loop active (minimal overhead)")
+        logger.info("Main loop active (minimal overhead)\n")
         last_health_sec = time.time()
         
         while self.running:
@@ -286,8 +287,6 @@ class ZScoreIcebergBot:
         
         try:
             last_price = self.data_manager.get_last_price()
-            
-            # Use cached balance (no API call)
             balance_info = self.risk_manager.get_available_balance()
             pos = self.strategy.current_position
             
@@ -311,6 +310,9 @@ class ZScoreIcebergBot:
                     f"Position: {pos.side.upper()} {pos.quantity:.3f} @ {pos.entry_price:.2f}\n"
                     f"uPnL: {upnl:.2f} ({upnl/pos.margin_used*100:.1f}%) | {dur_min:.1f}min"
                 )
+            
+            lines.append(f"\nTotal Trades: {self.risk_manager.total_trades}")
+            lines.append(f"Total P&L: {self.risk_manager.realized_pnl:.2f} USDT")
             
             send_telegram_message("\n".join(lines))
         except Exception:

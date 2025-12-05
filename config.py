@@ -1,6 +1,5 @@
 """
-Configuration - Z-Score Imbalance Iceberg Hunter Strategy (2025 Real Version)
-Core edge with Vol-Regime Detection & Weighted Score Gauntlet
+Configuration - Z-Score Strategy with comprehensive logging
 """
 
 import os
@@ -178,7 +177,7 @@ WINPROB_LV_WEIGHT = 0.1
 WINPROB_ENTRY_THRESHOLD = 0.6
 
 # ============================================================================
-# ADVANCED POSITION MANAGEMENT (NEW)
+# ADVANCED POSITION MANAGEMENT
 # ============================================================================
 VOLATILE_ATR_THRESHOLD = 0.003  # 0.3% ATR = volatile
 POSITION_CHECK_INTERVAL_SEC = 5.0  # Check momentum/vol/trend every 5s
@@ -188,22 +187,12 @@ HALF_TP_THRESHOLD = 0.5  # 50% of TP
 TP_BUFFER_PERCENT = 0.005  # 0.5% buffer when setting near TP
 
 # ============================================================================
-# LOGGING CONTROL (REDUCE SPAM)
+# LOGGING CONTROL
 # ============================================================================
-LOG_DECISION_INTERVAL_SEC = 300.0  # Log decision every 5 min (not 1 min)
-LOG_POSITION_INTERVAL_SEC = 180.0  # Log position every 3 min
+LOG_DECISION_INTERVAL_SEC = 60.0  # Log comprehensive decision every 1 minute
+LOG_POSITION_INTERVAL_SEC = 60.0  # Log position status every 1 minute
 TELEGRAM_REPORT_INTERVAL_SEC = 900.0  # Telegram report every 15 min
 BALANCE_CACHE_TTL_SEC = 300.0  # Cache balance for 5 min
-
-
-# Risk limits (add at end if missing)
-MAX_CONCURRENT_POSITIONS = 1
-MAX_DAILY_TRADES = 100
-MAX_DAILY_LOSS = 50.0
-MIN_MARGIN_PER_TRADE = 4.0
-MAX_MARGIN_PER_TRADE = 10000.0
-
-
 
 # ============================================================================
 # DISPLAY

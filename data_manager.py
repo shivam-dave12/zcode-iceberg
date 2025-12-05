@@ -1186,20 +1186,5 @@ class ZScoreDataManager:
         else:
             regime = "NEUTRAL"
         
-        logger.debug(f"[VOL-REGIME] ATR%={atr_pct*100:.3f}% → {regime}")
         return regime
 
-    def get_vol_regime(self, atr_pct: Optional[float]) -> str:
-        """
-        Classify volatility regime based on ATR%.
-        Returns: 'LOW', 'NEUTRAL', or 'HIGH'
-        """
-        if atr_pct is None:
-            return "NEUTRAL"
-        
-        if atr_pct < config.VOL_REGIME_LOW_ATR_PCT:
-            return "LOW"
-        elif atr_pct > config.VOL_REGIME_HIGH_ATR_PCT:
-            return "HIGH"
-        else:
-            return "NEUTRAL"

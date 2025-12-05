@@ -1,229 +1,171 @@
 """
-Risk Manager - Handles position sizing, risk limits, and trade statistics
-CORRECTED: Proper balance parsing for CoinSwitch API
+Risk Manager - Position sizing and risk controls with balance caching
 """
 
 import time
 import logging
-from typing import Dict, Optional, Tuple
-from datetime import datetime
-from futures_api import FuturesAPI
+from typing import Optional, Dict, Tuple
 import config
+from futures_api import FuturesAPI
 
 logger = logging.getLogger(__name__)
 
 class RiskManager:
-    """Manages risk parameters and position sizing"""
-    
-    def __init__(self):
-        """Initialize risk manager with balance caching"""
+    """Risk management with balance caching and vol-regime sizing"""
+
+    def __init__(self) -> None:
         self.api = FuturesAPI(
             api_key=config.COINSWITCH_API_KEY,
             secret_key=config.COINSWITCH_SECRET_KEY,
         )
+        self.total_trades: int = 0
+        self.winning_trades: int = 0
+        self.losing_trades: int = 0
+        self.realized_pnl: float = 0.0
+        self.daily_trades: int = 0
+        self.daily_pnl: float = 0.0
+        self.last_daily_reset: float = time.time()
         
-        # Daily statistics
-        self.daily_trades = 0
-        self.total_trades = 0  # Added for strategy.py
-        self.daily_pnl = 0.0
-        self.daily_wins = 0
-        self.daily_losses = 0
-        self.last_reset_date = datetime.now().date()
+        # Balance caching (reduce API spam)
+        self._cached_balance: Optional[Dict] = None
+        self._balance_cache_time: float = 0.0
+        self._balance_cache_ttl: float = config.BALANCE_CACHE_TTL_SEC
         
-        # Trade tracking
-        self.open_trades = 0
-        self.total_margin_used = 0.0
-        
-        # BALANCE CACHE - 3 second TTL
-        self._last_balance_time = 0
-        self._cached_balance = None
-        
-        logger.info("RiskManager initialized with balance caching")
-    
-    def _reset_daily_stats_if_needed(self):
-        """Reset daily statistics if new day"""
-        current_date = datetime.now().date()
-        if current_date != self.last_reset_date:
-            logger.info(f"New day - resetting stats (prev: {self.daily_trades} trades, P&L: {self.daily_pnl:.2f})")
-            self.daily_trades = 0
-            self.daily_pnl = 0.0
-            self.daily_wins = 0
-            self.daily_losses = 0
-            self.last_reset_date = current_date
-    
+        logger.info("✓ RiskManager initialized with balance caching")
+
     def get_available_balance(self, force_refresh: bool = False) -> Optional[Dict]:
         """
-        Get available balance with CORRECT CoinSwitch API parsing (1 call per 3 seconds MAX)
-        
-        Args:
-            force_refresh: If True, bypass cache and force fresh API call
-        
-        Response format: response["data"]["base_asset_balances"][0]["balances"]["total_available_balance"]
+        Get available balance with caching.
+        Only fetches from API if cache expired or force_refresh=True.
         """
         now = time.time()
         
-        # GLOBAL RATE LIMIT - 1 call per 3 seconds MAX (unless force_refresh)
-        if not force_refresh and now - self._last_balance_time < 3.0:
-            logger.debug("Balance rate limited - using cache")
-            return self._cached_balance
+        # Return cached balance if still valid
+        if not force_refresh and self._cached_balance is not None:
+            if now - self._balance_cache_time < self._balance_cache_ttl:
+                logger.debug(f"[BALANCE CACHE] Using cached: {self._cached_balance['available']:.2f} USDT")
+                return self._cached_balance
         
-        self._last_balance_time = now
-        
+        # Fetch fresh balance from API
         try:
-            # CORRECT METHOD: get_wallet_balance() not get_balance()
-            response = self.api.get_wallet_balance()
-            
-            if "data" in response and "base_asset_balances" in response["data"]:
-                balances = response["data"]["base_asset_balances"]
-                
-                # Find USDT balance
-                for asset in balances:
-                    if asset.get("base_asset") == "USDT":
-                        balances_dict = asset.get("balances", {})
-                        available_usdt = float(balances_dict.get("total_available_balance", 0.0))
-                        
-                        # Cache result
-                        self._cached_balance = {
-                            "available": available_usdt,
-                            "total": float(balances_dict.get("total_balance", 0.0)),
-                            "used": float(balances_dict.get("total_blocked_balance", 0.0)),
-                            "timestamp": now
-                        }
-                        
-                        logger.debug(f"✓ Fresh balance: {available_usdt:.2f} USDT available")
-                        return self._cached_balance
-                
-                logger.warning("No USDT balance found in response")
-                return self._cached_balance
+            balance = self.api.get_balance(currency="USDT")
+            if balance and "available" in balance:
+                self._cached_balance = balance
+                self._balance_cache_time = now
+                logger.info(f"[BALANCE API] Fetched: {balance['available']:.2f} USDT (cached for {self._balance_cache_ttl}s)")
+                return balance
             else:
-                logger.warning(f"Unexpected balance response: {response}")
-                return self._cached_balance
-                
+                logger.error("Invalid balance response from API")
+                return self._cached_balance  # Return stale cache if API fails
         except Exception as e:
             logger.error(f"Error fetching balance: {e}")
-            return self._cached_balance
+            return self._cached_balance  # Return stale cache on error
 
-    
-    def check_trading_allowed(self) -> Tuple[bool, str]:
-        """Check if trading is allowed based on risk limits"""
-        self._reset_daily_stats_if_needed()
-        
-        # Check daily trade limit
-        if self.daily_trades >= config.MAX_DAILY_TRADES:
-            return False, f"Daily trade limit ({self.daily_trades}/{config.MAX_DAILY_TRADES})"
-        
-        # Check daily loss limit
-        if self.daily_pnl < -config.MAX_DAILY_LOSS:
-            return False, f"Daily loss limit (${self.daily_pnl:.2f}/-${config.MAX_DAILY_LOSS})"
-        
-        # Check concurrent position limit
-        if self.open_trades >= config.MAX_CONCURRENT_POSITIONS:
-            return False, f"Max positions ({self.open_trades}/{config.MAX_CONCURRENT_POSITIONS})"
-        
-        # Check available balance
-        balance_info = self.get_available_balance()
-        if not balance_info:
-            return False, "Cannot fetch balance"
-        
-        available = float(balance_info.get("available", 0.0))
-        if available < config.MIN_MARGIN_PER_TRADE:
-            return False, f"Low balance (${available:.2f} < ${config.MIN_MARGIN_PER_TRADE})"
-        
-        return True, "OK"
-    
-    def calculate_position_size_regime_aware(
-        self,
-        entry_price: float,
-        vol_regime: str,
+    def calculate_position_size_vol_regime(
+        self, entry_price: float, regime: str, current_balance: float = None
     ) -> Tuple[float, float]:
         """
-        Calculate position size based on vol regime
-        
-        Returns:
-            (margin_to_use, quantity_in_btc)
+        Calculate position size based on vol regime.
+        Returns: (quantity, margin_used)
         """
-        balance_info = self.get_available_balance()
-        if not balance_info:
-            logger.error("Cannot calculate position size without balance")
-            return 0.0, 0.0
+        logger.info("=" * 80)
+        logger.info("[POSITION SIZING] Calculating size based on vol-regime")
         
-        available = float(balance_info.get("available", 0.0))
+        if current_balance is None:
+            balance_info = self.get_available_balance()
+            if not balance_info:
+                logger.error("Could not fetch balance for vol-regime sizing")
+                return 0.001, 0.0
+            current_balance = balance_info["available"]
         
-        # Vol-regime sizing
-        if vol_regime == "HIGH":
-            size_pct = config.VOL_REGIME_SIZE_HIGH_PCT
-        elif vol_regime == "LOW":
-            size_pct = config.VOL_REGIME_SIZE_LOW_PCT
+        logger.info(f"  Entry Price: {entry_price:.2f}")
+        logger.info(f"  Available Balance: {current_balance:.2f} USDT")
+        logger.info(f"  Vol Regime: {regime}")
+        
+        if regime == "HIGH":
+            size_pct = config.VOL_REGIME_HIGH_SIZE_PCT / 100.0
+            logger.info(f"  HIGH regime → Size %: {config.VOL_REGIME_HIGH_SIZE_PCT}%")
         else:
-            size_pct = (config.VOL_REGIME_SIZE_HIGH_PCT + config.VOL_REGIME_SIZE_LOW_PCT) / 2.0
+            size_pct = config.VOL_REGIME_LOW_SIZE_PCT / 100.0
+            logger.info(f"  LOW/NEUTRAL regime → Size %: {config.VOL_REGIME_LOW_SIZE_PCT}%")
         
-        margin_to_use = available * size_pct
-        margin_to_use = max(config.MIN_MARGIN_PER_TRADE, min(margin_to_use, config.MAX_MARGIN_PER_TRADE))
+        margin_used = current_balance * size_pct
+        logger.info(f"  Raw Margin: {margin_used:.2f} USDT")
         
-        # Calculate quantity
-        notional = margin_to_use * config.LEVERAGE
-        quantity = notional / entry_price
-        quantity = round(quantity, 6)
+        margin_used = max(config.MIN_MARGIN_PER_TRADE, min(margin_used, config.MAX_MARGIN_PER_TRADE))
+        logger.info(f"  Clamped Margin: {margin_used:.2f} USDT (min={config.MIN_MARGIN_PER_TRADE}, max={config.MAX_MARGIN_PER_TRADE})")
         
-        logger.info(f"Position size: vol={vol_regime}, usage={size_pct*100:.1f}%, margin={margin_to_use:.2f}, qty={quantity:.6f}")
+        quantity = (margin_used * config.LEVERAGE) / entry_price
+        quantity = max(0.001, round(quantity, 6))
         
-        return margin_to_use, quantity
-    
-    def record_trade_opened(self):
-        """Record that a trade was opened"""
-        self.open_trades += 1
-        self.total_trades += 1
-        logger.debug(f"Trade opened - open count: {self.open_trades}")
-    
-    def record_trade_closed(self):
-        """Record that a trade was closed"""
-        self.open_trades = max(0, self.open_trades - 1)
-        logger.debug(f"Trade closed - open count: {self.open_trades}")
-    
-    def update_trade_stats(self, pnl: float):
-        """Update daily trade statistics"""
-        self._reset_daily_stats_if_needed()
+        logger.info(f"  Leverage: {config.LEVERAGE}x")
+        logger.info(f"  Final Quantity: {quantity:.6f} BTC")
+        logger.info(f"  Position Value: {quantity * entry_price:.2f} USDT")
+        logger.info("=" * 80)
         
+        return quantity, margin_used
+
+    def check_trading_allowed(self) -> Tuple[bool, str]:
+        """Check if trading is allowed based on risk rules."""
+        self._maybe_reset_daily_counters()
+        
+        if not config.ENABLE_TRADING:
+            logger.warning("[RISK CHECK] Trading disabled in config")
+            return False, "TRADING_DISABLED"
+        
+        if self.daily_trades >= config.MAX_DAILY_TRADES:
+            logger.warning(f"[RISK CHECK] Max daily trades reached: {self.daily_trades}/{config.MAX_DAILY_TRADES}")
+            return False, f"MAX_DAILY_TRADES_REACHED ({self.daily_trades}/{config.MAX_DAILY_TRADES})"
+        
+        if self.daily_pnl <= -config.MAX_DAILY_LOSS:
+            logger.warning(f"[RISK CHECK] Max daily loss reached: {self.daily_pnl:.2f}/-{config.MAX_DAILY_LOSS}")
+            return False, f"MAX_DAILY_LOSS_REACHED ({self.daily_pnl:.2f}/-{config.MAX_DAILY_LOSS})"
+        
+        logger.debug(f"[RISK CHECK] ✓ Trading allowed (daily trades={self.daily_trades}, daily PnL={self.daily_pnl:.2f})")
+        return True, "OK"
+
+    def record_trade_opened(self) -> None:
+        """Record trade opening."""
         self.daily_trades += 1
+        self.total_trades += 1
+        logger.info(f"[TRADE COUNTER] Trade #{self.total_trades} opened (daily: {self.daily_trades})")
+        # Invalidate balance cache when trade is opened
+        self._cached_balance = None
+
+    def update_trade_stats(self, pnl: float) -> None:
+        """Update trade statistics."""
+        self.realized_pnl += pnl
         self.daily_pnl += pnl
         
         if pnl > 0:
-            self.daily_wins += 1
-            logger.info(f"✓ Winning trade: ${pnl:.2f}")
+            self.winning_trades += 1
+            logger.info(f"[TRADE STATS] ✓ WIN: +{pnl:.2f} USDT")
         else:
-            self.daily_losses += 1
-            logger.info(f"✗ Losing trade: ${pnl:.2f}")
+            self.losing_trades += 1
+            logger.info(f"[TRADE STATS] ✗ LOSS: {pnl:.2f} USDT")
         
-        logger.info(f"Daily stats: trades={self.daily_trades}, P&L={self.daily_pnl:.2f}, wins={self.daily_wins}, losses={self.daily_losses}")
-    
-    def get_daily_stats(self) -> Dict:
-        """Get daily statistics"""
-        self._reset_daily_stats_if_needed()
+        win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0.0
         
-        win_rate = (self.daily_wins / self.daily_trades * 100) if self.daily_trades > 0 else 0
+        logger.info("=" * 80)
+        logger.info("[CUMULATIVE STATS]")
+        logger.info(f"  Total Trades: {self.total_trades}")
+        logger.info(f"  Win Rate: {win_rate:.1f}% ({self.winning_trades}W / {self.losing_trades}L)")
+        logger.info(f"  Total P&L: {self.realized_pnl:.2f} USDT")
+        logger.info(f"  Daily P&L: {self.daily_pnl:.2f} USDT")
+        logger.info("=" * 80)
         
-        return {
-            "trades": self.daily_trades,
-            "pnl": self.daily_pnl,
-            "wins": self.daily_wins,
-            "losses": self.daily_losses,
-            "win_rate": win_rate,
-            "open_trades": self.open_trades,
-        }
+        # Invalidate balance cache after trade closes
+        self._cached_balance = None
 
-if __name__ == "__main__":
-    rm = RiskManager()
-    print("✓ RiskManager initialized")
-    
-    # Test balance
-    balance = rm.get_available_balance()
-    if balance:
-        print(f"✓ Balance: {balance['available']:.2f} USDT available")
-    
-    # Test trading allowed
-    allowed, reason = rm.check_trading_allowed()
-    print(f"Trading allowed: {allowed} - {reason}")
-    
-    # Test stats
-    stats = rm.get_daily_stats()
-    print(f"Daily stats: {stats}")
+    def _maybe_reset_daily_counters(self) -> None:
+        """Reset daily counters at midnight UTC."""
+        now = time.time()
+        if now - self.last_daily_reset >= 86400:
+            logger.info("=" * 80)
+            logger.info("[DAILY RESET] Resetting daily counters")
+            logger.info(f"  Previous Daily Trades: {self.daily_trades}")
+            logger.info(f"  Previous Daily P&L: {self.daily_pnl:.2f} USDT")
+            logger.info("=" * 80)
+            self.daily_trades = 0
+            self.daily_pnl = 0.0
+            self.last_daily_reset = now
