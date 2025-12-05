@@ -1,5 +1,6 @@
 """
 Z-Score Strategy with comprehensive parameter logging every minute
+FIXED: Removed duplicate OracleInputs, improved error handling
 """
 
 import time
@@ -13,12 +14,14 @@ from scipy.stats import norm
 import config
 from zscore_excel_logger import ZScoreExcelLogger
 from telegram_notifier import send_telegram_message
-from aether_oracle import AetherOracle, OracleInputs, OracleOutputs
+from aether_oracle import AetherOracle, OracleInputs, OracleOutputs, OracleSideScores
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class ZScorePosition:
+    """Position tracking dataclass"""
     trade_id: str
     side: str
     quantity: float
@@ -46,24 +49,15 @@ class ZScorePosition:
     last_momentum_check_sec: float
     tp_adjustment_count: int
 
-@dataclass
-class OracleInputs:
-    cvd: float = 0.0
-    lv_1m: float = 0.0
-    lv_5m: float = 0.0
-    lv_15m: float = 0.0
-    hurst: float = 0.5
-    bossignal: int = 0      # <-- ADD THIS
-    lstm_1m: float = 0.0
-    lstm_5m: float = 0.0
-    lstm_15m: float = 0.0
-
 
 class ZScoreIcebergHunterStrategy:
-    """Strategy with comprehensive logging every minute"""
+    """
+    Z-Score Iceberg Hunter Strategy
+    Industry-grade implementation with proper error handling
+    """
     
-    DECISION_LOG_INTERVAL_SEC = 60.0  # Log every 1 minute
-    POSITION_LOG_INTERVAL_SEC = 60.0  # Log position every 1 minute
+    DECISION_LOG_INTERVAL_SEC = 60.0
+    POSITION_LOG_INTERVAL_SEC = 60.0
     ORDER_STATUS_CHECK_INTERVAL_SEC = 10.0
 
     def __init__(self, excel_logger: Optional[ZScoreExcelLogger] = None) -> None:
@@ -94,50 +88,72 @@ class ZScoreIcebergHunterStrategy:
         desired_profit_roi: float,
         desired_sl_roi: float,
     ) -> Tuple[float, float]:
-        """Calculate TP/SL based on margin methodology."""
-        logger.info("=" * 80)
-        logger.info("[TP/SL CALCULATION] Using margin-based formula")
-        logger.info(f"  Entry Price: {entry_price:.2f}")
-        logger.info(f"  Margin Used: {margin_used:.2f} USDT")
-        logger.info(f"  Quantity: {quantity:.6f} BTC")
-        logger.info(f"  Side: {side.upper()}")
-        logger.info(f"  Desired TP ROI: {desired_profit_roi*100:.2f}%")
-        logger.info(f"  Desired SL ROI: {desired_sl_roi*100:.2f}%")
-        
-        # Calculate price movements
-        tp_price_movement = (margin_used * desired_profit_roi) / quantity
-        sl_price_movement = (margin_used * desired_sl_roi) / quantity
-        
-        logger.info(f"  TP Price Movement: {tp_price_movement:.2f} USDT")
-        logger.info(f"  SL Price Movement: {sl_price_movement:.2f} USDT")
-        
-        if side == "long":
-            tp_price = entry_price + tp_price_movement
-            sl_price = entry_price - sl_price_movement
-        else:
-            tp_price = entry_price - tp_price_movement
-            sl_price = entry_price + sl_price_movement
-        
-        logger.info(f"  ✓ TP Price: {tp_price:.2f}")
-        logger.info(f"  ✓ SL Price: {sl_price:.2f}")
-        logger.info("=" * 80)
-        
-        return tp_price, sl_price
+        """Calculate TP/SL based on margin methodology with validation"""
+        try:
+            logger.info("=" * 80)
+            logger.info("[TP/SL CALCULATION] Using margin-based formula")
+            logger.info(f"  Entry Price: {entry_price:.2f}")
+            logger.info(f"  Margin Used: {margin_used:.2f} USDT")
+            logger.info(f"  Quantity: {quantity:.6f} BTC")
+            logger.info(f"  Side: {side.upper()}")
+            logger.info(f"  Desired TP ROI: {desired_profit_roi*100:.2f}%")
+            logger.info(f"  Desired SL ROI: {desired_sl_roi*100:.2f}%")
+            
+            # Validate inputs
+            if entry_price <= 0 or margin_used <= 0 or quantity <= 0:
+                raise ValueError("Invalid input: prices/margin/quantity must be positive")
+            
+            # Calculate price movements
+            tp_price_movement = (margin_used * desired_profit_roi) / quantity
+            sl_price_movement = (margin_used * desired_sl_roi) / quantity
+            
+            logger.info(f"  TP Price Movement: {tp_price_movement:.2f} USDT")
+            logger.info(f"  SL Price Movement: {sl_price_movement:.2f} USDT")
+            
+            if side == "long":
+                tp_price = entry_price + tp_price_movement
+                sl_price = entry_price - sl_price_movement
+            else:
+                tp_price = entry_price - tp_price_movement
+                sl_price = entry_price + sl_price_movement
+            
+            # Validate outputs
+            if tp_price <= 0 or sl_price <= 0:
+                raise ValueError("Invalid TP/SL: prices must be positive")
+            
+            logger.info(f"  ✓ TP Price: {tp_price:.2f}")
+            logger.info(f"  ✓ SL Price: {sl_price:.2f}")
+            logger.info("=" * 80)
+            
+            return tp_price, sl_price
+            
+        except Exception as e:
+            logger.error(f"Error calculating TP/SL: {e}")
+            # Return safe defaults
+            if side == "long":
+                return entry_price * 1.01, entry_price * 0.99
+            else:
+                return entry_price * 0.99, entry_price * 1.01
 
     # ======================================================================
     # VOLATILITY REGIME
     # ======================================================================
     
     def _get_regime_params(self, data_manager, current_price: float) -> Dict:
-        """Get dynamic params based on vol regime."""
-        atr_pct = None
+        """Get dynamic params based on vol regime with error handling"""
         try:
             atr_pct = data_manager.get_atr_percent()
         except Exception as e:
-            logger.error(f"Error getting ATR%: {e}")
+            logger.debug(f"Error getting ATR%: {e}")
+            atr_pct = None
         
-        regime = data_manager.get_vol_regime(atr_pct) if hasattr(data_manager, 'get_vol_regime') else "NEUTRAL"
+        try:
+            regime = data_manager.get_vol_regime(atr_pct) if hasattr(data_manager, 'get_vol_regime') else "NEUTRAL"
+        except Exception as e:
+            logger.debug(f"Error getting vol regime: {e}")
+            regime = "NEUTRAL"
         
+        # Dynamic thresholds
         if regime == "LOW":
             z_thresh = config.VOL_REGIME_BASE_Z_THRESH - 0.3
         elif regime == "HIGH":
@@ -145,6 +161,7 @@ class ZScoreIcebergHunterStrategy:
         else:
             z_thresh = config.VOL_REGIME_BASE_Z_THRESH
         
+        # Regime-specific parameters
         if regime == "HIGH":
             wall_mult = config.VOL_REGIME_HIGH_WALL_MULT
             tp_mult = config.VOL_REGIME_HIGH_TP_MULT
@@ -163,8 +180,9 @@ class ZScoreIcebergHunterStrategy:
             "tp_mult": tp_mult,
             "sl_mult": sl_mult,
             "size_pct": size_pct,
-            "atr_pct": atr_pct,
+            "atr_pct": atr_pct or 0.0,
         }
+
 
     # ======================================================================
     # WEIGHTED SCORE CALCULATION

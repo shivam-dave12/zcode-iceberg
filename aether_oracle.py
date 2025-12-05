@@ -1,57 +1,67 @@
 """
 Aether Oracle - 9-Signal Data Fusion for Z-Score Strategy
+Industry-grade refactored version with proper error handling
 """
 
 import logging
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple, List
 import numpy as np
 import config
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class OracleInputs:
+    """All inputs required for oracle decision making"""
     # Core gates
-    imbalance_data: Optional[Dict]
-    wall_data: Optional[Dict]
-    delta_data: Optional[Dict]
-    touch_data: Optional[Dict]
-    htf_trend: Optional[str]
-    ltf_trend: Optional[str]
-    ema_val: Optional[float]
-    atr_pct: Optional[float]
+    imbalance_data: Optional[Dict] = None
+    wall_data: Optional[Dict] = None
+    delta_data: Optional[Dict] = None
+    touch_data: Optional[Dict] = None
+    htf_trend: Optional[str] = None
+    ltf_trend: Optional[str] = None
+    ema_val: Optional[float] = None
+    atr_pct: Optional[float] = None
     
     # Advanced metrics (9-signal fusion)
-    lv_1m: Optional[float]
-    lv_5m: Optional[float]
-    lv_15m: Optional[float]
-    micro_trap: bool
-    norm_cvd: Optional[float]
-    hurst: Optional[float]
-    bos_align: Optional[float]
+    lv_1m: Optional[float] = None
+    lv_5m: Optional[float] = None
+    lv_15m: Optional[float] = None
+    micro_trap: bool = False
+    norm_cvd: Optional[float] = None
+    hurst: Optional[float] = None
+    bos_align: Optional[float] = None  # FIXED: was bos_signal
+    
+    # LSTM predictions
+    lstm_1m: Optional[float] = None
+    lstm_5m: Optional[float] = None
+    lstm_15m: Optional[float] = None
     
     # Meta
-    current_price: float
-    now_sec: float
+    current_price: float = 0.0
+    now_sec: float = 0.0
 
 
 @dataclass
 class OracleSideScores:
+    """Scoring output for one side (long/short)"""
     side: str
-    mc: Optional[float]
-    bayes: Optional[float]
-    rl: Optional[float]
-    fused: Optional[float]
-    kelly_f: float
-    rr: float
-    reasons: List[str]
+    mc: Optional[float] = None
+    bayes: Optional[float] = None
+    rl: Optional[float] = None
+    fused: Optional[float] = None
+    kelly_f: float = 0.0
+    rr: float = 3.33
+    reasons: List[str] = field(default_factory=list)
 
 
 @dataclass
 class OracleOutputs:
+    """Complete oracle decision output"""
     long_scores: OracleSideScores
     short_scores: OracleSideScores
 
@@ -69,199 +79,27 @@ class AetherOracle:
         self.mc_paths: int = 100
         self._prob_min: float = 0.01
         self._prob_max: float = 0.99
+        logger.info("AetherOracle initialized")
 
     # ======================================================================
-    # RAW METRIC BUILDERS
-    # ======================================================================
-
-    def compute_liquidity_velocity_multi_tf(
-        self, data_manager
-    ) -> Tuple[Optional[float], Optional[float], Optional[float], bool]:
-        """
-        LV per TF: LV = sum(volume) / (sum(|ΔP|) + ε)
-        """
-        def _lv_for_window(window_sec: int) -> Optional[float]:
-            price_window = data_manager.get_price_window(window_seconds=window_sec)
-            if not price_window or len(price_window) < 2:
-                return None
-            
-            prices = [p for _, p in price_window]
-            deltas = [abs(prices[i] - prices[i - 1]) for i in range(1, len(prices))]
-            sum_abs_dp = float(sum(deltas))
-            eps = 1e-6
-            
-            trades = data_manager.get_recent_trades(window_seconds=window_sec)
-            if not trades:
-                return None
-            
-            vol_sum = 0.0
-            for t in trades:
-                try:
-                    qty = float(t.get("qty", 0.0))
-                except:
-                    qty = 0.0
-                if qty <= 0:
-                    continue
-                vol_sum += qty
-            
-            if vol_sum <= 0.0:
-                return None
-            
-            return vol_sum / (sum_abs_dp + eps)
-        
-        lv_1m = _lv_for_window(60)
-        lv_5m = _lv_for_window(300)
-        lv_15m = _lv_for_window(900)
-        
-        micro_trap = False
-        if lv_1m is not None and lv_5m is not None and lv_5m > 0:
-            if lv_1m > 1.5 * lv_5m:
-                micro_trap = True
-        
-        return lv_1m, lv_5m, lv_15m, micro_trap
-
-    def compute_norm_cvd(self, data_manager, window_sec: int) -> Optional[float]:
-        """
-        Normalized CVD: (Σ Vol_i * side_sign_i) / (Σ Vol_i)
-        """
-        trades = data_manager.get_recent_trades(window_seconds=window_sec)
-        if not trades:
-            if data_manager.get_last_price() > 0:
-                return 0.0
-            return None
-        
-        buy_vol = 0.0
-        sell_vol = 0.0
-        for t in trades:
-            try:
-                qty = float(t.get("qty", 0.0))
-            except:
-                qty = 0.0
-            if qty <= 0:
-                continue
-            is_buyer_maker = bool(t.get("isBuyerMaker", False))
-            if not is_buyer_maker:
-                buy_vol += qty
-            else:
-                sell_vol += qty
-        
-        total = buy_vol + sell_vol
-        if total <= 0.0:
-            return 0.0
-        
-        norm_cvd = (buy_vol - sell_vol) / total
-        return max(-1.0, min(1.0, norm_cvd))
-
-    def compute_hurst_exponent(
-        self, data_manager, window_ticks: int = 20
-    ) -> Optional[float]:
-        """
-        Hurst exponent via R/S method.
-        """
-        window_sec = getattr(config, "DELTA_WINDOW_SEC", 10) * 3
-        price_window = data_manager.get_price_window(window_seconds=window_sec)
-        if not price_window or len(price_window) < window_ticks:
-            return None
-        
-        prices = np.asarray([p for _, p in price_window], dtype=np.float64)
-        series = prices[-window_ticks:]
-        if len(series) < window_ticks:
-            return None
-        
-        mean = float(series.mean())
-        dev = series - mean
-        cum_dev = np.cumsum(dev)
-        r = float(np.max(cum_dev) - np.min(cum_dev))
-        s = float(np.std(cum_dev))
-        n = len(series)
-        
-        if n <= 1 or s == 0.0 or r <= 0.0:
-            return None
-        
-        try:
-            h = math.log(r / s) / math.log(n)
-        except:
-            return None
-        
-        return h
-
-    def compute_bos_alignment(
-        self, data_manager, current_price: float
-    ) -> Optional[float]:
-        """
-        Multi-TF BOS alignment: fraction of recent bars where price breaks structure.
-        """
-        try:
-            import pandas as pd
-        except ImportError:
-            return None
-        
-        def _build_ohlc(window_min: int, rule: str) -> Optional["pd.DataFrame"]:
-            window_sec = window_min * 60 * 10
-            price_window = data_manager.get_price_window(window_seconds=window_sec)
-            if not price_window:
-                return None
-            
-            df = pd.DataFrame(price_window, columns=["tsms", "price"])
-            if df.empty:
-                return None
-            
-            df["ts"] = pd.to_datetime(df["tsms"], unit="ms")
-            df.set_index("ts", inplace=True)
-            ohlc = df["price"].resample(rule).agg(["first", "max", "min", "last"])
-            ohlc.dropna(inplace=True)
-            if ohlc.empty:
-                return None
-            
-            ohlc.columns = ["open", "high", "low", "close"]
-            return ohlc
-        
-        bos_vals: List[float] = []
-        valid_count = 0
-        
-        for window_min, rule in ((15, "15min"), (5, "5min"), (1, "1min")):
-            ohlc = _build_ohlc(window_min, rule)
-            if ohlc is None:
-                continue
-            
-            tail = ohlc.tail(10)
-            if len(tail) == 0:
-                continue
-            
-            highs = tail["high"].values
-            lows = tail["low"].values
-            if len(highs) == 0:
-                continue
-            
-            breaks = 0
-            total = len(highs)
-            for h, l in zip(highs, lows):
-                if current_price > h or current_price < l:
-                    breaks += 1
-            
-            bos_tf = breaks / float(total)
-            bos_vals.append(bos_tf)
-            valid_count += 1
-        
-        if valid_count == 0:
-            return None
-        
-        align = float(sum(bos_vals) / valid_count)
-        return align
-
-    # ======================================================================
-    # FUSION COMPONENTS
+    # UTILITY FUNCTIONS
     # ======================================================================
 
     @staticmethod
     def _sigmoid(x: float) -> float:
+        """Sigmoid function with overflow protection"""
         try:
             return 1.0 / (1.0 + math.exp(-x))
         except OverflowError:
             return 1.0 if x > 0 else 0.0
 
     def _clamp_prob(self, p: float) -> float:
+        """Clamp probability to valid range"""
         return max(self._prob_min, min(self._prob_max, p))
+
+    # ======================================================================
+    # FUSION COMPONENTS
+    # ======================================================================
 
     def _compute_mc_component(
         self,
@@ -281,17 +119,21 @@ class AetherOracle:
         ):
             return None
         
-        sign_side = 1.0 if side == "long" else -1.0
-        mu = float(norm_cvd) * sign_side
-        sigma = max(float(atr_percent), 1e-4)
-        
-        paths = np.random.normal(loc=mu, scale=sigma, size=self.mc_paths)
-        sign_I = 1.0 if imbalance_val >= 0 else -1.0
-        
-        positives = float(np.sum(paths * sign_I > 0))
-        mc = positives / float(self.mc_paths)
-        
-        return self._clamp_prob(mc)
+        try:
+            sign_side = 1.0 if side == "long" else -1.0
+            mu = float(norm_cvd) * sign_side
+            sigma = max(float(atr_percent), 1e-4)
+            
+            paths = np.random.normal(loc=mu, scale=sigma, size=self.mc_paths)
+            sign_I = 1.0 if imbalance_val >= 0 else -1.0
+            
+            positives = float(np.sum(paths * sign_I > 0))
+            mc = positives / float(self.mc_paths)
+            
+            return self._clamp_prob(mc)
+        except Exception as e:
+            logger.error(f"Error in MC component: {e}")
+            return None
 
     def _compute_bayes_component(
         self,
@@ -307,26 +149,30 @@ class AetherOracle:
         if norm_cvd is None or imbalance_val is None:
             return None
         
-        sign_side = 1.0 if side == "long" else -1.0
-        f1 = float(norm_cvd) * sign_side
-        f2 = float(imbalance_val) * sign_side
-        
-        if bos_align is not None:
-            f3 = bos_align
-            w3 = 1.0
-        else:
-            f3 = 0.0
-            w3 = 0.0
-        
-        if hurst is not None:
-            f4 = max(float(hurst) - 0.5, 0.0)
-        else:
-            f4 = 0.0
-        
-        psy = 2.5 * f1 + 1.5 * f2 + w3 * f3 + 1.0 * f4
-        bayes_raw = self._sigmoid(psy)
-        
-        return self._clamp_prob(bayes_raw)
+        try:
+            sign_side = 1.0 if side == "long" else -1.0
+            f1 = float(norm_cvd) * sign_side
+            f2 = float(imbalance_val) * sign_side
+            
+            if bos_align is not None:
+                f3 = bos_align
+                w3 = 1.0
+            else:
+                f3 = 0.0
+                w3 = 0.0
+            
+            if hurst is not None:
+                f4 = max(float(hurst) - 0.5, 0.0)
+            else:
+                f4 = 0.0
+            
+            psy = 2.5 * f1 + 1.5 * f2 + w3 * f3 + 1.0 * f4
+            bayes_raw = self._sigmoid(psy)
+            
+            return self._clamp_prob(bayes_raw)
+        except Exception as e:
+            logger.error(f"Error in Bayes component: {e}")
+            return None
 
     def _compute_rl_component(
         self, side: str, risk_manager, hurst: Optional[float]
@@ -337,19 +183,27 @@ class AetherOracle:
         if hurst is None:
             return None
         
-        score = 0.5 + (0.5 - float(hurst))
-        return max(0.01, min(0.99, score))
+        try:
+            score = 0.5 + (0.5 - float(hurst))
+            return max(0.01, min(0.99, score))
+        except Exception as e:
+            logger.error(f"Error in RL component: {e}")
+            return None
 
     def _compute_kelly_fraction(self, p: float) -> float:
         """
         Kelly sizing: f = (p*b - q) / b, capped to 2%.
         """
-        p = max(0.0, min(1.0, p))
-        q = 1.0 - p
-        b = self.rr_assumed
-        edge = p * b - q
-        f = edge / b
-        return max(0.0, min(0.02, f))
+        try:
+            p = max(0.0, min(1.0, p))
+            q = 1.0 - p
+            b = self.rr_assumed
+            edge = p * b - q
+            f = edge / b
+            return max(0.0, min(0.02, f))
+        except Exception as e:
+            logger.error(f"Error in Kelly fraction: {e}")
+            return 0.0
 
     # ======================================================================
     # HIGH-LEVEL API
@@ -375,62 +229,48 @@ class AetherOracle:
             if cvd is not None:
                 norm_cvd = max(-1.0, min(1.0, cvd / 100.0))
         except Exception as e:
-            logger.error(f"Error calculating CVD: {e}")
+            logger.debug(f"Error calculating CVD: {e}")
         
-        # Liquidity Volatility (1m, 5m, 15m)
-        lv_1m = None
-        lv_5m = None
-        lv_15m = None
-        try:
-            lv_1m = data_manager.get_liquidity_volatility(timeframe="1m")
-            logger.debug(f"[LV DEBUG] 1m: {lv_1m}")
-        except Exception as e:
-            logger.error(f"Error calculating LV 1m: {e}")
-        
-        try:
-            lv_5m = data_manager.get_liquidity_volatility(timeframe="5m")
-            logger.debug(f"[LV DEBUG] 5m: {lv_5m}")
-        except Exception as e:
-            logger.error(f"Error calculating LV 5m: {e}")
-        
-        try:
-            lv_15m = data_manager.get_liquidity_volatility(timeframe="15m")
-            logger.debug(f"[LV DEBUG] 15m: {lv_15m}")
-        except Exception as e:
-            logger.error(f"Error calculating LV 15m: {e}")
+        # Liquidity Volatility
+        lv_1m = self._safe_get_lv(data_manager, "1m")
+        lv_5m = self._safe_get_lv(data_manager, "5m")
+        lv_15m = self._safe_get_lv(data_manager, "15m")
         
         # Hurst Exponent
         hurst = None
         try:
             hurst = data_manager.get_hurst_exponent()
         except Exception as e:
-            logger.error(f"Error calculating Hurst: {e}")
+            logger.debug(f"Error calculating Hurst: {e}")
         
-        # BOS (Break of Structure)
-        bos_signal = None
+        # BOS Alignment (FIXED: renamed from bos_signal to bos_align)
+        bos_align = None
         try:
             bos_signal = data_manager.get_bos_signal()
+            if bos_signal is not None:
+                # Convert BOS signal (-1, 0, 1) to alignment score [0, 1]
+                bos_align = (float(bos_signal) + 1.0) / 2.0
         except Exception as e:
-            logger.error(f"Error calculating BOS: {e}")
+            logger.debug(f"Error calculating BOS: {e}")
         
         # LSTM Predictions
-        lstm_1m = None
-        lstm_5m = None
-        lstm_15m = None
-        try:
-            lstm_1m = data_manager.get_lstm_prediction(timeframe="1m")
-        except Exception as e:
-            logger.error(f"Error getting LSTM 1m: {e}")
+        lstm_1m = self._safe_get_lstm(data_manager, "1m")
+        lstm_5m = self._safe_get_lstm(data_manager, "5m")
+        lstm_15m = self._safe_get_lstm(data_manager, "15m")
         
+        # ATR
+        atr_pct = None
         try:
-            lstm_5m = data_manager.get_lstm_prediction(timeframe="5m")
+            atr_pct = data_manager.get_atr_percent()
         except Exception as e:
-            logger.error(f"Error getting LSTM 5m: {e}")
+            logger.debug(f"Error calculating ATR: {e}")
         
+        # EMA
+        ema_val = None
         try:
-            lstm_15m = data_manager.get_lstm_prediction(timeframe="15m")
+            ema_val = data_manager.get_ema(period=config.EMA_PERIOD)
         except Exception as e:
-            logger.error(f"Error getting LSTM 15m: {e}")
+            logger.debug(f"Error calculating EMA: {e}")
         
         return OracleInputs(
             current_price=current_price,
@@ -440,17 +280,37 @@ class AetherOracle:
             touch_data=touch_data,
             htf_trend=htf_trend,
             ltf_trend=ltf_trend,
+            ema_val=ema_val,
+            atr_pct=atr_pct,
             norm_cvd=norm_cvd,
             lv_1m=lv_1m,
             lv_5m=lv_5m,
             lv_15m=lv_15m,
             hurst=hurst,
-            bos_signal=bos_signal,
+            bos_align=bos_align,
             lstm_1m=lstm_1m,
             lstm_5m=lstm_5m,
             lstm_15m=lstm_15m,
+            now_sec=time.time(),
         )
 
+    def _safe_get_lv(self, data_manager, timeframe: str) -> Optional[float]:
+        """Safely get liquidity volatility with error handling"""
+        try:
+            lv = data_manager.get_liquidity_volatility(timeframe=timeframe)
+            logger.debug(f"[LV {timeframe}] = {lv}")
+            return lv
+        except Exception as e:
+            logger.debug(f"Error getting LV {timeframe}: {e}")
+            return None
+
+    def _safe_get_lstm(self, data_manager, timeframe: str) -> Optional[float]:
+        """Safely get LSTM prediction with error handling"""
+        try:
+            return data_manager.get_lstm_prediction(timeframe=timeframe)
+        except Exception as e:
+            logger.debug(f"Error getting LSTM {timeframe}: {e}")
+            return None
 
     def compute_side_scores(
         self,
@@ -461,98 +321,105 @@ class AetherOracle:
         """
         Compute MC, Bayes, RL + fused score + Kelly for one side.
         """
-        imbalance_val = None
-        if inputs.imbalance_data is not None:
-            imbalance_val = float(inputs.imbalance_data.get("imbalance", 0.0))
-        
-        norm_cvd = inputs.norm_cvd
-        bos_align = inputs.bos_align
-        hurst = inputs.hurst
-        atr_pct = inputs.atr_pct
-        
-        mc = self._compute_mc_component(
-            side=side,
-            imbalance_val=imbalance_val,
-            norm_cvd=norm_cvd,
-            atr_percent=atr_pct,
-        )
-        
-        bayes = self._compute_bayes_component(
-            side=side,
-            imbalance_val=imbalance_val,
-            norm_cvd=norm_cvd,
-            bos_align=bos_align,
-            hurst=hurst,
-        )
-        
-        rl = self._compute_rl_component(side=side, risk_manager=risk_manager, hurst=hurst)
-        
-        # Fusion
-        components: List[Tuple[float, float]] = []
-        if mc is not None:
-            components.append((mc, 0.4))
-        if bayes is not None:
-            components.append((bayes, 0.3))
-        if rl is not None:
-            components.append((rl, 0.3))
-        
-        if not components:
-            fused: Optional[float] = None
-            kelly_f = 0.0
-        else:
-            num = sum(v * w for (v, w) in components)
-            den = sum(w for (_, w) in components)
-            fused_val = num / den if den > 0 else 0.0
-            fused_val = max(0.0, min(1.0, fused_val))
-            fused = fused_val
-            kelly_f = self._compute_kelly_fraction(p=fused_val)
-        
-        reasons: List[str] = []
-        if inputs.micro_trap and side == "short":
-            reasons.append("micro_trap=1")
-        if inputs.hurst is not None:
-            reasons.append(f"hurst={inputs.hurst:.2f}")
-        if inputs.bos_align is not None:
-            reasons.append(f"bos={inputs.bos_align:.2f}")
-        if inputs.norm_cvd is not None:
-            reasons.append(f"cvd={inputs.norm_cvd:.2f}")
-        if mc is not None:
-            reasons.append(f"mc={mc:.3f}")
-        if bayes is not None:
-            reasons.append(f"bayes={bayes:.3f}")
-        if rl is not None:
-            reasons.append(f"rl={rl:.3f}")
-        if fused is not None:
-            reasons.append(f"fused={fused:.3f}")
-        reasons.append(f"kelly={kelly_f:.4f}")
-        
-        return OracleSideScores(
-            side=side,
-            mc=mc,
-            bayes=bayes,
-            rl=rl,
-            fused=fused,
-            kelly_f=kelly_f,
-            rr=self.rr_assumed,
-            reasons=reasons,
-        )
+        try:
+            imbalance_val = None
+            if inputs.imbalance_data is not None:
+                imbalance_val = float(inputs.imbalance_data.get("imbalance", 0.0))
+            
+            mc = self._compute_mc_component(
+                side=side,
+                imbalance_val=imbalance_val,
+                norm_cvd=inputs.norm_cvd,
+                atr_percent=inputs.atr_pct,
+            )
+            
+            bayes = self._compute_bayes_component(
+                side=side,
+                imbalance_val=imbalance_val,
+                norm_cvd=inputs.norm_cvd,
+                bos_align=inputs.bos_align,
+                hurst=inputs.hurst,
+            )
+            
+            rl = self._compute_rl_component(
+                side=side,
+                risk_manager=risk_manager,
+                hurst=inputs.hurst
+            )
+            
+            # Fusion
+            components: List[Tuple[float, float]] = []
+            if mc is not None:
+                components.append((mc, 0.4))
+            if bayes is not None:
+                components.append((bayes, 0.3))
+            if rl is not None:
+                components.append((rl, 0.3))
+            
+            if not components:
+                fused = None
+                kelly_f = 0.0
+            else:
+                num = sum(v * w for (v, w) in components)
+                den = sum(w for (_, w) in components)
+                fused_val = num / den if den > 0 else 0.0
+                fused_val = max(0.0, min(1.0, fused_val))
+                fused = fused_val
+                kelly_f = self._compute_kelly_fraction(p=fused_val)
+            
+            # Build reasons
+            reasons: List[str] = []
+            if inputs.hurst is not None:
+                reasons.append(f"hurst={inputs.hurst:.2f}")
+            if inputs.bos_align is not None:
+                reasons.append(f"bos={inputs.bos_align:.2f}")
+            if inputs.norm_cvd is not None:
+                reasons.append(f"cvd={inputs.norm_cvd:.2f}")
+            if mc is not None:
+                reasons.append(f"mc={mc:.3f}")
+            if bayes is not None:
+                reasons.append(f"bayes={bayes:.3f}")
+            if rl is not None:
+                reasons.append(f"rl={rl:.3f}")
+            if fused is not None:
+                reasons.append(f"fused={fused:.3f}")
+            reasons.append(f"kelly={kelly_f:.4f}")
+            
+            return OracleSideScores(
+                side=side,
+                mc=mc,
+                bayes=bayes,
+                rl=rl,
+                fused=fused,
+                kelly_f=kelly_f,
+                rr=self.rr_assumed,
+                reasons=reasons,
+            )
+        except Exception as e:
+            logger.error(f"Error computing side scores for {side}: {e}")
+            return OracleSideScores(side=side, reasons=["error"])
 
     def decide(self, inputs: OracleInputs, risk_manager) -> Optional[OracleOutputs]:
         """
         Compute scores for both sides.
         """
-        long_scores = self.compute_side_scores("long", inputs, risk_manager)
-        short_scores = self.compute_side_scores("short", inputs, risk_manager)
-        
-        # Disable oracle if no components available
-        if (
-            long_scores.mc is None
-            and long_scores.bayes is None
-            and long_scores.rl is None
-            and short_scores.mc is None
-            and short_scores.bayes is None
-            and short_scores.rl is None
-        ):
+        try:
+            long_scores = self.compute_side_scores("long", inputs, risk_manager)
+            short_scores = self.compute_side_scores("short", inputs, risk_manager)
+            
+            # Disable oracle if no components available
+            if (
+                long_scores.mc is None
+                and long_scores.bayes is None
+                and long_scores.rl is None
+                and short_scores.mc is None
+                and short_scores.bayes is None
+                and short_scores.rl is None
+            ):
+                logger.debug("Oracle disabled: no valid components")
+                return None
+            
+            return OracleOutputs(long_scores=long_scores, short_scores=short_scores)
+        except Exception as e:
+            logger.error(f"Error in oracle decide: {e}")
             return None
-        
-        return OracleOutputs(long_scores=long_scores, short_scores=short_scores)
