@@ -46,6 +46,18 @@ class ZScorePosition:
     last_momentum_check_sec: float
     tp_adjustment_count: int
 
+@dataclass
+class OracleInputs:
+    cvd: float = 0.0
+    lv_1m: float = 0.0
+    lv_5m: float = 0.0
+    lv_15m: float = 0.0
+    hurst: float = 0.5
+    bossignal: int = 0      # <-- ADD THIS
+    lstm_1m: float = 0.0
+    lstm_5m: float = 0.0
+    lstm_15m: float = 0.0
+
 
 class ZScoreIcebergHunterStrategy:
     """Strategy with comprehensive logging every minute"""
