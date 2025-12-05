@@ -133,15 +133,18 @@ class ZScoreIcebergBot:
             
             # Set leverage (ONE-TIME API call)
             logger.info(f"Setting leverage to {config.LEVERAGE}x...")
-            lev_res = self.api.set_leverage(
-                symbol=config.SYMBOL,
-                exchange=config.EXCHANGE,
-                leverage=config.LEVERAGE,
-            )
-            if lev_res:
-                logger.info(f"✓ Leverage set to {config.LEVERAGE}x")
-            else:
-                logger.warning("Leverage may already be set")
+            try:
+                lev_res = self.api.set_leverage(
+                    symbol=config.SYMBOL,
+                    exchange=config.EXCHANGE,
+                    leverage=config.LEVERAGE,
+                )
+                if lev_res and "error" not in lev_res:
+                    logger.info(f"✓ Leverage set to {config.LEVERAGE}x")
+                else:
+                    logger.warning(f"Leverage response: {lev_res}")
+            except Exception as e:
+                logger.warning(f"Leverage setting: {e}")
             
             # Fetch initial balance (ONE-TIME API call, then cached)
             logger.info("Fetching initial balance...")

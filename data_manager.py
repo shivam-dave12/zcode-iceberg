@@ -1180,11 +1180,9 @@ class ZScoreDataManager:
             return "NEUTRAL"
         
         if atr_pct < config.VOL_REGIME_LOW_ATR_PCT:
-            regime = "LOW"
+            return "LOW"
         elif atr_pct > config.VOL_REGIME_HIGH_ATR_PCT:
-            regime = "HIGH"
+            return "HIGH"
         else:
-            regime = "NEUTRAL"
-        
-        return regime
+            return "NEUTRAL"
 

@@ -49,13 +49,14 @@ class RiskManager:
         # Fetch fresh balance from API
         try:
             balance = self.api.get_balance(currency="USDT")
-            if balance and "available" in balance:
+            
+            if balance and "error" not in balance and "available" in balance:
                 self._cached_balance = balance
                 self._balance_cache_time = now
                 logger.info(f"[BALANCE API] Fetched: {balance['available']:.2f} USDT (cached for {self._balance_cache_ttl}s)")
                 return balance
             else:
-                logger.error("Invalid balance response from API")
+                logger.error(f"Invalid balance response: {balance}")
                 return self._cached_balance  # Return stale cache if API fails
         except Exception as e:
             logger.error(f"Error fetching balance: {e}")

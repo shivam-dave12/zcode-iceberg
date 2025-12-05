@@ -370,6 +370,76 @@ class FuturesAPI:
     def fetch_klines(self, *args, **kwargs):
         return self.get_klines(*args, **kwargs)
 
+
+    def get_balance(self, currency: str = "USDT") -> Dict:
+        """
+        Get balance for specific currency (wrapper around get_wallet_balance)
+        
+        Args:
+            currency: Currency to get balance for (default: USDT)
+            
+        Returns:
+            Dict with 'available', 'locked', 'currency' keys
+        """
+        try:
+            wallet = self.get_wallet_balance()
+            
+            # Check for errors in response
+            if "error" in wallet:
+                return wallet
+            
+            # Parse wallet response based on actual API structure
+            # The response structure may vary - adjust based on your actual API
+            if "data" in wallet:
+                data = wallet["data"]
+                
+                # If data is a dict with balances array
+                if isinstance(data, dict) and "balances" in data:
+                    for bal in data["balances"]:
+                        if bal.get("currency") == currency or bal.get("asset") == currency:
+                            return {
+                                "available": float(bal.get("available", bal.get("free", 0))),
+                                "locked": float(bal.get("locked", 0)),
+                                "currency": currency
+                            }
+                
+                # If data is a direct balance object
+                elif isinstance(data, dict):
+                    return {
+                        "available": float(data.get("available", data.get("availableBalance", 0))),
+                        "locked": float(data.get("locked", data.get("frozenBalance", 0))),
+                        "currency": currency
+                    }
+            
+            # If wallet is the direct data (no "data" wrapper)
+            elif isinstance(wallet, dict):
+                # Check if it has balances array
+                if "balances" in wallet:
+                    for bal in wallet["balances"]:
+                        if bal.get("currency") == currency or bal.get("asset") == currency:
+                            return {
+                                "available": float(bal.get("available", bal.get("free", 0))),
+                                "locked": float(bal.get("locked", 0)),
+                                "currency": currency
+                            }
+                # Direct balance fields
+                else:
+                    return {
+                        "available": float(wallet.get("available", wallet.get("availableBalance", 0))),
+                        "locked": float(wallet.get("locked", wallet.get("frozenBalance", 0))),
+                        "currency": currency
+                    }
+            
+            # If nothing matches, return error
+            return {
+                "error": "Could not parse wallet balance",
+                "raw_response": wallet
+            }
+            
+        except Exception as e:
+            return {"error": f"Exception getting balance: {str(e)}"}
+
+
 if __name__ == "__main__":
     # Quick test
     try:

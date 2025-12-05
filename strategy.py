@@ -48,7 +48,7 @@ class ZScorePosition:
 
 
 class ZScoreIcebergHunterStrategy:
-    """Strategy with comprehensive logging"""
+    """Strategy with comprehensive logging every minute"""
     
     DECISION_LOG_INTERVAL_SEC = 60.0  # Log every 1 minute
     POSITION_LOG_INTERVAL_SEC = 60.0  # Log position every 1 minute
@@ -64,7 +64,6 @@ class ZScoreIcebergHunterStrategy:
         self._last_position_log_sec: float = 0.0
         self._last_status_check_sec: float = 0.0
         self._oracle = AetherOracle()
-        self._last_report_sec: float = 0.0
         
         logger.info("=" * 80)
         logger.info("Z-SCORE STRATEGY INITIALIZED")
@@ -230,7 +229,7 @@ class ZScoreIcebergHunterStrategy:
         oracle_outputs: Optional[OracleOutputs],
         side: str,
     ) -> Tuple[float, List[str]]:
-        """Compute Aether 9-signal fusion."""
+        """Compute Aether fusion score."""
         if oracle_inputs is None or oracle_outputs is None:
             return 0.0, ["aether=MISSING"]
         
@@ -699,7 +698,7 @@ class ZScoreIcebergHunterStrategy:
                 data_manager, pos.side, current_price
             )
             
-            logger.info(f"[MOMENTUM CHECK] {pos.trade_id} | Hold={hold_min:.1f}min | "
+            logger.debug(f"[MOMENTUM CHECK] {pos.trade_id} | Hold={hold_min:.1f}min | "
                        f"Profit={current_profit_pct*100:.2f}% | "
                        f"Momentum={momentum_favorable} Vol={vol_favorable} Trend={trend_favorable}")
             
