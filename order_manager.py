@@ -96,7 +96,7 @@ class OrderManager:
         Polls order status until filled or timeout.
         """
         start_time = time.time()
-        check_interval = 0.5  # ← ADD THIS: Check every 500ms instead of rapid fire
+        check_interval = 1.0  # ← ADD THIS: Check every 500ms instead of rapid fire
         
         while time.time() - start_time < timeout_sec:
             try:
