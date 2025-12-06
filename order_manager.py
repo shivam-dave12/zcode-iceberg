@@ -377,25 +377,53 @@ class OrderManager:
             return False
 
     def get_order_status(self, order_id: str) -> Optional[Dict]:
-        """Get order status."""
+        """
+        Get order status with robust error handling.
+        """
         try:
             response = self.api.get_order(order_id)
-
-            if "data" in response:
-                order_data = response["data"].get("order", response["data"])
-
-                if order_id in self.active_orders:
-                    self.active_orders[order_id]["status"] = order_data.get(
-                        "status", "UNKNOWN"
-                    )
-
-                return order_data
-            else:
-                logger.warning(f"Could not get order status for {order_id}")
+            
+            # Not a dict = failure
+            if not isinstance(response, dict):
                 return None
+            
+            # Explicit error = failure
+            if "error" in response:
+                error_msg = response.get("error")
+                # Only log as warning if it's a real error (not just "not found")
+                if "not found" not in str(error_msg).lower():
+                    logger.debug(f"Order status error for {order_id}: {error_msg}")
+                return None
+            
+            # Extract status from response
+            status = None
+            order_data = response
+            
+            # Try multiple structures
+            if "status" in response:
+                status = response["status"]
+            elif "data" in response:
+                data = response.get("data", {})
+                if isinstance(data, dict):
+                    if "order" in data:
+                        order_data = data["order"]
+                        status = order_data.get("status")
+                    elif "status" in data:
+                        order_data = data
+                        status = data["status"]
+            
+            # No status found = can't determine order state
+            if not status:
+                return None
+            
+            # Update tracking
+            if order_id in self.active_orders:
+                self.active_orders[order_id]["status"] = status
+            
+            return order_data
 
         except Exception as e:
-            logger.error(f"Error getting order status: {e}")
+            logger.debug(f"Exception getting order status: {e}")
             return None
 
     def get_open_orders(self) -> list:
