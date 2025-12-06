@@ -447,24 +447,18 @@ class ZScoreIcebergHunterStrategy:
         oracle_inputs: Optional[OracleInputs],
         oracle_outputs: Optional[OracleOutputs],
     ) -> None:
-        """Evaluate LONG/SHORT with comprehensive logging every minute."""
+        """Evaluate LONG/SHORT every tick, log every minute."""
         if not all([imbalance_data, wall_data, delta_data, touch_data]):
             return
 
-        # Log every minute
-        if now_sec - self._last_decision_log_sec < self.DECISION_LOG_INTERVAL_SEC:
-            return
-
-        self._last_decision_log_sec = now_sec
-
-        # Get regime params
+        # Get regime params (EVERY TICK)
         regime_params = self._get_regime_params(data_manager, current_price)
         regime = regime_params["regime"]
         z_thresh = regime_params["z_thresh"]
         wall_mult = regime_params["wall_mult"]
         atr_pct = regime_params.get("atr_pct", 0.0)
 
-        # EMA trend
+        # EMA trend (EVERY TICK)
         ema_val: Optional[float] = None
         try:
             ema_val = data_manager.get_ema(period=config.EMA_PERIOD)
@@ -474,7 +468,7 @@ class ZScoreIcebergHunterStrategy:
         trend_long_ok = (ema_val is not None and current_price > ema_val)
         trend_short_ok = (ema_val is not None and current_price < ema_val)
 
-        # Compute scores
+        # Compute scores (EVERY TICK)
         long_core, long_core_reasons = self._compute_weighted_score(
             imbalance_data, wall_data, delta_data, touch_data,
             trend_long_ok, "long", regime, z_thresh, wall_mult
@@ -496,52 +490,57 @@ class ZScoreIcebergHunterStrategy:
         long_entry = (long_total > config.SCORE_ENTRY_THRESHOLD)
         short_entry = (short_total > config.SCORE_ENTRY_THRESHOLD)
 
-        # COMPREHENSIVE LOGGING EVERY MINUTE
-        logger.info("\n" + "=" * 100)
-        logger.info(f"[DECISION REPORT] {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
-        logger.info("=" * 100)
-        logger.info(f"PRICE: {current_price:.2f} USDT")
-        logger.info(f"")
-        logger.info(f"[VOL REGIME]")
-        logger.info(f"  Regime: {regime}")
-        logger.info(f"  ATR%: {atr_pct*100:.3f}% (LOW<{config.VOL_REGIME_LOW_ATR_PCT*100:.2f}%, HIGH>{config.VOL_REGIME_HIGH_ATR_PCT*100:.2f}%)")
-        logger.info(f"  Z Threshold: {z_thresh:.2f}")
-        logger.info(f"  Wall Multiplier: {wall_mult:.2f}")
-        logger.info(f"")
-        logger.info(f"[CORE METRICS]")
-        logger.info(f"  Imbalance: {imbalance_data['imbalance']:.3f} (threshold: ±{config.IMBALANCE_THRESHOLD})")
-        logger.info(f"    Total Bid: {imbalance_data['total_bid']:.2f} BTC")
-        logger.info(f"    Total Ask: {imbalance_data['total_ask']:.2f} BTC")
-        logger.info(f"  Wall Strength:")
-        logger.info(f"    Bid: {wall_data['bid_wall_strength']:.2f}x (volume: {wall_data['bid_vol_zone']:.2f} BTC)")
-        logger.info(f"    Ask: {wall_data['ask_wall_strength']:.2f}x (volume: {wall_data['ask_vol_zone']:.2f} BTC)")
-        logger.info(f"  Z-Score: {delta_data['z_score']:.2f} (threshold: ±{z_thresh:.2f})")
-        logger.info(f"    Buy Volume: {delta_data['buy_vol']:.4f} BTC")
-        logger.info(f"    Sell Volume: {delta_data['sell_vol']:.4f} BTC")
-        logger.info(f"    Delta: {delta_data['delta']:.4f} BTC")
-        logger.info(f"  Price Touch:")
-        logger.info(f"    Bid Distance: {touch_data['bid_distance_ticks']:.1f} ticks (threshold: {config.PRICE_TOUCH_THRESHOLD_TICKS})")
-        logger.info(f"    Ask Distance: {touch_data['ask_distance_ticks']:.1f} ticks")
-        logger.info(f"  Trend:")
-        logger.info(f"    EMA{config.EMA_PERIOD}: {ema_val:.2f}" if ema_val else "    EMA: N/A")
-        logger.info(f"    HTF Trend: {htf_trend or 'N/A'}")
-        logger.info(f"    Long Trend OK: {trend_long_ok}")
-        logger.info(f"    Short Trend OK: {trend_short_ok}")
-        logger.info(f"")
-        logger.info(f"[SCORE BREAKDOWN]")
-        logger.info(f"  LONG:")
-        logger.info(f"    Core (65%): {long_core:.3f} | {' | '.join(long_core_reasons)}")
-        logger.info(f"    Aether (35%): {long_aether:.3f} | {' | '.join(long_aether_reasons)}")
-        logger.info(f"    TOTAL: {long_total:.3f} (threshold: {config.SCORE_ENTRY_THRESHOLD})")
-        logger.info(f"    → {'✓ ENTRY SIGNAL' if long_entry else '✗ NO ENTRY'}")
-        logger.info(f"  SHORT:")
-        logger.info(f"    Core (65%): {short_core:.3f} | {' | '.join(short_core_reasons)}")
-        logger.info(f"    Aether (35%): {short_aether:.3f} | {' | '.join(short_aether_reasons)}")
-        logger.info(f"    TOTAL: {short_total:.3f} (threshold: {config.SCORE_ENTRY_THRESHOLD})")
-        logger.info(f"    → {'✓ ENTRY SIGNAL' if short_entry else '✗ NO ENTRY'}")
-        logger.info("=" * 100 + "\n")
+        # LOG ONLY EVERY MINUTE (separate from decision logic)
+        should_log = (now_sec - self._last_decision_log_sec >= self.DECISION_LOG_INTERVAL_SEC)
+        
+        if should_log:
+            self._last_decision_log_sec = now_sec
+            
+            logger.info("\n" + "=" * 100)
+            logger.info(f"[DECISION REPORT] {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            logger.info("=" * 100)
+            logger.info(f"PRICE: {current_price:.2f} USDT")
+            logger.info(f"")
+            logger.info(f"[VOL REGIME]")
+            logger.info(f"  Regime: {regime}")
+            logger.info(f"  ATR%: {atr_pct*100:.3f}% (LOW<{config.VOL_REGIME_LOW_ATR_PCT*100:.2f}%, HIGH>{config.VOL_REGIME_HIGH_ATR_PCT*100:.2f}%)")
+            logger.info(f"  Z Threshold: {z_thresh:.2f}")
+            logger.info(f"  Wall Multiplier: {wall_mult:.2f}")
+            logger.info(f"")
+            logger.info(f"[CORE METRICS]")
+            logger.info(f"  Imbalance: {imbalance_data['imbalance']:.3f} (threshold: ±{config.IMBALANCE_THRESHOLD})")
+            logger.info(f"    Total Bid: {imbalance_data['total_bid']:.2f} BTC")
+            logger.info(f"    Total Ask: {imbalance_data['total_ask']:.2f} BTC")
+            logger.info(f"  Wall Strength:")
+            logger.info(f"    Bid: {wall_data['bid_wall_strength']:.2f}x (volume: {wall_data['bid_vol_zone']:.2f} BTC)")
+            logger.info(f"    Ask: {wall_data['ask_wall_strength']:.2f}x (volume: {wall_data['ask_vol_zone']:.2f} BTC)")
+            logger.info(f"  Z-Score: {delta_data['z_score']:.2f} (threshold: ±{z_thresh:.2f})")
+            logger.info(f"    Buy Volume: {delta_data['buy_vol']:.4f} BTC")
+            logger.info(f"    Sell Volume: {delta_data['sell_vol']:.4f} BTC")
+            logger.info(f"    Delta: {delta_data['delta']:.4f} BTC")
+            logger.info(f"  Price Touch:")
+            logger.info(f"    Bid Distance: {touch_data['bid_distance_ticks']:.1f} ticks (threshold: {config.PRICE_TOUCH_THRESHOLD_TICKS})")
+            logger.info(f"    Ask Distance: {touch_data['ask_distance_ticks']:.1f} ticks")
+            logger.info(f"  Trend:")
+            logger.info(f"    EMA{config.EMA_PERIOD}: {ema_val:.2f}" if ema_val else "    EMA: N/A")
+            logger.info(f"    HTF Trend: {htf_trend or 'N/A'}")
+            logger.info(f"    Long Trend OK: {trend_long_ok}")
+            logger.info(f"    Short Trend OK: {trend_short_ok}")
+            logger.info(f"")
+            logger.info(f"[SCORE BREAKDOWN]")
+            logger.info(f"  LONG:")
+            logger.info(f"    Core (65%): {long_core:.3f} | {' | '.join(long_core_reasons)}")
+            logger.info(f"    Aether (35%): {long_aether:.3f} | {' | '.join(long_aether_reasons)}")
+            logger.info(f"    TOTAL: {long_total:.3f} (threshold: {config.SCORE_ENTRY_THRESHOLD})")
+            logger.info(f"    → {'✓ ENTRY SIGNAL' if long_entry else '✗ NO ENTRY'}")
+            logger.info(f"  SHORT:")
+            logger.info(f"    Core (65%): {short_core:.3f} | {' | '.join(short_core_reasons)}")
+            logger.info(f"    Aether (35%): {short_aether:.3f} | {' | '.join(short_aether_reasons)}")
+            logger.info(f"    TOTAL: {short_total:.3f} (threshold: {config.SCORE_ENTRY_THRESHOLD})")
+            logger.info(f"    → {'✓ ENTRY SIGNAL' if short_entry else '✗ NO ENTRY'}")
+            logger.info("=" * 100 + "\n")
 
-        # Enter if signal
+        # ENTRY LOGIC RUNS EVERY TICK (regardless of logging)
         if long_entry:
             self._enter_position(
                 data_manager, order_manager, risk_manager, "long", current_price,
