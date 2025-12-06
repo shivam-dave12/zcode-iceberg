@@ -90,60 +90,40 @@ class OrderManager:
 
         return price
 
-    def wait_for_fill(
-        self,
-        order_id: str,
-        timeout_sec: float = 3.0,
-        poll_interval_sec: float = 0.1,
-    ) -> Dict:
+    def wait_for_fill(self, order_id: str, timeout_sec: float = 30.0) -> Dict:
         """
-        Poll order status until a real fill is present or timeout.
-
-        Conditions to return:
-        - status in EXECUTED / PARTIALLY_EXECUTED / FILLED (case-insensitive)
-        - exec_quantity > 0
-        - avg_execution_price (or equivalent) > 0
-
-        Raises RuntimeError on:
-        - timeout without valid fill
-        - status in CANCELLED / REJECTED
-        - API / rate limit errors
+        Wait for order to fill with timeout.
+        Polls order status until filled or timeout.
         """
-        start = time.time()
-        last_data: Optional[Dict] = None
-
-        while True:
-            now = time.time()
-            if now - start > timeout_sec:
-                raise RuntimeError(
-                    f"Timed out waiting for fill on order {order_id}. Last status: {last_data}"
-                )
-
-            status_resp = self.get_order_status(order_id)
-            if not status_resp:
-                time.sleep(poll_interval_sec)
-                continue
-
-            last_data = status_resp
-            status = str(status_resp.get("status", "")).upper()
-            exec_qty_str = status_resp.get("exec_quantity") or status_resp.get(
-                "executed_qty"
-            )
+        start_time = time.time()
+        check_interval = 0.5  # ← ADD THIS: Check every 500ms instead of rapid fire
+        
+        while time.time() - start_time < timeout_sec:
             try:
-                exec_qty = float(exec_qty_str) if exec_qty_str is not None else 0.0
-            except Exception:
-                exec_qty = 0.0
+                status = self.get_order_status(order_id)
+                
+                if status:
+                    order_status = status.get("status", "").upper()
+                    
+                    if order_status in ("EXECUTED", "FILLED"):
+                        logger.info(f"✓ Order filled: {order_id}")
+                        return status
+                    elif order_status in ("CANCELLED", "REJECTED", "EXPIRED"):
+                        raise Exception(f"Order {order_id} terminated: {order_status}")
+                
+                time.sleep(check_interval)  # ← ADD THIS: Wait before next check
+                
+            except Exception as e:
+                logger.debug(f"Error checking order status: {e}")
+                time.sleep(check_interval)  # ← ADD THIS: Wait even on error
+        
+        # Timeout - get final status
+        final_status = self.get_order_status(order_id)
+        raise Exception(
+            f"Timed out waiting for fill on order {order_id}. "
+            f"Last status: {final_status}"
+        )
 
-            if status in ("CANCELLED", "REJECTED"):
-                raise RuntimeError(
-                    f"Order {order_id} not filled. Status={status}, data={status_resp}"
-                )
-
-            if exec_qty > 0:
-                _ = self.extract_fill_price(status_resp)
-                return status_resp
-
-            time.sleep(poll_interval_sec)
 
     # ======================================================================
     # Order placement
