@@ -81,15 +81,13 @@ class ZScoreIcebergHunterStrategy:
         self._last_status_check_sec: float = 0.0
         self._oracle = AetherOracle()
 
+        self._signal_history: deque = deque(maxlen=3)
+        self._last_signal_time: float = 0.0
+
         logger.info("=" * 80)
         logger.info("Z-SCORE STRATEGY INITIALIZED")
         logger.info("With Session + Weekend Volatility Gates")
         logger.info("=" * 80)
-
-        # Signal confirmation tracking (3 consecutive signals required)
-        from collections import deque
-        self._signal_history: deque = deque(maxlen=3)
-        self._last_signal_time: float = 0.0
 
     # ======================================================================
     # SESSION + WEEKEND DETECTION (FIRST GATE)
