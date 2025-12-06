@@ -1,6 +1,6 @@
 """
-CoinSwitch Futures Trading API Plugin - CORRECTED
-Proper signature generation matching official specification
+CoinSwitch Futures Trading API Plugin
+CORRECTED: Proper signature generation matching official specification
 """
 
 import os
@@ -16,9 +16,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-class CoinSwitchFuturesAPI:
+class FuturesAPI:
     """CoinSwitch Futures Trading API Client"""
-
+    
     def __init__(self, api_key: str = None, secret_key: str = None):
         """
         Initialize Futures API client
@@ -27,20 +27,14 @@ class CoinSwitchFuturesAPI:
             api_key: CoinSwitch API key
             secret_key: CoinSwitch secret key
         """
-        self.api_key = api_key or os.getenv("COINSWITCH_API_KEY")
-        self.secret_key = secret_key or os.getenv("COINSWITCH_SECRET_KEY")
+        self.api_key = api_key or os.getenv('COINSWITCH_API_KEY')
+        self.secret_key = secret_key or os.getenv('COINSWITCH_SECRET_KEY')
         self.base_url = "https://coinswitch.co"
-
+        
         if not self.api_key or not self.secret_key:
             raise ValueError("API key and secret key required")
-
-    def _generate_signature(
-        self,
-        method: str,
-        endpoint: str,
-        params: Dict = None,
-        payload: Dict = None,
-    ) -> str:
+    
+    def _generate_signature(self, method: str, endpoint: str, params: Dict = None, payload: Dict = None) -> str:
         """
         Generate ED25519 signature
         
@@ -51,7 +45,7 @@ class CoinSwitchFuturesAPI:
         Args:
             method: HTTP method
             endpoint: API endpoint
-            params: Query parameters (for GET)
+            params: Query parameters for GET
             payload: Body payload
             
         Returns:
@@ -59,87 +53,67 @@ class CoinSwitchFuturesAPI:
         """
         params = params or {}
         payload = payload or {}
-
+        
         unquote_endpoint = endpoint
-
+        
+        # Add query parameters to endpoint if GET
         if method == "GET" and len(params) != 0:
             endpoint += ('&', '?')[urlparse(endpoint).query == ''] + urlencode(params)
             unquote_endpoint = urllib.parse.unquote_plus(endpoint)
-
+        
+        # CRITICAL: Always include JSON payload in signature (even empty {})
         payload_json = json.dumps(payload, separators=(',', ':'), sort_keys=True)
         signature_msg = method + unquote_endpoint + payload_json
+        
         request_string = bytes(signature_msg, 'utf-8')
-
         secret_key_bytes = bytes.fromhex(self.secret_key)
         secret_key_obj = ed25519.Ed25519PrivateKey.from_private_bytes(secret_key_bytes)
         signature_bytes = secret_key_obj.sign(request_string)
-
+        
         return signature_bytes.hex()
-
-    def _make_request(
-        self,
-        method: str,
-        endpoint: str,
-        params: Dict = None,
-        payload: Dict = None,
-    ) -> Dict:
+    
+    def _make_request(self, method: str, endpoint: str, params: Dict = None, payload: Dict = None) -> Dict:
         """Make authenticated API request"""
         signature = self._generate_signature(method, endpoint, params, payload)
-
+        
         url = self.base_url + endpoint
         if method == "GET" and params:
             url += ('&', '?')[urlparse(endpoint).query == ''] + urlencode(params)
-
+        
         headers = {
-            "Content-Type": "application/json",
-            "X-AUTH-SIGNATURE": signature,
-            "X-AUTH-APIKEY": self.api_key,
+            'Content-Type': 'application/json',
+            'X-AUTH-SIGNATURE': signature,
+            'X-AUTH-APIKEY': self.api_key
         }
-
+        
         try:
-            response = requests.request(
-                method,
-                url,
-                headers=headers,
-                json=payload if payload else {}
-            )
+            response = requests.request(method, url, headers=headers, json=payload if payload else {})
             response.raise_for_status()
             return response.json()
-
         except requests.exceptions.RequestException as e:
             error_response = {
                 "error": str(e),
-                "status_code": getattr(e.response, "status_code", None) if hasattr(e, "response") else None,
+                "status_code": getattr(e.response, 'status_code', None) if hasattr(e, 'response') else None,
             }
-            if hasattr(e, "response") and e.response is not None:
+            if hasattr(e, 'response') and e.response is not None:
                 try:
-                    error_response["response"] = e.response.json()
+                    error_response['response'] = e.response.json()
                 except:
-                    error_response["response"] = e.response.text
+                    error_response['response'] = e.response.text
             return error_response
-
-    # ======================================================================
-    # ORDER MANAGEMENT
-    # ======================================================================
-
-    def place_order(
-        self,
-        symbol: str,
-        side: str,
-        order_type: str,
-        quantity: float,
-        exchange: str = "EXCHANGE_2",
-        price: float = None,
-        trigger_price: float = None,
-        reduce_only: bool = False,
-    ) -> Dict:
+    
+    # ============ ORDER MANAGEMENT ============
+    
+    def place_order(self, symbol: str, side: str, order_type: str, quantity: float,
+                   exchange: str = "EXCHANGE_2", price: float = None, 
+                   trigger_price: float = None, reduce_only: bool = False) -> Dict:
         """
         Place a futures order
         
         Args:
-            symbol: Trading symbol (e.g., "BTCUSDT")
-            side: "BUY" or "SELL"
-            order_type: "MARKET", "LIMIT", "TAKE_PROFIT_MARKET", "STOP_MARKET"
+            symbol: Trading symbol (e.g., BTCUSDT)
+            side: BUY or SELL
+            order_type: MARKET, LIMIT, TAKE_PROFIT_MARKET, STOP_MARKET
             quantity: Order quantity in base asset
             exchange: Exchange identifier
             price: Limit price (required for LIMIT orders)
@@ -150,26 +124,23 @@ class CoinSwitchFuturesAPI:
             Order response with order_id
         """
         endpoint = "/trade/api/v2/futures/order"
-
         payload = {
             "symbol": symbol,
             "exchange": exchange,
             "side": side,
             "order_type": order_type,
-            "quantity": quantity,
+            "quantity": quantity
         }
-
+        
         if price is not None:
             payload["price"] = price
-
         if trigger_price is not None:
             payload["trigger_price"] = trigger_price
-
         if reduce_only:
             payload["reduce_only"] = reduce_only
-
+        
         return self._make_request("POST", endpoint, payload=payload)
-
+    
     def cancel_order(self, order_id: str, exchange: str = "EXCHANGE_2") -> Dict:
         """
         Cancel a futures order
@@ -181,44 +152,36 @@ class CoinSwitchFuturesAPI:
         endpoint = "/trade/api/v2/futures/order"
         payload = {
             "order_id": order_id,
-            "exchange": exchange,
+            "exchange": exchange
         }
         return self._make_request("DELETE", endpoint, payload=payload)
-
+   
     def get_order(self, order_id: str) -> Dict:
         """
         Get order status
-        
-        *** FIXED: Extracts order from data.order structure ***
         
         Args:
             order_id: Order ID to query
         
         Returns:
-            Order data (extracted from nested structure)
+            Order data (extracted from data.order)
         """
         endpoint = "/trade/api/v2/futures/order"
         params = {"order_id": order_id}
         
-        response = self._make_request("GET", endpoint, params=params, payload={})
+        response = self.make_request("GET", endpoint, params=params, payload={})
         
-        # Extract order from nested structure: data.order
+        # Extract order from nested structure
         if isinstance(response, dict):
             if "data" in response and isinstance(response["data"], dict):
                 if "order" in response["data"]:
                     return response["data"]["order"]  # Return the order object directly
         
-        # If structure is different or error, return as-is
+        # If structure is different, return as-is (might be error response)
         return response
-
-    def get_open_orders(
-        self,
-        exchange: str = "EXCHANGE_2",
-        symbol: str = None,
-        limit: int = 50,
-        from_time: int = None,
-        to_time: int = None,
-    ) -> Dict:
+    
+    def get_open_orders(self, exchange: str = "EXCHANGE_2", symbol: str = None,
+                       limit: int = 50, from_time: int = None, to_time: int = None) -> Dict:
         """
         Get open orders
         
@@ -230,8 +193,8 @@ class CoinSwitchFuturesAPI:
             to_time: End time in milliseconds
         """
         endpoint = "/trade/api/v2/futures/orders/open"
-
         payload = {"exchange": exchange}
+        
         if symbol:
             payload["symbol"] = symbol
         if limit:
@@ -240,17 +203,11 @@ class CoinSwitchFuturesAPI:
             payload["from_time"] = from_time
         if to_time:
             payload["to_time"] = to_time
-
+        
         return self._make_request("POST", endpoint, payload=payload)
-
-    def get_closed_orders(
-        self,
-        exchange: str = "EXCHANGE_2",
-        symbol: str = None,
-        limit: int = 50,
-        from_time: int = None,
-        to_time: int = None,
-    ) -> Dict:
+    
+    def get_closed_orders(self, exchange: str = "EXCHANGE_2", symbol: str = None,
+                         limit: int = 50, from_time: int = None, to_time: int = None) -> Dict:
         """
         Get closed orders
         
@@ -262,8 +219,8 @@ class CoinSwitchFuturesAPI:
             to_time: End time in milliseconds
         """
         endpoint = "/trade/api/v2/futures/orders/closed"
-
         payload = {"exchange": exchange}
+        
         if symbol:
             payload["symbol"] = symbol
         if limit:
@@ -272,9 +229,9 @@ class CoinSwitchFuturesAPI:
             payload["from_time"] = from_time
         if to_time:
             payload["to_time"] = to_time
-
+        
         return self._make_request("POST", endpoint, payload=payload)
-
+    
     def cancel_all_orders(self, exchange: str = "EXCHANGE_2", symbol: str = None) -> Dict:
         """
         Cancel all open orders
@@ -284,36 +241,32 @@ class CoinSwitchFuturesAPI:
             symbol: Cancel orders for specific symbol (optional)
         """
         endpoint = "/trade/api/v2/futures/cancel_all"
-
         payload = {"exchange": exchange}
+        
         if symbol:
             payload["symbol"] = symbol
-
+        
         return self._make_request("POST", endpoint, payload=payload)
-
-    # ======================================================================
-    # LEVERAGE & MARGIN
-    # ======================================================================
-
+    
+    # ============ LEVERAGE & MARGIN ============
+    
     def set_leverage(self, symbol: str, leverage: int, exchange: str = "EXCHANGE_2") -> Dict:
         """
         Set leverage for a symbol
         
         Args:
-            symbol: Trading symbol (e.g., "BTCUSDT")
+            symbol: Trading symbol (e.g., BTCUSDT)
             leverage: Leverage value (1 to max_leverage)
             exchange: Exchange identifier
         """
         endpoint = "/trade/api/v2/futures/leverage"
-
         payload = {
             "symbol": symbol,
             "exchange": exchange,
-            "leverage": leverage,
+            "leverage": leverage
         }
-
         return self._make_request("POST", endpoint, payload=payload)
-
+    
     def get_leverage(self, symbol: str, exchange: str = "EXCHANGE_2") -> Dict:
         """
         Get current leverage for symbol
@@ -325,10 +278,10 @@ class CoinSwitchFuturesAPI:
         endpoint = "/trade/api/v2/futures/leverage"
         params = {
             "symbol": symbol,
-            "exchange": exchange,
+            "exchange": exchange
         }
         return self._make_request("GET", endpoint, params=params, payload={})
-
+    
     def add_margin(self, symbol: str, margin: float, exchange: str = "EXCHANGE_2") -> Dict:
         """
         Add margin to position
@@ -339,19 +292,15 @@ class CoinSwitchFuturesAPI:
             exchange: Exchange identifier
         """
         endpoint = "/trade/api/v2/futures/add_margin"
-
         payload = {
             "exchange": exchange,
             "symbol": symbol,
-            "margin": margin,
+            "margin": margin
         }
-
         return self._make_request("POST", endpoint, payload=payload)
-
-    # ======================================================================
-    # POSITIONS & ACCOUNT
-    # ======================================================================
-
+    
+    # ============ POSITIONS & ACCOUNT ============
+    
     def get_positions(self, exchange: str = "EXCHANGE_2", symbol: str = None) -> Dict:
         """
         Get open positions
@@ -362,44 +311,40 @@ class CoinSwitchFuturesAPI:
         """
         endpoint = "/trade/api/v2/futures/positions"
         params = {"exchange": exchange}
+        
         if symbol:
             params["symbol"] = symbol
-
+        
         return self._make_request("GET", endpoint, params=params, payload={})
-
+    
     def get_wallet_balance(self) -> Dict:
         """Get futures wallet balance"""
-        endpoint = "/trade/api/v2/futures/wallet/balance"
+        endpoint = "/trade/api/v2/futures/wallet_balance"
         return self._make_request("GET", endpoint, params={}, payload={})
-
-    def get_transactions(
-        self,
-        exchange: str = "EXCHANGE_2",
-        symbol: str = None,
-        transaction_type: str = None,
-        transaction_id: str = None,
-    ) -> Dict:
+    
+    def get_transactions(self, exchange: str = "EXCHANGE_2", symbol: str = None,
+                        transaction_type: str = None, transaction_id: str = None) -> Dict:
         """
         Get transaction history
         
         Args:
             exchange: Exchange identifier
             symbol: Filter by symbol
-            transaction_type: Filter by type ("commission", "P&L", "funding fee", "liquidation fee")
+            transaction_type: Filter by type (commission, P&L, funding fee, liquidation fee)
             transaction_id: Specific transaction ID
         """
         endpoint = "/trade/api/v2/futures/transactions"
-
         params = {"exchange": exchange}
+        
         if symbol:
             params["symbol"] = symbol
         if transaction_type:
             params["type"] = transaction_type
         if transaction_id:
             params["transaction_id"] = transaction_id
-
+        
         return self._make_request("GET", endpoint, params=params, payload={})
-
+    
     def get_instrument_info(self, exchange: str = "EXCHANGE_2") -> Dict:
         """
         Get instrument specifications
@@ -411,51 +356,38 @@ class CoinSwitchFuturesAPI:
         params = {"exchange": exchange}
         return self._make_request("GET", endpoint, params=params, payload={})
 
-    # ======================================================================
-    # MARKET DATA
-    # ======================================================================
-
-    def get_klines(
-        self,
-        symbol: str,
-        interval: int = 1,
-        limit: int = 100,
-        exchange: str = "EXCHANGE_2",
-    ) -> Dict:
+    # -------------------------
+    # REST klines / candles API
+    # -------------------------
+    def get_klines(self, symbol: str, interval: int = 1, limit: int = 100, exchange: str = "EXCHANGE_2") -> Dict:
         """
         Retrieve historical klines/candles for warmup.
-        
-        - symbol: "BTCUSDT"
-        - interval: minutes (1,5,15,...)
-        - limit: number of bars
-        
-        Returns:
-            parsed JSON or error dict.
+          - symbol: "BTCUSDT"
+          - interval: minutes (1,5,15,...)
+          - limit: number of bars
+        Returns parsed JSON or error dict.
         """
+        # Best-effort endpoint name / params (adjust if your exchange uses different names)
         endpoint = "/trade/api/v2/futures/klines"
-
-        params = {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit,
-            "exchange": exchange,
-        }
-
+        params = {"symbol": symbol, "interval": interval, "limit": limit, "exchange": exchange}
         try:
             resp = self._make_request("GET", endpoint, params=params, payload={})
             return resp
         except Exception as e:
             return {"error": str(e)}
 
+    # Alternate names some adapters use
     def get_candles(self, symbol: str, interval: int = 1, limit: int = 100, exchange: str = "EXCHANGE_2") -> Dict:
         return self.get_klines(symbol=symbol, interval=interval, limit=limit, exchange=exchange)
 
     def fetch_klines(self, *args, **kwargs):
         return self.get_klines(*args, **kwargs)
 
+
     def get_balance(self, currency: str = "USDT") -> Dict:
         """
         Get futures wallet balance for a base asset (e.g. USDT).
+
         Uses the actual CoinSwitch response structure observed in logs:
         {
           "data": {
@@ -463,84 +395,84 @@ class CoinSwitchFuturesAPI:
               {
                 "base_asset": "USDT",
                 "balances": {
-                  "total_balance": 100.6873,
-                  "total_available_balance": 100.6873,
-                  "total_blocked_balance": 0,
-                  "total_position_margin": 0,
-                  "total_open_order_margin": 0
-                },
-                ...
+                  "total_balance": "100.6873",
+                  "total_available_balance": "100.6873",
+                  "total_blocked_balance": "0",
+                  "total_position_margin": "0",
+                  "total_open_order_margin": "0"
+                }
               },
-              ...  # per-symbol rows
+              ...
             ],
-            "asset": ...
-          },
-          "result": ...
+            "asset": [ ... per-symbol rows ... ]
+          }
         }
-        available = 0.0, locked = 0.0, currency = currency
         """
+        result = {
+            "available": 0.0,
+            "locked": 0.0,
+            "currency": currency,
+        }
+
         try:
             wallet = self.get_wallet_balance()
 
+            # Basic error pass-through
             if not isinstance(wallet, dict):
-                return {
-                    "error": "wallet response not dict",
-                    "raw_response": wallet,
-                    "result": {"available": 0.0, "locked": 0.0, "currency": currency}
-                }
+                return {"error": "wallet response not dict", "raw_response": wallet, **result}
 
             data = wallet.get("data")
             if not isinstance(data, dict):
-                return {
-                    "error": "wallet.data missing or not dict",
-                    "raw_response": wallet,
-                    "result": {"available": 0.0, "locked": 0.0, "currency": currency}
-                }
+                return {"error": "wallet.data missing or not dict", "raw_response": wallet, **result}
 
             base_list = data.get("base_asset_balances")
             if not isinstance(base_list, list):
-                return {
-                    "error": "wallet.data.base_asset_balances missing or not list",
-                    "raw_response": wallet,
-                    "result": {"available": 0.0, "locked": 0.0, "currency": currency}
-                }
+                return {"error": "wallet.data.base_asset_balances missing or not list", "raw_response": wallet, **result}
 
+            # Find the entry for the requested base asset (USDT)
             for entry in base_list:
                 if entry.get("base_asset") == currency:
                     balances = entry.get("balances", {})
-                    total_avail_str = balances.get("total_available_balance", 0)
-                    total_blocked_str = balances.get("total_blocked_balance", 0)
+                    total_avail_str = balances.get("total_available_balance", "0")
+                    total_blocked_str = balances.get("total_blocked_balance", "0")
+
                     available = float(total_avail_str)
                     locked = float(total_blocked_str)
+
                     return {
                         "available": available,
                         "locked": locked,
                         "currency": currency,
                     }
 
+            # If we reach here, USDT was not found
             return {
-                "error": f"base_asset={currency} not found in base_asset_balances",
+                "error": f"base_asset {currency} not found in base_asset_balances",
                 "raw_response": wallet,
-                "result": {"available": 0.0, "locked": 0.0, "currency": currency},
+                **result,
             }
 
         except Exception as e:
             return {
                 "error": f"Exception in get_balance: {e}",
-                "result": {"available": 0.0, "locked": 0.0, "currency": currency},
+                **result,
             }
 
 
+
 if __name__ == "__main__":
+    # Quick test
     try:
-        api = CoinSwitchFuturesAPI()
-        print("Futures API initialized successfully")
-
+        api = FuturesAPI()
+        print("✓ Futures API initialized successfully")
+        
+        # Test getting positions
         positions = api.get_positions()
-        print(f"Positions retrieved")
-
+        print(f"✓ Positions retrieved")
+        
+        # Test getting wallet balance
         balance = api.get_wallet_balance()
-        print(f"Wallet balance retrieved")
-
+        print(f"✓ Wallet balance retrieved")
+        
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"✗ Error: {e}")
