@@ -6,12 +6,13 @@ CHANGES:
 2. New position management logic (volatile vs non-volatile)
 3. Calculations every 50ms, logging every 60s
 4. Entry lock to prevent multiple simultaneous orders
+5. Session + Weekend logic as first gate for volatility detection
 """
 
 import time
 from dataclasses import dataclass
 from typing import Optional, Dict, List, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import deque
 import logging
 import numpy as np
@@ -55,6 +56,7 @@ class ZScorePosition:
     last_momentum_check_sec: float
     last_momentum_log_sec: float
     tp_adjustment_count: int
+    entry_session: str
 
 
 class ZScoreIcebergHunterStrategy:
@@ -81,7 +83,104 @@ class ZScoreIcebergHunterStrategy:
 
         logger.info("=" * 80)
         logger.info("Z-SCORE STRATEGY INITIALIZED")
+        logger.info("With Session + Weekend Volatility Gates")
         logger.info("=" * 80)
+
+    # ======================================================================
+    # SESSION + WEEKEND DETECTION (FIRST GATE)
+    # ======================================================================
+
+    def _get_current_session(self) -> Tuple[str, bool]:
+        """
+        Detect current trading session and weekend status.
+        Returns: (session_name, is_major_session)
+        
+        Sessions (UTC):
+        - Asia (Tokyo): 00:00 - 09:00 UTC
+        - London: 08:00 - 16:00 UTC  
+        - New York: 13:00 - 22:00 UTC
+        - Overlap zones have highest volatility
+        """
+        now_utc = datetime.now(timezone.utc)
+        hour_utc = now_utc.hour
+        day_of_week = now_utc.weekday()  # Monday=0, Sunday=6
+        
+        # Weekend check (Saturday=5, Sunday=6)
+        if day_of_week >= 5:
+            return "WEEKEND", False
+        
+        # Session detection
+        in_asia = 0 <= hour_utc < 9
+        in_london = 8 <= hour_utc < 16
+        in_ny = 13 <= hour_utc < 22
+        
+        # Overlap zones (highest volatility)
+        if in_london and in_ny:  # London-NY overlap: 13:00-16:00 UTC
+            return "LONDON_NY_OVERLAP", True
+        elif in_asia and in_london:  # Asia-London overlap: 08:00-09:00 UTC
+            return "ASIA_LONDON_OVERLAP", True
+        elif in_london:
+            return "LONDON", True
+        elif in_ny:
+            return "NEW_YORK", True
+        elif in_asia:
+            return "ASIA", True
+        else:
+            return "OFF_SESSION", False
+
+    def _determine_volatility_with_gates(
+        self, 
+        data_manager, 
+        current_price: float
+    ) -> Tuple[bool, str, float, str]:
+        """
+        Two-gate volatility detection:
+        Gate 1: Session + Weekend check
+        Gate 2: ATR-based calculation
+        
+        Returns: (is_volatile, session, atr_pct, explanation)
+        """
+        # GATE 1: Session + Weekend
+        session, is_major_session = self._get_current_session()
+        
+        # Get ATR for Gate 2
+        try:
+            atr_pct = data_manager.get_atr_percent()
+        except Exception as e:
+            logger.debug(f"Error getting ATR%: {e}")
+            atr_pct = None
+        
+        # Weekend → always LOW volatility (override ATR)
+        if session == "WEEKEND":
+            explanation = "Weekend - Forced LOW volatility"
+            return False, session, atr_pct or 0.0, explanation
+        
+        # Off-session → bias towards LOW unless ATR is extremely high
+        if not is_major_session:
+            if atr_pct and atr_pct > config.VOLATILE_ATR_THRESHOLD * 1.5:
+                explanation = f"Off-session but ATR very high ({atr_pct*100:.3f}%)"
+                return True, session, atr_pct, explanation
+            else:
+                explanation = f"Off-session - bias LOW volatility"
+                return False, session, atr_pct or 0.0, explanation
+        
+        # GATE 2: Major session → use ATR threshold
+        if atr_pct is not None:
+            is_volatile = atr_pct > config.VOLATILE_ATR_THRESHOLD
+            if is_volatile:
+                explanation = f"Major session ({session}) + High ATR ({atr_pct*100:.3f}%)"
+            else:
+                explanation = f"Major session ({session}) + Normal ATR ({atr_pct*100:.3f}%)"
+            return is_volatile, session, atr_pct, explanation
+        else:
+            # No ATR data, use session as indicator
+            # Overlap sessions → assume volatile
+            if "OVERLAP" in session:
+                explanation = f"Overlap session ({session}) - assume HIGH volatility"
+                return True, session, 0.0, explanation
+            else:
+                explanation = f"Major session ({session}) - assume NORMAL volatility"
+                return False, session, 0.0, explanation
 
     # ======================================================================
     # MARGIN-BASED TP/SL CALCULATION
@@ -479,10 +578,17 @@ class ZScoreIcebergHunterStrategy:
         if should_log:
             self._last_decision_log_sec = now_sec
             
+            # Get session info for logging
+            session, is_major = self._get_current_session()
+            
             logger.info("\n" + "=" * 100)
             logger.info(f"[DECISION REPORT] {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
             logger.info("=" * 100)
             logger.info(f"PRICE: {current_price:.2f} USDT")
+            logger.info(f"")
+            logger.info(f"[SESSION INFO]")
+            logger.info(f"  Current Session: {session}")
+            logger.info(f"  Major Session: {'Yes' if is_major else 'No'}")
             logger.info(f"")
             logger.info(f"[VOL REGIME]")
             logger.info(f"  Regime: {regime}")
@@ -539,7 +645,7 @@ class ZScoreIcebergHunterStrategy:
             )
 
     # ======================================================================
-    # POSITION ENTRY (WITH LIMIT ORDER)
+    # POSITION ENTRY (WITH LIMIT ORDER + SESSION GATES)
     # ======================================================================
 
     def _enter_position(
@@ -560,9 +666,11 @@ class ZScoreIcebergHunterStrategy:
         """Enter position with LIMIT order and volatility-based entry price."""
         try:
             regime = regime_params["regime"]
-            atr_pct = regime_params.get("atr_pct", 0.0)
-
-            is_volatile = (atr_pct is not None and atr_pct > config.VOLATILE_ATR_THRESHOLD)
+            
+            # TWO-GATE VOLATILITY CHECK
+            is_volatile, session, atr_pct, vol_explanation = self._determine_volatility_with_gates(
+                data_manager, current_price
+            )
 
             quantity, margin_used = risk_manager.calculate_position_size_vol_regime(
                 entry_price=current_price,
@@ -574,6 +682,7 @@ class ZScoreIcebergHunterStrategy:
                 self.pending_entry = False
                 return
 
+            # Entry price offset based on two-gate volatility
             if is_volatile:
                 offset_ticks = config.LIMIT_ORDER_HIGH_VOL_OFFSET_TICKS
             else:
@@ -584,6 +693,7 @@ class ZScoreIcebergHunterStrategy:
             else:
                 limit_entry_price = current_price + (offset_ticks * config.TICK_SIZE)
 
+            # TP/SL based on two-gate volatility
             if is_volatile:
                 tp_roi = config.PROFIT_TARGET_ROI
                 sl_roi = config.STOP_LOSS_ROI
@@ -596,7 +706,11 @@ class ZScoreIcebergHunterStrategy:
             logger.info("\n" + "=" * 100)
             logger.info(f"[ENTRY EXECUTION] {side.upper()} - LIMIT ORDER")
             logger.info("=" * 100)
-            logger.info(f"  Regime: {regime} | Volatile: {is_volatile}")
+            logger.info(f"  Session: {session}")
+            logger.info(f"  Volatility Gates: {vol_explanation}")
+            logger.info(f"  Final Volatility: {'HIGH' if is_volatile else 'LOW'}")
+            logger.info(f"  ATR%: {atr_pct*100:.3f}%")
+            logger.info(f"  Regime: {regime}")
             logger.info(f"  Entry Score: {entry_score:.3f}")
             logger.info(f"  Current Price: {current_price:.2f}")
             logger.info(f"  Limit Entry Price: {limit_entry_price:.2f} (offset: {offset_ticks} ticks)")
@@ -699,6 +813,7 @@ class ZScoreIcebergHunterStrategy:
                 last_momentum_check_sec=now_sec,
                 last_momentum_log_sec=now_sec,
                 tp_adjustment_count=0,
+                entry_session=session,
             )
 
             risk_manager.record_trade_opened()
@@ -706,6 +821,7 @@ class ZScoreIcebergHunterStrategy:
 
             msg = (
                 f"🚀 {side.upper()} ENTRY (LIMIT)\n"
+                f"Session: {session}\n"
                 f"Price: {entry_price:.2f} | Qty: {quantity:.6f}\n"
                 f"TP: {tp_price:.2f} ({tp_roi*100:.1f}%) | SL: {sl_price:.2f} ({sl_roi*100:.1f}%)\n"
                 f"Volatile: {is_volatile} | Score: {entry_score:.3f}"
@@ -749,6 +865,7 @@ class ZScoreIcebergHunterStrategy:
             logger.info(f"[POSITION STATUS] {pos.trade_id}")
             logger.info("=" * 100)
             logger.info(f"  Side: {pos.side.upper()}")
+            logger.info(f"  Entry Session: {pos.entry_session}")
             logger.info(f"  Entry: {pos.entry_price:.2f} | Current: {current_price:.2f}")
             logger.info(f"  Quantity: {pos.quantity:.6f} BTC")
             logger.info(f"  Margin: {pos.margin_used:.2f} USDT")
@@ -1004,6 +1121,7 @@ class ZScoreIcebergHunterStrategy:
         logger.info(f"[POSITION CLOSED] {pos.trade_id} | {reason}")
         logger.info("=" * 100)
         logger.info(f"  Side: {pos.side.upper()}")
+        logger.info(f"  Entry Session: {pos.entry_session}")
         logger.info(f"  Entry: {pos.entry_price:.2f} | Exit: {exit_price:.2f}")
         logger.info(f"  Quantity: {pos.quantity:.6f} BTC")
         logger.info(f"  P&L: {pnl:.2f} USDT ({roi*100:.2f}%)")
@@ -1012,6 +1130,7 @@ class ZScoreIcebergHunterStrategy:
 
         msg = (
             f"🛑 EXIT {pos.side.upper()} | {reason}\n"
+            f"Session: {pos.entry_session}\n"
             f"Entry: {pos.entry_price:.2f} → Exit: {exit_price:.2f}\n"
             f"P&L: {pnl:.2f} USDT ({roi*100:.2f}%)\n"
             f"Hold: {(now_sec - pos.entry_time_sec)/60.0:.1f}min"
