@@ -17,7 +17,7 @@ from collections import deque
 import logging
 import numpy as np
 from scipy.stats import norm
-
+from collections import deque
 import config
 from zscore_excel_logger import ZScoreExcelLogger
 from telegram_notifier import send_telegram_message
