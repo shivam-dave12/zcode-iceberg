@@ -169,7 +169,8 @@ class FuturesAPI:
         endpoint = "/trade/api/v2/futures/order"
         params = {"order_id": order_id}
         
-        response = self.make_request("GET", endpoint, params=params, payload={})
+        # FIX: Use _make_request (with underscore) not make_request
+        response = self._make_request("GET", endpoint, params=params, payload={})
         
         # Extract order from nested structure
         if isinstance(response, dict):
