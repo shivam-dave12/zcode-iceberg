@@ -377,54 +377,48 @@ class OrderManager:
             return False
 
     def get_order_status(self, order_id: str) -> Optional[Dict]:
-        """
-        Get order status with robust error handling.
-        """
         try:
-            response = self.api.get_order(order_id)
-            
-            # Not a dict = failure
-            if not isinstance(response, dict):
+            resp = self.api.get_order(order_id)   # CoinSwitch futures API call
+            logger.info(f"[DEBUG] get_order({order_id}) raw response: {resp}")
+
+            if not isinstance(resp, dict):
                 return None
-            
-            # Explicit error = failure
-            if "error" in response:
-                error_msg = response.get("error")
-                # Only log as warning if it's a real error (not just "not found")
-                if "not found" not in str(error_msg).lower():
-                    logger.debug(f"Order status error for {order_id}: {error_msg}")
+
+            # Unwrap common shapes:
+            data = resp.get("data", resp)
+            if isinstance(data, list):
+                data = data[0] if data else None
+            if not isinstance(data, dict):
                 return None
-            
-            # Extract status from response
-            status = None
-            order_data = response
-            
-            # Try multiple structures
-            if "status" in response:
-                status = response["status"]
-            elif "data" in response:
-                data = response.get("data", {})
-                if isinstance(data, dict):
-                    if "order" in data:
-                        order_data = data["order"]
-                        status = order_data.get("status")
-                    elif "status" in data:
-                        order_data = data
-                        status = data["status"]
-            
-            # No status found = can't determine order state
+
+            # Some APIs nest under "order"
+            order = data.get("order", data)
+
+            # Normalize status field
+            status = (
+                order.get("status")
+                or order.get("order_status")
+                or order.get("state")
+                or ""
+            )
+            status = str(status).upper()
+
             if not status:
+                # Nothing usable yet
                 return None
-            
-            # Update tracking
+
+            order["status"] = status  # ensure key exists
+
+            # Keep local cache in sync
             if order_id in self.active_orders:
                 self.active_orders[order_id]["status"] = status
-            
-            return order_data
+
+            return order
 
         except Exception as e:
-            logger.debug(f"Exception getting order status: {e}")
+            logger.debug(f"Exception getting order status for {order_id}: {e}")
             return None
+
 
     def get_open_orders(self) -> list:
         """Get all open orders."""

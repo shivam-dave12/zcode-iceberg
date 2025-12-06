@@ -778,15 +778,8 @@ class ZScoreIcebergHunterStrategy:
             logger.info("=" * 100)
 
             market_side = "BUY" if side == "long" else "SELL"
-            main_order = order_manager.place_limit_order(
-                side=market_side,
-                quantity=quantity,
-                price=limit_entry_price,
-                reduce_only=False,
-            )
-
+            main_order = order_manager.place_limit_order(...)
             if not main_order:
-                logger.error("Limit order placement failed")
                 self.pending_entry = False
                 return
 
@@ -795,11 +788,11 @@ class ZScoreIcebergHunterStrategy:
 
             try:
                 filled_order = order_manager.wait_for_fill(
-                    main_order_id, 
-                    timeout_sec=config.LIMIT_ORDER_WAIT_TIMEOUT_SEC
+                    main_order_id,
+                    timeout_sec=config.LIMIT_ORDER_WAIT_TIMEOUT_SEC,
                 )
                 entry_price = order_manager.extract_fill_price(filled_order)
-                logger.info(f"✓ Limit order filled at {entry_price:.2f}")
+                logger.info(f"Limit order filled at {entry_price:.2f}")
             except Exception as e:
                 logger.error(f"Limit order fill failed or timeout: {e}")
                 order_manager.cancel_order(main_order_id)
@@ -818,14 +811,10 @@ class ZScoreIcebergHunterStrategy:
 
             tp_side = "SELL" if side == "long" else "BUY"
             tp_order = order_manager.place_take_profit(
-                side=tp_side,
-                quantity=quantity,
-                trigger_price=tp_price,
+                side=tp_side, quantity=quantity, trigger_price=tp_price
             )
             sl_order = order_manager.place_stop_loss(
-                side=tp_side,
-                quantity=quantity,
-                trigger_price=sl_price,
+                side=tp_side, quantity=quantity, trigger_price=sl_price
             )
 
             if not tp_order or not sl_order:
