@@ -86,6 +86,11 @@ class ZScoreIcebergHunterStrategy:
         logger.info("With Session + Weekend Volatility Gates")
         logger.info("=" * 80)
 
+        # Signal confirmation tracking (3 consecutive signals required)
+        from collections import deque
+        self._signal_history: deque = deque(maxlen=3)
+        self._last_signal_time: float = 0.0
+
     # ======================================================================
     # SESSION + WEEKEND DETECTION (FIRST GATE)
     # ======================================================================
@@ -530,7 +535,10 @@ class ZScoreIcebergHunterStrategy:
         oracle_inputs: Optional[OracleInputs],
         oracle_outputs: Optional[OracleOutputs],
     ) -> None:
-        """Evaluate LONG/SHORT every tick, log every minute."""
+        """
+        Evaluate LONG/SHORT every tick, log every minute.
+        NEW: Requires 3 consecutive identical signals before entering.
+        """
         if not all([imbalance_data, wall_data, delta_data, touch_data]):
             return
 
@@ -552,6 +560,7 @@ class ZScoreIcebergHunterStrategy:
         trend_long_ok = (ema_val is not None and current_price > ema_val)
         trend_short_ok = (ema_val is not None and current_price < ema_val)
 
+        # Calculate scores
         long_core, long_core_reasons = self._compute_weighted_score(
             imbalance_data, wall_data, delta_data, touch_data,
             trend_long_ok, "long", regime, z_thresh, wall_mult
@@ -573,6 +582,39 @@ class ZScoreIcebergHunterStrategy:
         long_entry = (long_total > config.SCORE_ENTRY_THRESHOLD)
         short_entry = (short_total > config.SCORE_ENTRY_THRESHOLD)
 
+        # Determine current signal
+        current_signal = None
+        current_score = 0.0
+        if long_entry and long_total > short_total:
+            current_signal = "LONG"
+            current_score = long_total
+        elif short_entry and short_total > long_total:
+            current_signal = "SHORT"
+            current_score = short_total
+        else:
+            current_signal = "NEUTRAL"
+            current_score = max(long_total, short_total)
+
+        # Add to signal history (with timestamp)
+        self._signal_history.append({
+            "signal": current_signal,
+            "score": current_score,
+            "time": now_sec
+        })
+
+        # Check for 3 consecutive identical signals
+        confirmed_signal = None
+        if len(self._signal_history) == 3:
+            signals = [s["signal"] for s in self._signal_history]
+            if signals[0] == signals[1] == signals[2] and signals[0] != "NEUTRAL":
+                # All 3 signals are the same and not neutral
+                confirmed_signal = signals[0]
+                avg_score = sum(s["score"] for s in self._signal_history) / 3
+                time_span = now_sec - self._signal_history[0]["time"]
+                
+                logger.info(f"[SIGNAL CONFIRMATION] ✓ 3x {confirmed_signal} signals over {time_span:.1f}s (avg score: {avg_score:.3f})")
+
+        # Logging
         should_log = (now_sec - self._last_decision_log_sec >= self.DECISION_LOG_INTERVAL_SEC)
         
         if should_log:
@@ -581,10 +623,18 @@ class ZScoreIcebergHunterStrategy:
             # Get session info for logging
             session, is_major = self._get_current_session()
             
+            # Show signal history
+            signal_history_str = " → ".join([s["signal"][0] for s in self._signal_history])
+            
             logger.info("\n" + "=" * 100)
             logger.info(f"[DECISION REPORT] {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
             logger.info("=" * 100)
             logger.info(f"PRICE: {current_price:.2f} USDT")
+            logger.info(f"")
+            logger.info(f"[SIGNAL CONFIRMATION]")
+            logger.info(f"  Current Signal: {current_signal}")
+            logger.info(f"  Signal History (last 3): {signal_history_str}")
+            logger.info(f"  Confirmed Entry: {confirmed_signal if confirmed_signal else 'None (need 3 consecutive)'}")
             logger.info(f"")
             logger.info(f"[SESSION INFO]")
             logger.info(f"  Current Session: {session}")
@@ -629,20 +679,29 @@ class ZScoreIcebergHunterStrategy:
             logger.info(f"    → {'✓ ENTRY SIGNAL' if short_entry else '✗ NO ENTRY'}")
             logger.info("=" * 100 + "\n")
 
-        if long_entry:
+        # Only enter if we have 3 consecutive confirmed signals
+        if confirmed_signal == "LONG":
             self.pending_entry = True
+            avg_score = sum(s["score"] for s in self._signal_history) / 3
             self._enter_position(
                 data_manager, order_manager, risk_manager, "long", current_price,
                 imbalance_data, wall_data, delta_data, touch_data, now_sec,
-                regime_params, long_total
+                regime_params, avg_score
             )
-        elif short_entry:
+            # Clear signal history after entry
+            self._signal_history.clear()
+            
+        elif confirmed_signal == "SHORT":
             self.pending_entry = True
+            avg_score = sum(s["score"] for s in self._signal_history) / 3
             self._enter_position(
                 data_manager, order_manager, risk_manager, "short", current_price,
                 imbalance_data, wall_data, delta_data, touch_data, now_sec,
-                regime_params, short_total
+                regime_params, avg_score
             )
+            # Clear signal history after entry
+            self._signal_history.clear()
+
 
     # ======================================================================
     # POSITION ENTRY (WITH LIMIT ORDER + SESSION GATES)

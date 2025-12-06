@@ -164,23 +164,45 @@ class FuturesAPI:
             order_id: Order ID to query
         
         Returns:
-            Order data (extracted from data.order)
+            Order data with proper error handling
         """
         endpoint = "/trade/api/v2/futures/order"
         params = {"order_id": order_id}
         
-        # FIX: Use _make_request (with underscore) not make_request
-        response = self._make_request("GET", endpoint, params=params, payload={})
+        try:
+            # FIX: Use _make_request (with underscore)
+            response = self._make_request("GET", endpoint, params=params, payload={})
+            
+            # Handle multiple response structures
+            if isinstance(response, dict):
+                # Check for errors first
+                if "error" in response:
+                    return response
+                
+                # Try to extract order from nested structure
+                if "data" in response:
+                    data = response["data"]
+                    if isinstance(data, dict):
+                        # Structure 1: data.order
+                        if "order" in data:
+                            return data["order"]
+                        # Structure 2: data itself is the order
+                        elif "order_id" in data or "status" in data:
+                            return data
+                
+                # Structure 3: response itself is the order
+                if "order_id" in response or "status" in response:
+                    return response
+            
+            # If we can't parse it, return as-is
+            return response
+            
+        except Exception as e:
+            return {
+                "error": str(e),
+                "order_id": order_id
+            }
         
-        # Extract order from nested structure
-        if isinstance(response, dict):
-            if "data" in response and isinstance(response["data"], dict):
-                if "order" in response["data"]:
-                    return response["data"]["order"]  # Return the order object directly
-        
-        # If structure is different, return as-is (might be error response)
-        return response
-    
     def get_open_orders(self, exchange: str = "EXCHANGE_2", symbol: str = None,
                        limit: int = 50, from_time: int = None, to_time: int = None) -> Dict:
         """
