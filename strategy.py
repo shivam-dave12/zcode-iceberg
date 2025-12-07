@@ -952,145 +952,182 @@ class ZScoreIcebergHunterStrategy:
             
             # TIMEOUT CHECK: 60 seconds (SINGLE FIRE)
             if elapsed_since_placement > 60.0 and not pos.timeout_cancelled:
-                pos.timeout_cancelled = True  # ← PREVENT MULTIPLE CANCELLATIONS
-                
                 logger.warning(f"⏱️ LIMIT ORDER TIMEOUT after {elapsed_since_placement:.1f}s")
+                logger.info("Starting timeout cancellation sequence...")
+                
+                pos.timeout_cancelled = True  # Mark as processed
                 
                 # ========================================================================
                 # CRITICAL: Check if limit order filled RIGHT BEFORE timeout
                 # ========================================================================
                 try:
+                    logger.info(f"Checking final status of limit order: {pos.main_order_id}")
                     final_check = order_manager.get_order_status(pos.main_order_id)
-                    if final_check:
-                        final_status = final_check.get("status", "").upper()
+                    
+                    if not final_check:
+                        logger.error("Cannot get order status - aborting timeout cancellation for safety")
+                        self.current_position = None
+                        self.pending_entry = False
+                        return
+                    
+                    final_status = final_check.get("status", "").upper()
+                    logger.info(f"Limit order final status: {final_status}")
+                    
+                    if final_status in ("EXECUTED", "FILLED"):
+                        # ✓ ORDER FILLED! Don't cancel TP/SL
+                        logger.info(f"✅ Limit order FILLED just before timeout - keeping TP/SL active")
+                        pos.main_filled = True
                         
-                        if final_status in ("EXECUTED", "FILLED"):
-                            # ✓ ORDER FILLED! Don't cancel TP/SL
-                            logger.info(f"✅ Limit order FILLED just before timeout - keeping TP/SL active")
-                            pos.main_filled = True
+                        try:
                             actual_fill_price = order_manager.extract_fill_price(final_check)
                             pos.entry_price = actual_fill_price
-                            
-                            try:
-                                msg = (
-                                    f"✅ {pos.side.upper()} FILLED (last-second)\n"
-                                    f"Entry: {actual_fill_price:.2f}\n"
-                                    f"TP: {pos.tp_price:.2f} | SL: {pos.sl_price:.2f}\n"
-                                    f"Filled after {elapsed_since_placement:.1f}s"
-                                )
-                                send_telegram_message(msg)
-                            except:
-                                pass
-                            
-                            # Continue with normal position management (don't return here)
-                            # Fall through to position management below
-                            
-                        elif final_status in ("OPEN", "PENDING", "NEW"):
-                            # ✗ Order still open - safe to cancel bracket
-                            logger.warning(f"Limit order still OPEN - cancelling bracket")
-                            
-                            # Cancel in sequence with verification
-                            try:
-                                order_manager.cancel_order(pos.main_order_id)
-                                logger.info(f"✓ Cancelled limit order: {pos.main_order_id}")
-                            except Exception as e:
-                                logger.warning(f"Limit cancel error (may already be filled): {e}")
-                            
-                            # Wait 0.5s then verify limit is NOT filled before cancelling TP/SL
-                            time.sleep(0.5)
-                            
-                            # DOUBLE CHECK before cancelling TP/SL
+                            logger.info(f"Updated entry price to: {actual_fill_price:.2f}")
+                        except Exception as e:
+                            logger.warning(f"Could not extract fill price: {e}")
+                        
+                        try:
+                            msg = (
+                                f"✅ {pos.side.upper()} FILLED (last-second)\n"
+                                f"Entry: {pos.entry_price:.2f}\n"
+                                f"TP: {pos.tp_price:.2f} | SL: {pos.sl_price:.2f}\n"
+                                f"Filled after {elapsed_since_placement:.1f}s"
+                            )
+                            send_telegram_message(msg)
+                        except:
+                            pass
+                        
+                        # Continue with normal position management
+                        logger.info("Position is now ACTIVE - continuing to position management")
+                        # Don't return - fall through to position management below
+                        
+                    elif final_status in ("OPEN", "PENDING", "NEW", "ACTIVE"):
+                        # ✗ Order still open - safe to cancel bracket
+                        logger.info(f"Limit order still {final_status} - proceeding with bracket cancellation")
+                        
+                        # Cancel limit order first
+                        logger.info(f"Cancelling limit order: {pos.main_order_id}")
+                        try:
+                            cancel_result = order_manager.cancel_order(pos.main_order_id)
+                            logger.info(f"Limit order cancel result: {cancel_result}")
+                        except Exception as e:
+                            logger.warning(f"Limit cancel error: {e}")
+                        
+                        # Wait and recheck
+                        logger.info("Waiting 0.5s before rechecking...")
+                        import time
+                        time.sleep(0.5)
+                        
+                        # DOUBLE CHECK before cancelling TP/SL
+                        logger.info("Performing safety recheck...")
+                        try:
                             recheck = order_manager.get_order_status(pos.main_order_id)
                             recheck_status = recheck.get("status", "").upper() if recheck else "UNKNOWN"
+                            logger.info(f"Recheck status: {recheck_status}")
                             
                             if recheck_status in ("EXECUTED", "FILLED"):
                                 logger.warning(f"⚠️ Limit order filled DURING cancellation - KEEPING TP/SL")
                                 pos.main_filled = True
                                 pos.timeout_cancelled = False  # Reset flag
-                                # Don't cancel TP/SL - position is now live
                                 return
-                            
-                            # Still safe - cancel TP/SL
-                            try:
-                                order_manager.cancel_order(pos.tp_order_id)
-                                logger.info(f"✓ Cancelled TP order: {pos.tp_order_id}")
-                            except Exception as e:
-                                logger.warning(f"TP cancel error: {e}")
-                            
-                            try:
-                                order_manager.cancel_order(pos.sl_order_id)
-                                logger.info(f"✓ Cancelled SL order: {pos.sl_order_id}")
-                            except Exception as e:
-                                logger.warning(f"SL cancel error: {e}")
-                            
-                            # Send timeout notification
-                            try:
-                                msg = (
-                                    f"⏱️ TIMEOUT: {pos.side.upper()} bracket cancelled\n"
-                                    f"Limit order not filled in 60s\n"
-                                    f"Limit Entry: {pos.entry_price:.2f} (current {current_price:.2f})\n"
-                                    f"Moving to next analysis"
-                                )
-                                send_telegram_message(msg)
-                            except:
-                                pass
-                            
-                            # Reset position state
-                            self.current_position = None
-                            self.pending_entry = False
-                            return
+                        except Exception as e:
+                            logger.error(f"Recheck failed: {e} - proceeding with caution")
                         
-                        else:
-                            # Order cancelled/rejected/expired by exchange
-                            logger.warning(f"Limit order {final_status} by exchange - cleaning up")
+                        # Still safe - cancel TP/SL
+                        logger.info(f"Cancelling TP order: {pos.tp_order_id}")
+                        try:
+                            tp_result = order_manager.cancel_order(pos.tp_order_id)
+                            logger.info(f"TP cancel result: {tp_result}")
+                        except Exception as e:
+                            logger.warning(f"TP cancel error: {e}")
+                        
+                        logger.info(f"Cancelling SL order: {pos.sl_order_id}")
+                        try:
+                            sl_result = order_manager.cancel_order(pos.sl_order_id)
+                            logger.info(f"SL cancel result: {sl_result}")
+                        except Exception as e:
+                            logger.warning(f"SL cancel error: {e}")
+                        
+                        logger.info("✓ Bracket cancellation complete")
+                        
+                        # Send timeout notification
+                        try:
+                            msg = (
+                                f"⏱️ TIMEOUT: {pos.side.upper()} bracket cancelled\n"
+                                f"Limit order not filled in 60s\n"
+                                f"Limit Entry: {pos.entry_price:.2f} (current {current_price:.2f})\n"
+                                f"Moving to next analysis"
+                            )
+                            send_telegram_message(msg)
+                        except Exception as e:
+                            logger.debug(f"Telegram notification failed: {e}")
+                        
+                        # Reset position state
+                        logger.info("Resetting position state")
+                        self.current_position = None
+                        self.pending_entry = False
+                        return
+                    
+                    else:
+                        # Order cancelled/rejected/expired by exchange
+                        logger.warning(f"Limit order {final_status} by exchange - cleaning up TP/SL")
+                        
+                        try:
                             order_manager.cancel_order(pos.tp_order_id)
+                        except Exception as e:
+                            logger.debug(f"TP cleanup error: {e}")
+                        
+                        try:
                             order_manager.cancel_order(pos.sl_order_id)
-                            self.current_position = None
-                            self.pending_entry = False
-                            return
-                            
+                        except Exception as e:
+                            logger.debug(f"SL cleanup error: {e}")
+                        
+                        self.current_position = None
+                        self.pending_entry = False
+                        return
+                        
                 except Exception as e:
-                    logger.error(f"Error during timeout final check: {e}")
+                    logger.error(f"CRITICAL ERROR during timeout handling: {e}", exc_info=True)
                     # Play it safe - don't cancel TP/SL if we can't verify status
                     logger.warning("Cannot verify limit status - NOT cancelling TP/SL for safety")
                     self.current_position = None
                     self.pending_entry = False
                     return
             
-            # If timeout already processed, just return
+            # If timeout already processed and not filled, wait for exchange to update
             if pos.timeout_cancelled and not pos.main_filled:
                 return
             
-            # Check order status (if not timed out yet)
-            try:
-                main_status = order_manager.get_order_status(pos.main_order_id)
-                if main_status:
-                    status = main_status.get("status", "").upper()
-                    if status in ("EXECUTED", "FILLED"):
-                        pos.main_filled = True
-                        actual_fill_price = order_manager.extract_fill_price(main_status)
-                        pos.entry_price = actual_fill_price
-                        logger.info(f"✓ Limit order filled at {actual_fill_price:.2f} (after {elapsed_since_placement:.1f}s)")
-                        
-                        try:
-                            msg = (
-                                f"✅ {pos.side.upper()} FILLED\n"
-                                f"Entry: {actual_fill_price:.2f} (after {elapsed_since_placement:.1f}s)\n"
-                                f"TP: {pos.tp_price:.2f} | SL: {pos.sl_price:.2f}"
-                            )
-                            send_telegram_message(msg)
-                        except:
-                            pass
-                        
-                    elif status in ("CANCELLED", "REJECTED", "EXPIRED"):
-                        logger.warning(f"Limit order {status} - closing bracket")
-                        order_manager.cancel_order(pos.tp_order_id)
-                        order_manager.cancel_order(pos.sl_order_id)
-                        self.current_position = None
-                        self.pending_entry = False
-                        return
-            except Exception as e:
-                logger.debug(f"Error checking main order status: {e}")
+            # Regular status check (if not timed out yet)
+            if elapsed_since_placement <= 60.0:
+                try:
+                    main_status = order_manager.get_order_status(pos.main_order_id)
+                    if main_status:
+                        status = main_status.get("status", "").upper()
+                        if status in ("EXECUTED", "FILLED"):
+                            pos.main_filled = True
+                            actual_fill_price = order_manager.extract_fill_price(main_status)
+                            pos.entry_price = actual_fill_price
+                            logger.info(f"✓ Limit order filled at {actual_fill_price:.2f} (after {elapsed_since_placement:.1f}s)")
+                            
+                            try:
+                                msg = (
+                                    f"✅ {pos.side.upper()} FILLED\n"
+                                    f"Entry: {actual_fill_price:.2f} (after {elapsed_since_placement:.1f}s)\n"
+                                    f"TP: {pos.tp_price:.2f} | SL: {pos.sl_price:.2f}"
+                                )
+                                send_telegram_message(msg)
+                            except:
+                                pass
+                            
+                        elif status in ("CANCELLED", "REJECTED", "EXPIRED"):
+                            logger.warning(f"Limit order {status} - closing bracket")
+                            order_manager.cancel_order(pos.tp_order_id)
+                            order_manager.cancel_order(pos.sl_order_id)
+                            self.current_position = None
+                            self.pending_entry = False
+                            return
+                except Exception as e:
+                    logger.debug(f"Error checking main order status: {e}")
             
             # If limit not filled yet, don't do position management
             return
@@ -1100,8 +1137,6 @@ class ZScoreIcebergHunterStrategy:
         # ======================================================================
         hold_sec = now_sec - pos.entry_time_sec
         hold_min = hold_sec / 60.0
-        
-
 
         if now_sec - self._last_position_log_sec >= self.POSITION_LOG_INTERVAL_SEC:
             self._last_position_log_sec = now_sec
