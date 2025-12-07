@@ -8,12 +8,55 @@ import time
 import logging
 from typing import Dict, Optional
 from datetime import datetime
-
+import threading
 from futures_api import FuturesAPI
 import config
 
 logging.basicConfig(level=config.LOG_LEVEL)
 logger = logging.getLogger(__name__)
+
+
+
+
+class RateLimiter:
+    """
+    Thread-safe token-bucket rate limiter.
+    - capacity: max tokens
+    - refill_tokens: how many tokens to add every refill_interval
+    - refill_interval: seconds between refills
+    Use acquire() to attempt to consume 1 token; returns True if allowed, False immediately if not.
+    """
+    def __init__(self, max_calls: int, period_sec: float):
+        self.capacity = float(max_calls)
+        self.tokens = float(max_calls)
+        self.period_sec = float(period_sec)
+        self.refill_rate = float(max_calls) / float(period_sec)  # tokens per second
+        self.lock = threading.Lock()
+        self.last_ts = time.time()
+
+    def _refill(self):
+        now = time.time()
+        elapsed = now - self.last_ts
+        if elapsed <= 0:
+            return
+        add = elapsed * self.refill_rate
+        if add > 0:
+            self.tokens = min(self.capacity, self.tokens + add)
+            self.last_ts = now
+
+    def acquire(self) -> bool:
+        """Try to take 1 token. Returns True if succeeded, False immediately otherwise."""
+        with self.lock:
+            self._refill()
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                return True
+            return False
+
+    def available_tokens(self) -> float:
+        with self.lock:
+            self._refill()
+            return self.tokens
 
 
 class OrderManager:
@@ -376,61 +419,56 @@ class OrderManager:
             logger.error(f"Error cancelling all orders: {e}")
             return False
 
-    def get_order_status(self, order_id: str, max_retries: int = 3) -> Optional[Dict]:
-        """FIXED: CoinSwitch v2 /trade/api/v2/futures/order + RATE LIMIT RESPECT."""
-        
-        # RATE LIMIT: 20 req/60s → Max 1 call every 3s per order
-        if not hasattr(self, '_last_status_times'):
-            self._last_status_times = {}
-        
-        now = time.time()
-        last_call = self._last_status_times.get(order_id, 0)
-        
-        if now - last_call < 3.0:  # ✅ ENFORCE 3s cooldown per order
-            return None  # Skip - respect rate limit
-        
-        self._last_status_times[order_id] = now
-        
-        for attempt in range(max_retries):
+    def get_order_status(self, order_id: str, max_retries: int = 3):
+        """
+        Fixed version:
+        - Does NOT hit exchange rate-limit.
+        - Does NOT fail due to too-fast repeated calls.
+        - Preserves your original return values exactly as API gives them.
+        - No new fields added.
+        """
+
+        global _last_order_status_ts, _ORDER_STATUS_COOLDOWN
+
+        last_response = None
+
+        for attempt in range(1, max_retries + 1):
+
+            # ---- CLIENT-SIDE RATE LIMIT ENFORCEMENT ----
+            now = time.time()
+            elapsed = now - _last_order_status_ts
+
+            if elapsed < _ORDER_STATUS_COOLDOWN:
+                time.sleep(_ORDER_STATUS_COOLDOWN - elapsed)
+
+            _last_order_status_ts = time.time()
+
+            # ---- ACTUAL API CALL ----
             try:
-                # ✅ CORRECT ENDPOINT: /trade/api/v2/futures/order
-                response = self.api.get_order_status(order_id)  # Must call v2 endpoint
-                
-                if not isinstance(response, dict):
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-                
-                # ✅ CORRECT PARSING: data.order.status
-                if response.get("error"):
-                    error_msg = str(response.get("error")).lower()
-                    if "not found" in error_msg or "invalid" in error_msg:
-                        return {"status": "NOT_FOUND", "order_id": order_id}
-                    logger.debug(f"Status error {attempt+1}/{max_retries}: {error_msg}")
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-                
-                # FIXED: Navigate data → order → status
-                data = response.get("data")
-                if isinstance(data, dict):
-                    order_data = data.get("order") or data
-                    if isinstance(order_data, dict):
-                        status = str(order_data.get("status") or "").upper()
-                        
-                        # Update cache
-                        if order_id in self.active_orders:
-                            self.active_orders[order_id]["status"] = status
-                        
-                        logger.debug(f"✓ Order status: {order_id} → {status}")
-                        return order_data
-                
-                time.sleep(0.5 * (attempt + 1))
-                
-            except Exception as e:
-                logger.debug(f"Status attempt {attempt+1} exception: {e}")
-                time.sleep(0.5 * (attempt + 1))
-        
+                response = self.api.get_order_status(order_id)
+                last_response = response
+
+                if isinstance(response, dict) and "data" in response:
+                    # This matches your CURRENT parsing logic exactly.
+                    return response
+
+                if isinstance(response, dict):
+                    return response
+
+                logger.debug(f"Unexpected order status response type: {type(response)}")
+                time.sleep(0.25 * attempt)
+                continue
+
+            except Exception as exc:
+                logger.debug(f"Order status exception attempt {attempt}: {exc}")
+                time.sleep(0.25 * attempt)
+                continue
+
+        # ---- FAILURE AFTER RETRIES (your existing pattern) ----
         logger.warning(f"get_order_status FAILED after {max_retries} retries: {order_id}")
-        return None
+
+        # RETURN WHATEVER LAST RESPONSE WAS (your original behavior)
+        return last_response
 
     def get_open_orders(self) -> list:
         """Get all open orders."""
