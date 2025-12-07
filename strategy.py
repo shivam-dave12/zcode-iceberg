@@ -822,7 +822,13 @@ class ZScoreIcebergHunterStrategy:
         current_price: float, 
         now_sec: float
     ) -> None:
-        """Production-safe position management: SINGLE-FIRE timeout + position verification."""
+        """
+        Production-safe position management: 
+        - SINGLE-FIRE timeout (120s) with position verification
+        - Rate-limit aware status checks (1Hz fill, 10s bracket)
+        - Session-based TP/SL adjustments (T+10min, T+15min)
+        - CoinSwitch v2 API compatible
+        """
         pos = self.current_position
         if pos is None:
             return
@@ -833,13 +839,15 @@ class ZScoreIcebergHunterStrategy:
         if not pos.main_filled:
             elapsed_since_place = now_sec - pos.limit_order_placed_time
             
-            # SINGLE-FIRE: Atomic flag check (prevents multi-fire)
-            if elapsed_since_place > config.LIMIT_ORDER_WAIT_TIMEOUT_SEC and not pos.timeout_cancelled:
-                pos.timeout_cancelled = True  # SET FLAG IMMEDIATELY (protects all threads)
+            # SINGLE-FIRE: Atomic flag check (prevents multi-fire across threads)
+            if (elapsed_since_place > config.LIMIT_ORDER_WAIT_TIMEOUT_SEC and 
+                not pos.timeout_cancelled):
+                
+                pos.timeout_cancelled = True  # SET FLAG IMMEDIATELY
                 logger.warning(f"⏱️ LIMIT TIMEOUT {elapsed_since_place:.1f}s → SINGLE-FIRE HANDLER")
                 
                 # ========================================
-                # SAFETY CHECK 1: Verify NO position exists
+                # SAFETY CHECK 1: Verify NO position exists (API positions)
                 # ========================================
                 try:
                     positions_resp = order_manager.api.get_positions(
@@ -854,14 +862,15 @@ class ZScoreIcebergHunterStrategy:
                                     qty = abs(float(p.get("quantity", 0)))
                                     if qty > 0:
                                         logger.info(f"🛡️ ACTIVE POSITION qty={qty:.6f} → KEEP BRACKET")
-                                        pos.main_filled = True  # Assume filled if position exists
+                                        pos.main_filled = True
                                         pos.timeout_cancelled = False  # Reset flag
-                                        return
+                                        pos.entry_price = float(p.get("entry_price", current_price))
+                                        return  # Proceed to Phase 2
                 except Exception as e:
                     logger.debug(f"Position check error: {e}")
                 
                 # ========================================
-                # FINAL STATUS POLL (3x retry with backoff)
+                # FINAL STATUS POLL (3x retry with backoff) - Rate limit safe
                 # ========================================
                 final_status = None
                 final_check = None
@@ -869,15 +878,18 @@ class ZScoreIcebergHunterStrategy:
                     try:
                         logger.info(f"🔍 Final status check #{attempt+1}: {pos.main_order_id}")
                         final_check = order_manager.get_order_status(pos.main_order_id)
-                        if final_check:
-                            final_status = final_check.get("status", "").upper()
+                        if final_check and isinstance(final_check, dict):
+                            # CoinSwitch v2: data.order.status
+                            order_data = final_check.get("order") or final_check
+                            final_status = str(order_data.get("status", "")).upper()
                             logger.info(f"Final status: {final_status}")
                             break
-                        time.sleep(0.3 * (attempt + 1))  # Progressive backoff
+                        time.sleep(0.5 * (attempt + 1))  # Progressive backoff
                     except Exception as e:
                         logger.debug(f"Status poll #{attempt+1} error: {e}")
+                        time.sleep(0.5 * (attempt + 1))
                 
-                # FILLED? → Activate position
+                # FILLED? → Activate position management
                 if final_status in ("EXECUTED", "FILLED", "PARTIALLY_FILLED"):
                     try:
                         pos.main_filled = True
@@ -888,13 +900,17 @@ class ZScoreIcebergHunterStrategy:
                         return  # Proceed to Phase 2 next tick
                     except Exception as e:
                         logger.warning(f"Fill price extraction failed: {e}")
+                        pos.main_filled = True  # Assume filled, use approx price
                 
                 # STILL OPEN? → SAFE TO CANCEL (no position detected)
                 logger.info("🧹 Cancelling unfilled bracket (no position)")
-                order_manager.cancel_order(pos.main_order_id)  # Limit first
-                time.sleep(0.5)
-                order_manager.cancel_order(pos.tp_order_id)     # TP
-                order_manager.cancel_order(pos.sl_order_id)     # SL
+                try:
+                    order_manager.cancel_order(pos.main_order_id)  # Limit first
+                    time.sleep(0.3)
+                    order_manager.cancel_order(pos.tp_order_id)     # TP
+                    order_manager.cancel_order(pos.sl_order_id)     # SL
+                except:
+                    pass
                 
                 msg = f"⏱️ TIMEOUT {pos.side.upper()}\nLimit: {pos.entry_price:.2f} → {elapsed_since_place:.1f}s"
                 send_telegram_message(msg)
@@ -904,31 +920,38 @@ class ZScoreIcebergHunterStrategy:
                 self.last_entry_time_sec = now_sec  # Enforce cooldown
                 return
             
-            # EARLY CHECK: Rate-limit aware (max 1Hz, skips if recently called)
+            # ========================================
+            # EARLY CHECK: Rate-limit aware (max 1Hz per order)
+            # ========================================
             if not hasattr(pos, '_last_status_check_time'):
                 pos._last_status_check_time = 0.0
-
-            if now_sec - pos._last_status_check_time >= 1.0:  # 1Hz max
-                pos._last_status_check_time = now_sec
-                status = self.order_manager.get_order_status(pos.main_order_id)  # Now rate-limited
-                if status and status.get("status", "").upper() in ("EXECUTED", "FILLED"):
-                    pos.main_filled = True
-                    pos.entry_price = self.order_manager.extract_fill_price(status)
-                    logger.info(f"✓ EARLY FILL: {pos.entry_price:.2f}")
-
-                except:
-                    pass
             
-            return  # Continue waiting...
+            if now_sec - pos._last_status_check_time >= 1.0:  # ✅ 1Hz throttle
+                pos._last_status_check_time = now_sec
+                try:
+                    status = order_manager.get_order_status(pos.main_order_id)
+                    if status:
+                        order_data = status.get("order") or status
+                        order_status = str(order_data.get("status", "")).upper()
+                        if order_status in ("EXECUTED", "FILLED", "PARTIALLY_FILLED"):
+                            pos.main_filled = True
+                            pos.entry_price = order_manager.extract_fill_price(status)
+                            logger.info(f"✓ EARLY FILL detected: {pos.entry_price:.2f}")
+                except Exception as e:
+                    logger.debug(f"Early status check error: {e}")
+            
+            return  # Continue waiting for fill...
         
         # ========================================
-        # PHASE 2: Manage FILLED Position (TP/SL + Time-Based Adjustments)
+        # PHASE 2: FILLED POSITION MANAGEMENT
         # ========================================
         
-        # ✅ FIX #1: Calculate hold_min FIRST (used everywhere below)
+        # Calculate hold time FIRST (used everywhere)
         hold_min = (now_sec - pos.entry_time_sec) / 60.0
         
-        # Periodic position logging
+        # ========================================
+        # Periodic Position Status Logging (60s)
+        # ========================================
         if now_sec - self._last_position_log_sec >= self.POSITION_LOG_INTERVAL_SEC:
             self._last_position_log_sec = now_sec
             direction = 1.0 if pos.side == "long" else -1.0
@@ -944,17 +967,21 @@ class ZScoreIcebergHunterStrategy:
             logger.info(f"  Quantity: {pos.quantity:.6f} BTC")
             logger.info(f"  Margin: {pos.margin_used:.2f} USDT")
             logger.info(f"  TP: {pos.tp_price:.2f} ({pos.tp_roi*100:.2f}%) | SL: {pos.sl_price:.2f} ({pos.sl_roi*100:.2f}%)")
-            logger.info(f"  Hold Time: {hold_min:.1f} min")  # ✅ NOW DEFINED
+            logger.info(f"  Hold Time: {hold_min:.1f} min")
             logger.info(f"  Unrealized P&L: {upnl:.2f} USDT ({current_profit_pct*100:.2f}%)")
             logger.info(f"  TP Adjustments: {pos.tp_adjustment_count}")
             logger.info("=" * 100 + "\n")
         
-        # Check bracket exits periodically (separate from fill checks)
-        if now_sec - self._last_status_check_sec >= self.ORDER_STATUS_CHECK_INTERVAL_SEC:
-            self._last_status_check_sec = now_sec
+        # ========================================
+        # Bracket Exit Check (10s interval) - TP/SL hits
+        # ========================================
+        if now_sec - getattr(self, '_last_bracket_check_sec', 0) >= self.ORDER_STATUS_CHECK_INTERVAL_SEC:
+            self._last_bracket_check_sec = now_sec
             self._check_bracket_exits(order_manager, risk_manager, current_price, now_sec)
         
-        # Advanced position management (momentum/trend checks)
+        # ========================================
+        # Momentum/Trend Analysis (5s interval)
+        # ========================================
         direction = 1.0 if pos.side == "long" else -1.0
         current_profit_pct = ((current_price - pos.entry_price) / pos.entry_price) * direction
         
@@ -964,25 +991,32 @@ class ZScoreIcebergHunterStrategy:
                 data_manager, pos.side, current_price
             )
             
+            # Momentum logging (30s)
             if now_sec - pos.last_momentum_log_sec >= config.MOMENTUM_LOG_INTERVAL_SEC:
                 pos.last_momentum_log_sec = now_sec
                 logger.info(
-                    f"[MOMENTUM CHECK] {pos.trade_id} | Hold={hold_min:.1f}min | "
-                    f"Profit={current_profit_pct*100:.2f}% | "
+                    f"[MOMENTUM] {pos.trade_id} | Hold={hold_min:.1f}m | P&L={current_profit_pct*100:.2f}% | "
                     f"M={momentum_favorable} V={vol_favorable} T={trend_favorable}"
                 )
         
-        # ✅ SESSION-BASED TP MANAGEMENT (uses pos.tp_roi from entry)
-        # T+10min: Half-TP or tighten based on conditions
-        if hold_min >= config.FIRST_TP_WAIT_MINUTES and pos.tp_adjustment_count == 0:
+        # ========================================
+        # SESSION-BASED TP MANAGEMENT TIMELINE
+        # ========================================
+        
+        # T+10min: Half-TP Logic (uses pos.tp_roi from entry session)
+        if (hold_min >= config.FIRST_TP_WAIT_MINUTES and 
+            pos.tp_adjustment_count == 0):
+            
             self._manage_tp_new_logic_10min(
                 data_manager, order_manager, current_price, now_sec,
                 momentum_favorable, vol_favorable, trend_favorable,
                 current_profit_pct
             )
         
-        # T+15min: Final tighten to current profit
-        elif hold_min >= (config.FIRST_TP_WAIT_MINUTES + config.SECOND_TP_WAIT_MINUTES) and pos.tp_adjustment_count == 1:
+        # T+15min: Final TP Tightening
+        elif (hold_min >= (config.FIRST_TP_WAIT_MINUTES + config.SECOND_TP_WAIT_MINUTES) and 
+            pos.tp_adjustment_count == 1):
+            
             self._manage_tp_new_logic_15min(
                 order_manager, current_price, current_profit_pct
             )
