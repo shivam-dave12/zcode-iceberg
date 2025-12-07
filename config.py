@@ -1,7 +1,6 @@
 """
-Configuration - Z-Score Strategy with comprehensive logging
+Configuration - Z-Score Strategy with SESSION-BASED PARAMETERS
 """
-
 import os
 from dotenv import load_dotenv
 
@@ -17,47 +16,78 @@ if not COINSWITCH_API_KEY or not COINSWITCH_SECRET_KEY:
     raise ValueError("API credentials not found in .env file")
 
 # ============================================================================
-# TRADING CONFIGURATION
+# TRADING PARAMETERS
 # ============================================================================
 SYMBOL = "BTCUSDT"
 EXCHANGE = "EXCHANGE_2"
 LEVERAGE = 25
 BALANCE_USAGE_PERCENTAGE = 30
 MIN_MARGIN_PER_TRADE = 4
-MAX_MARGIN_PER_TRADE = 10_000
+MAX_MARGIN_PER_TRADE = 10000
 
 # ============================================================================
-# TP/SL BASED ON MARGIN (PER IMAGE)
+# SESSION-BASED VOLATILITY THRESHOLDS
 # ============================================================================
-PROFIT_TARGET_ROI = 0.10  # 10% profit on margin (FULL TP for volatile)
-STOP_LOSS_ROI = 0.03  # 3% loss on margin (for volatile)
+# Weekend / Off-Hours (Conservative)
+WEEKEND_PARAMS = {
+    "z_threshold": 0.80,
+    "imbalance_threshold": 0.50,
+    "entry_score_threshold": 0.70,
+    "wall_multiplier": 5.0,
+    "min_signal_gap_sec": 180.0,  # 3 minutes
+    "tp_roi_target": 0.12,        # 12%
+    "sl_roi_max": 0.03,           # 3%
+}
+
+# Major Sessions (Standard)
+MAJOR_SESSION_PARAMS = {
+    "z_threshold": 0.70,
+    "imbalance_threshold": 0.45,
+    "entry_score_threshold": 0.65,
+    "wall_multiplier": 4.2,
+    "min_signal_gap_sec": 60.0,   # 1 minute
+    "tp_roi_target": 0.11,        # 11%
+    "sl_roi_max": 0.029,          # 2.9%
+}
+
+# Overlap Sessions (Aggressive)
+OVERLAP_SESSION_PARAMS = {
+    "z_threshold": 0.65,
+    "imbalance_threshold": 0.42,
+    "entry_score_threshold": 0.63,
+    "wall_multiplier": 4.0,
+    "min_signal_gap_sec": 45.0,   # 45 seconds
+    "tp_roi_target": 0.10,        # 10%
+    "sl_roi_max": 0.028,          # 2.8%
+}
 
 # ============================================================================
-# LIMIT ORDER ENTRY CONFIGURATION
+# ORDER PARAMETERS
 # ============================================================================
-LIMIT_ORDER_HIGH_VOL_OFFSET_TICKS = 25  # For high volatility: ~20-30 ticks away
-LIMIT_ORDER_LOW_VOL_OFFSET_TICKS = 10   # For low volatility: ~10 ticks away
-LIMIT_ORDER_WAIT_TIMEOUT_SEC = 30.0     # Wait 30s for limit order fill
+PROFIT_TARGET_ROI = 0.10
+STOP_LOSS_ROI = 0.03
+LIMIT_ORDER_HIGH_VOL_OFFSET_TICKS = 25
+LIMIT_ORDER_LOW_VOL_OFFSET_TICKS = 10
+LIMIT_ORDER_WAIT_TIMEOUT_SEC = 60.0
 
 # ============================================================================
-# DATA / STREAM SETTINGS
+# DATA PARAMETERS
 # ============================================================================
 TIMEFRAME = "tick"
 CANDLE_INTERVAL = 1
 CANDLE_LIMIT = 200
 MIN_CANDLES_FOR_TRADING = 50
-POSITION_CHECK_INTERVAL = 0.05
 
 # ============================================================================
-# TRADING RULES / DAILY RISK
+# RISK MANAGEMENT
 # ============================================================================
 ONE_POSITION_AT_A_TIME = True
 MIN_TIME_BETWEEN_TRADES = 2
 MAX_DAILY_TRADES = 100
-MAX_DAILY_LOSS = 2_000
+MAX_DAILY_LOSS = 2000
 
 # ============================================================================
-# LOGGING / SAFETY
+# LOGGING & MONITORING
 # ============================================================================
 LOG_LEVEL = "INFO"
 ENABLE_EXCEL_LOGGING = True
@@ -70,40 +100,32 @@ RATE_LIMIT_MARKET_DATA = 100
 REQUEST_TIMEOUT = 30
 
 # ============================================================================
-# Z-SCORE CORE CONSTANTS
+# TECHNICAL ANALYSIS PARAMETERS
 # ============================================================================
 TICK_SIZE = 1.0
 WALL_DEPTH_LEVELS = 20
-IMBALANCE_THRESHOLD = 0.45  # From 0.65: Catches mild biases (your -0.911 spikes now + partials)
-DELTA_Z_THRESHOLD = 1.0  # From 2.1: Allows Z=1.0+ spikes (your logs avg 0.4 → now triggers 40% cycles)
-DELTA_WINDOW_SEC = 20    # From 10: Bigger deltas (0.2→0.4 BTC avg) → raw Z 1.5-2x higher
+IMBALANCE_THRESHOLD = 0.45
+DELTA_Z_THRESHOLD = 1.0
+DELTA_WINDOW_SEC = 20
 ZONE_TICKS = 12
 PRICE_TOUCH_THRESHOLD_TICKS = 4
-MIN_WALL_VOLUME_MULT = 3.5  # From 4.2: 85% pass rate (your 20x walls always hit)
+MIN_WALL_VOLUME_MULT = 3.5
 WALL_DEGRADE_EXIT = 0.0005
-MAX_HOLD_MINUTES = 15         # From 30: Faster cycles in range
+MAX_HOLD_MINUTES = 15
 SLIPPAGE_TICKS_ASSUMED = 1
-Z_SCORE_POPULATION_SEC = 180  # From 360: Fresher pop (std~0.15 vs 0.3) → amplifies spikes to Z=2+
+ZSCORE_POPULATION_SEC = 180
 
 # ============================================================================
-# TREND / VOLATILITY FILTERS
+# TREND PARAMETERS
 # ============================================================================
 EMA_PERIOD = 20
 ATR_WINDOW_MINUTES = 10
 MAX_ATR_PERCENT = 0.015
-
-# ============================================================================
-# HTF TREND (5m)
-# ============================================================================
 HTF_TREND_INTERVAL = 5
 HTF_EMA_SPAN = 34
-HTF_LOOKBACK_BARS = 18  # From 24: Faster slope detect (your RANGEBOUND 90% → 70% align)
+HTF_LOOKBACK_BARS = 18
 MIN_TREND_SLOPE = 0.0003
-CONSISTENCY_THRESHOLD = 0.50  # From 0.60: Easier hysteresis flip
-
-# ============================================================================
-# LTF TREND (1m) - DISABLED
-# ============================================================================
+CONSISTENCY_THRESHOLD = 0.50
 LTF_EMA_SPAN = 12
 LTF_LOOKBACK_BARS = 30
 LTF_MIN_TREND_SLOPE = 0.0002
@@ -111,77 +133,69 @@ LTF_CONSISTENCY_THRESHOLD = 0.52
 USE_LTF_TREND = False
 
 # ============================================================================
-# FEE CONFIGURATION
+# FEES
 # ============================================================================
 MAKER_FEE_RATE = 0.0003
 TAKER_FEE_RATE = 0.00065
 
 # ============================================================================
-# VOLATILITY REGIME DETECTION
+# VOLATILITY REGIMES
 # ============================================================================
-VOL_REGIME_LOW_ATR_PCT = 0.0010  # From 0.0015: Classifies more as LOW → Z_thresh=1.0 (was 1.8)
-VOL_REGIME_HIGH_ATR_PCT = 0.0030  # HIGH > 0.30%
-VOL_REGIME_BASE_Z_THRESH = 1.0   # Global base (LOW adj auto to 0.85)
+VOL_REGIME_LOW_ATR_PCT = 0.0010
+VOL_REGIME_HIGH_ATR_PCT = 0.0030
+VOL_REGIME_BASE_Z_THRESH = 1.0
 VOL_REGIME_BASE_WALL_MULT = 4.2
 VOL_REGIME_HIGH_WALL_MULT = 3.8
 VOL_REGIME_LOW_WALL_MULT = 4.2
-
-# TP/SL multipliers per regime (only used if NOT volatile)
-VOL_REGIME_HIGH_TP_MULT = 1.40  # +40%
-VOL_REGIME_HIGH_SL_MULT = 0.90  # -10%
-VOL_REGIME_LOW_TP_MULT = 1.10  # +10%
-VOL_REGIME_LOW_SL_MULT = 0.97  # -3%
-
-# Position sizing per regime
-VOL_REGIME_HIGH_SIZE_PCT = 15.0  # 15% in HIGH vol
-VOL_REGIME_LOW_SIZE_PCT = 20.0  # 20% in LOW/NEUTRAL
+VOL_REGIME_HIGH_TP_MULT = 1.40
+VOL_REGIME_HIGH_SL_MULT = 0.90
+VOL_REGIME_LOW_TP_MULT = 1.10
+VOL_REGIME_LOW_SL_MULT = 0.97
+VOL_REGIME_HIGH_SIZE_PCT = 15.0
+VOL_REGIME_LOW_SIZE_PCT = 20.0
 
 # ============================================================================
-# WEIGHTED SCORE GAUNTLET
+# SCORING WEIGHTS
 # ============================================================================
-SCORE_ENTRY_THRESHOLD = 0.65  # From 0.75: Your peaks (0.646) now enter; expect 25-40 trades/day
+SCORE_ENTRY_THRESHOLD = 0.65
 SCORE_EXIT_THRESHOLD = 0.50
-RANGE_BONUS_LOW = 0.90  # New: Multiply trend score by 0.9 in RANGEBOUND (boosts neutral to partial OK)
-RANGE_BONUS_HIGH = 0.60       # New: HIGH vol bonus for trend
-
-SCORE_IMB_WEIGHT = 0.20       # From 0.25: Slight down (less drag from milds)
-SCORE_WALL_WEIGHT = 0.25      # From 0.20: Reward strong walls (your 20x always 1.0)
-SCORE_Z_WEIGHT = 0.35         # From 0.30: Prioritize Z spikes
+RANGE_BONUS_LOW = 0.90
+RANGE_BONUS_HIGH = 0.60
+SCORE_IMB_WEIGHT = 0.20
+SCORE_WALL_WEIGHT = 0.25
+SCORE_Z_WEIGHT = 0.35
 SCORE_TOUCH_WEIGHT = 0.10
 SCORE_TREND_WEIGHT = 0.15
-
 AETHER_CVD_WEIGHT = 0.10
 AETHER_LV_WEIGHT = 0.05
 AETHER_HURST_BOS_WEIGHT = 0.10
 AETHER_LSTM_WEIGHT = 0.10
 
 # ============================================================================
-# ADVANCED POSITION MANAGEMENT
+# VOLATILITY GATES
 # ============================================================================
-VOLATILE_ATR_THRESHOLD = 0.003  # 0.3% ATR = volatile
-POSITION_CHECK_INTERVAL_SEC = 1.0  # Check momentum/vol/trend every second
-MOMENTUM_LOG_INTERVAL_SEC = 60.0  # Log momentum check every minute
-FIRST_TP_WAIT_MINUTES = 10.0  # First 10 min wait
-SECOND_TP_WAIT_MINUTES = 5.0  # Second 5 min wait (total 15min)
-HALF_TP_THRESHOLD = 0.5  # 50% of TP
-TP_BUFFER_PERCENT = 0.01  # 1% buffer when setting near TP
+VOLATILE_ATR_THRESHOLD = 0.003
+POSITION_CHECK_INTERVAL_SEC = 1.0
+MOMENTUM_LOG_INTERVAL_SEC = 60.0
+FIRST_TP_WAIT_MINUTES = 10.0
+SECOND_TP_WAIT_MINUTES = 5.0
+HALF_TP_THRESHOLD = 0.5
+TP_BUFFER_PERCENT = 0.01
 
 # ============================================================================
-# LOGGING CONTROL (REDUCE SPAM)
+# LOGGING INTERVALS
 # ============================================================================
-LOG_DECISION_INTERVAL_SEC = 60.0  # Log comprehensive decision every 1 minute
-LOG_POSITION_INTERVAL_SEC = 60.0  # Log position status every 1 minute
-TELEGRAM_REPORT_INTERVAL_SEC = 900.0  # Telegram report every 15 min
-BALANCE_CACHE_TTL_SEC = 300.0  # Cache balance for 5 min
+LOG_DECISION_INTERVAL_SEC = 60.0
+LOG_POSITION_INTERVAL_SEC = 60.0
+TELEGRAM_REPORT_INTERVAL_SEC = 900.0
+BALANCE_CACHE_TTL_SEC = 300.0
 
-# ============================================================================
-# DISPLAY
-# ============================================================================
-print("\n" + "=" * 80)
-print("✓ Z-SCORE ICEBERG HUNTER CONFIG LOADED")
-print("=" * 80)
-print(f"  ORDER TYPE: LIMIT (volatility-based offset)")
-print(f"  TP/SL: Margin-based calculation ({PROFIT_TARGET_ROI*100:.1f}%/{STOP_LOSS_ROI*100:.1f}%)")
-print(f"  Advanced Position Management: Enabled")
-print(f"  Log intervals: Decision={LOG_DECISION_INTERVAL_SEC}s, Position={LOG_POSITION_INTERVAL_SEC}s")
-print("=" * 80 + "\n")
+if __name__ == "__main__":
+    print("=" * 80)
+    print("Z-SCORE ICEBERG HUNTER CONFIG LOADED")
+    print("=" * 80)
+    print(f"ORDER TYPE: LIMIT (volatility-based offset)")
+    print(f"TP/SL: Margin-based calculation ({PROFIT_TARGET_ROI*100:.1f}%/{STOP_LOSS_ROI*100:.1f}%)")
+    print("Advanced Position Management: Enabled")
+    print(f"Log intervals: Decision={LOG_DECISION_INTERVAL_SEC}s, Position={LOG_POSITION_INTERVAL_SEC}s")
+    print("=" * 80)

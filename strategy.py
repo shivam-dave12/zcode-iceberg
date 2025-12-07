@@ -1,12 +1,13 @@
 """
-Z-Score Strategy with LIMIT order entry and new position management
+Z-Score Strategy with Session-Based Entry Control and Dynamic Parameters
 
-CHANGES:
-1. LIMIT order entry with volatility-based price offset
-2. New position management logic (volatile vs non-volatile)
-3. Calculations every 50ms, logging every 60s
-4. Entry lock to prevent multiple simultaneous orders
-5. Session + Weekend logic as first gate for volatility detection
+IMPROVEMENTS:
+1. Session-aware parameter selection (Weekend/Major/Overlap)
+2. Entry cooldown to prevent noisy signals
+3. 3-signal confirmation with time tracking
+4. Single-fire timeout handling for limit orders
+5. Safe orphaned order cleanup
+6. Session-based TP/SL calculations
 """
 
 import time
@@ -17,18 +18,18 @@ from collections import deque
 import logging
 import numpy as np
 from scipy.stats import norm
-from collections import deque
+
 import config
 from zscore_excel_logger import ZScoreExcelLogger
 from telegram_notifier import send_telegram_message
-from aether_oracle import AetherOracle, OracleInputs, OracleOutputs, OracleSideScores
+from aether_oracle import AetherOracle, OracleInputs, OracleOutputs
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class ZScorePosition:
-    """Position tracking dataclass"""
+    """Position tracking dataclass with session info"""
     trade_id: str
     side: str
     quantity: float
@@ -45,25 +46,25 @@ class ZScorePosition:
     tp_order_id: str
     sl_order_id: str
     main_order_id: str
-    main_filled: bool
-    tp_reduced: bool
-    entry_htf_trend: str
-    vol_regime: str
-    entry_score: float
-    is_volatile: bool
-    tp_roi: float
-    sl_roi: float
-    last_momentum_check_sec: float
-    last_momentum_log_sec: float
-    tp_adjustment_count: int
-    entry_session: str
-    limit_order_placed_time: float
+    main_filled: bool = False
+    tp_reduced: bool = False
+    entry_htf_trend: str = ""
+    vol_regime: str = ""
+    entry_score: float = 0.0
+    is_volatile: bool = False
+    tp_roi: float = 0.0
+    sl_roi: float = 0.0
+    last_momentum_check_sec: float = 0.0
+    last_momentum_log_sec: float = 0.0
+    tp_adjustment_count: int = 0
+    entry_session: str = ""
+    limit_order_placed_time: float = 0.0
     timeout_cancelled: bool = False
+
 
 class ZScoreIcebergHunterStrategy:
     """
-    Z-Score Iceberg Hunter Strategy
-    Industry-grade implementation with proper error handling
+    Z-Score Iceberg Hunter Strategy with Session-Based Control
     """
 
     DECISION_LOG_INTERVAL_SEC = 60.0
@@ -76,22 +77,30 @@ class ZScoreIcebergHunterStrategy:
         self.last_exit_time_min: float = 0.0
         self.excel_logger = excel_logger
         self.trade_seq = 0
+        
         self._delta_population: deque = deque(maxlen=3000)
         self._last_decision_log_sec: float = 0.0
         self._last_position_log_sec: float = 0.0
         self._last_status_check_sec: float = 0.0
         self._oracle = AetherOracle()
 
+        # Signal confirmation tracking (stores tuples of (side, score, timestamp))
         self._signal_history: deque = deque(maxlen=3)
         self._last_signal_time: float = 0.0
+
+        # NEW: Entry cooldown tracking
+        self.last_entry_time_sec: float = 0.0
+        self.current_session_params: Dict = {}
 
         logger.info("=" * 80)
         logger.info("Z-SCORE STRATEGY INITIALIZED")
         logger.info("With Session + Weekend Volatility Gates")
+        logger.info("Dynamic Session-Based Parameters")
+        logger.info("Entry Cooldown & 3-Signal Confirmation")
         logger.info("=" * 80)
 
     # ======================================================================
-    # SESSION + WEEKEND DETECTION (FIRST GATE)
+    # SESSION DETECTION & PARAMETER SELECTION
     # ======================================================================
 
     def _get_current_session(self) -> Tuple[str, bool]:
@@ -131,6 +140,32 @@ class ZScoreIcebergHunterStrategy:
             return "ASIA", True
         else:
             return "OFF_SESSION", False
+
+    def _get_session_parameters(self, session: str, is_major_session: bool) -> Dict:
+        """
+        Get dynamic parameters based on current trading session.
+        Returns session-specific thresholds and timing parameters.
+        """
+        if session == "WEEKEND":
+            params = config.WEEKEND_PARAMS.copy()
+            session_type = "WEEKEND (Conservative)"
+        elif session in ("LONDON_NY_OVERLAP", "ASIA_LONDON_OVERLAP"):
+            params = config.OVERLAP_SESSION_PARAMS.copy()
+            session_type = f"{session} (Aggressive)"
+        elif is_major_session:
+            params = config.MAJOR_SESSION_PARAMS.copy()
+            session_type = "MAJOR SESSION (Standard)"
+        else:
+            # Off-peak hours
+            params = config.WEEKEND_PARAMS.copy()
+            session_type = "OFF-PEAK (Conservative)"
+        
+        # Store for debugging
+        self.current_session_params = params
+        params['session_name'] = session
+        
+        logger.debug(f"Using {session_type} parameters")
+        return params
 
     def _determine_volatility_with_gates(
         self, 
@@ -178,7 +213,6 @@ class ZScoreIcebergHunterStrategy:
             return is_volatile, session, atr_pct, explanation
         else:
             # No ATR data, use session as indicator
-            # Overlap sessions → assume volatile
             if "OVERLAP" in session:
                 explanation = f"Overlap session ({session}) - assume HIGH volatility"
                 return True, session, 0.0, explanation
@@ -187,7 +221,57 @@ class ZScoreIcebergHunterStrategy:
                 return False, session, 0.0, explanation
 
     # ======================================================================
-    # MARGIN-BASED TP/SL CALCULATION
+    # SIGNAL CONFIRMATION WITH COOLDOWN
+    # ======================================================================
+
+    def _check_signal_confirmation(
+        self, 
+        side: str, 
+        score: float, 
+        now_sec: float
+    ) -> Tuple[bool, str]:
+        """
+        Check if we have 3 consecutive signals for the same side.
+        Includes SESSION-BASED entry cooldown to prevent noise.
+        
+        Returns: (confirmed, reason)
+        """
+        # Get current session parameters
+        session, is_major = self._get_current_session()
+        session_params = self._get_session_parameters(session, is_major)
+        min_gap = session_params["min_signal_gap_sec"]
+        
+        # Check if we're in cooldown period
+        if now_sec - self.last_entry_time_sec < min_gap:
+            remaining = min_gap - (now_sec - self.last_entry_time_sec)
+            return False, f"COOLDOWN ({remaining:.0f}s remaining)"
+        
+        # Add signal to history (side, score, timestamp)
+        self._signal_history.append((side, score, now_sec))
+        
+        # Need 3 consecutive signals
+        if len(self._signal_history) < 3:
+            return False, f"NEED_MORE ({len(self._signal_history)}/3)"
+        
+        # Check if all 3 are the same side (and not NEUTRAL)
+        recent_3 = list(self._signal_history)[-3:]
+        sides = [s[0] for s in recent_3]
+        
+        if sides[0] == sides[1] == sides[2] == side and side != "NEUTRAL":
+            # Calculate time span and average score
+            time_span = now_sec - recent_3[0][2]
+            avg_score = sum(s[1] for s in recent_3) / 3
+            
+            logger.info(
+                f"[SIGNAL CONFIRMATION] ✓ 3x {side.upper()} signals "
+                f"over {time_span:.1f}s (avg score: {avg_score:.3f})"
+            )
+            return True, "CONFIRMED"
+        
+        return False, "NOT_CONSECUTIVE"
+
+    # ======================================================================
+    # TP/SL CALCULATION WITH SESSION PARAMETERS
     # ======================================================================
 
     def _calculate_tp_sl_prices(
@@ -196,25 +280,33 @@ class ZScoreIcebergHunterStrategy:
         margin_used: float,
         quantity: float,
         side: str,
-        desired_profit_roi: float,
-        desired_sl_roi: float,
-    ) -> Tuple[float, float]:
-        """Calculate TP/SL based on margin methodology with validation"""
+        session_params: Dict,
+    ) -> Tuple[float, float, float, float]:
+        """
+        Calculate TP/SL using SESSION-BASED ROI targets.
+        Returns: (tp_price, sl_price, tp_roi, sl_roi)
+        """
         try:
+            # Use session-specific TP/SL targets
+            tp_roi_target = session_params["tp_roi_target"]
+            sl_roi_max = session_params["sl_roi_max"]
+            
             logger.info("=" * 80)
-            logger.info("[TP/SL CALCULATION] Using margin-based formula")
+            logger.info("[TP/SL CALCULATION] Using session-based parameters")
+            logger.info(f"  Session: {session_params.get('session_name', 'UNKNOWN')}")
             logger.info(f"  Entry Price: {entry_price:.2f}")
             logger.info(f"  Margin Used: {margin_used:.2f} USDT")
             logger.info(f"  Quantity: {quantity:.6f} BTC")
             logger.info(f"  Side: {side.upper()}")
-            logger.info(f"  Desired TP ROI: {desired_profit_roi*100:.2f}%")
-            logger.info(f"  Desired SL ROI: {desired_sl_roi*100:.2f}%")
+            logger.info(f"  Desired TP ROI: {tp_roi_target*100:.2f}%")
+            logger.info(f"  Desired SL ROI: {sl_roi_max*100:.2f}%")
 
             if entry_price <= 0 or margin_used <= 0 or quantity <= 0:
                 raise ValueError("Invalid input: prices/margin/quantity must be positive")
 
-            tp_price_movement = (margin_used * desired_profit_roi) / quantity
-            sl_price_movement = (margin_used * desired_sl_roi) / quantity
+            # Calculate price movements
+            tp_price_movement = (margin_used * tp_roi_target) / quantity
+            sl_price_movement = (margin_used * sl_roi_max) / quantity
 
             logger.info(f"  TP Price Movement: {tp_price_movement:.2f} USDT")
             logger.info(f"  SL Price Movement: {sl_price_movement:.2f} USDT")
@@ -233,31 +325,763 @@ class ZScoreIcebergHunterStrategy:
             logger.info(f"  ✓ SL Price: {sl_price:.2f}")
             logger.info("=" * 80)
 
-            return tp_price, sl_price
+            return tp_price, sl_price, tp_roi_target, sl_roi_max
 
         except Exception as e:
             logger.error(f"Error calculating TP/SL: {e}")
+            # Fallback to safe defaults
             if side == "long":
-                return entry_price * 1.01, entry_price * 0.99
+                return entry_price * 1.01, entry_price * 0.99, 0.01, 0.01
             else:
-                return entry_price * 0.99, entry_price * 1.01
+                return entry_price * 0.99, entry_price * 1.01, 0.01, 0.01
 
     # ======================================================================
-    # VOLATILITY REGIME
+    # MAIN TICK HANDLER
+    # ======================================================================
+
+    def on_tick(self, data_manager, order_manager, risk_manager) -> None:
+        """Main per-tick strategy with session-aware logic."""
+        try:
+            current_price = data_manager.get_last_price()
+            if current_price <= 0:
+                return
+
+            now_sec = time.time()
+
+            # If position exists, manage it
+            if self.current_position is not None:
+                self._manage_open_position(
+                    data_manager=data_manager,
+                    order_manager=order_manager,
+                    risk_manager=risk_manager,
+                    current_price=current_price,
+                    now_sec=now_sec,
+                )
+                return
+
+            # Don't enter if already pending
+            if self.pending_entry:
+                return
+
+            # Check minimum time between trades
+            if self.last_exit_time_min > 0:
+                minutes_since_exit = (now_sec / 60.0) - self.last_exit_time_min
+                if minutes_since_exit < config.MIN_TIME_BETWEEN_TRADES:
+                    return
+
+            # Check if trading is allowed
+            allowed, reason = risk_manager.check_trading_allowed()
+            if not allowed:
+                return
+
+            # Compute metrics
+            imbalance_data = self._compute_imbalance(data_manager)
+            wall_data = (
+                self._compute_wall_strength(data_manager, current_price, imbalance_data)
+                if imbalance_data is not None
+                else None
+            )
+            delta_data = self._compute_delta_z_score(data_manager)
+            touch_data = self._compute_price_touch(data_manager, current_price)
+
+            # Get HTF trend
+            htf_trend: Optional[str] = None
+            try:
+                if hasattr(data_manager, "get_htf_trend"):
+                    htf_trend = data_manager.get_htf_trend()
+            except Exception as e:
+                logger.error(f"Error fetching HTF trend: {e}")
+
+            # Get Oracle inputs/outputs
+            oracle_inputs: Optional[OracleInputs] = None
+            oracle_outputs: Optional[OracleOutputs] = None
+            try:
+                oracle_inputs = self._oracle.build_inputs(
+                    data_manager=data_manager,
+                    current_price=current_price,
+                    imbalance_data=imbalance_data,
+                    wall_data=wall_data,
+                    delta_data=delta_data,
+                    touch_data=touch_data,
+                    htf_trend=htf_trend,
+                    ltf_trend=None,
+                )
+                oracle_outputs = self._oracle.decide(oracle_inputs, risk_manager)
+            except Exception as e:
+                logger.error(f"Oracle error: {e}")
+
+            # Try entries with comprehensive logging
+            self._try_entries_and_log(
+                data_manager=data_manager,
+                order_manager=order_manager,
+                risk_manager=risk_manager,
+                current_price=current_price,
+                imbalance_data=imbalance_data,
+                wall_data=wall_data,
+                delta_data=delta_data,
+                touch_data=touch_data,
+                htf_trend=htf_trend,
+                now_sec=now_sec,
+                oracle_inputs=oracle_inputs,
+                oracle_outputs=oracle_outputs,
+            )
+
+        except Exception as e:
+            logger.error(f"Error in on_tick: {e}", exc_info=True)
+
+    # ======================================================================
+    # ENTRY DECISION WITH SESSION-BASED THRESHOLDS
+    # ======================================================================
+
+    def _try_entries_and_log(
+        self,
+        data_manager,
+        order_manager,
+        risk_manager,
+        current_price: float,
+        imbalance_data: Optional[Dict],
+        wall_data: Optional[Dict],
+        delta_data: Optional[Dict],
+        touch_data: Optional[Dict],
+        htf_trend: Optional[str],
+        now_sec: float,
+        oracle_inputs: Optional[OracleInputs],
+        oracle_outputs: Optional[OracleOutputs],
+    ) -> None:
+        """
+        Evaluate LONG/SHORT with SESSION-BASED thresholds.
+        Requires 3 consecutive identical signals + cooldown before entering.
+        """
+        if not all([imbalance_data, wall_data, delta_data, touch_data]):
+            return
+
+        if self.pending_entry:
+            return
+
+        # Get session and parameters
+        session, is_major = self._get_current_session()
+        session_params = self._get_session_parameters(session, is_major)
+        
+        # Use session-specific thresholds
+        z_thresh = session_params["z_threshold"]
+        imb_thresh = session_params["imbalance_threshold"]
+        entry_thresh = session_params["entry_score_threshold"]
+        wall_mult = session_params["wall_multiplier"]
+
+        # Get volatility regime
+        regime_params = self._get_regime_params(data_manager, current_price)
+        regime = regime_params["regime"]
+        atr_pct = regime_params.get("atr_pct", 0.0)
+
+        # Get EMA for trend check
+        ema_val: Optional[float] = None
+        try:
+            ema_val = data_manager.get_ema(period=config.EMA_PERIOD)
+        except:
+            pass
+
+        trend_long_ok = (ema_val is not None and current_price > ema_val)
+        trend_short_ok = (ema_val is not None and current_price < ema_val)
+
+        # Calculate scores with session thresholds
+        long_core, long_core_reasons = self._compute_weighted_score(
+            imbalance_data, wall_data, delta_data, touch_data,
+            trend_long_ok, "long", regime, z_thresh, wall_mult
+        )
+        short_core, short_core_reasons = self._compute_weighted_score(
+            imbalance_data, wall_data, delta_data, touch_data,
+            trend_short_ok, "short", regime, z_thresh, wall_mult
+        )
+        
+        long_aether, long_aether_reasons = self._compute_aether_fusion_score(
+            oracle_inputs, oracle_outputs, "long"
+        )
+        short_aether, short_aether_reasons = self._compute_aether_fusion_score(
+            oracle_inputs, oracle_outputs, "short"
+        )
+
+        long_total = long_core * 0.65 + long_aether * 0.35
+        short_total = short_core * 0.65 + short_aether * 0.35
+
+        # Use session-specific entry threshold
+        long_entry = (long_total > entry_thresh)
+        short_entry = (short_total > entry_thresh)
+
+        # Determine current signal
+        current_signal = "NEUTRAL"
+        current_score = 0.0
+        
+        if long_entry and long_total > short_total:
+            current_signal = "LONG"
+            current_score = long_total
+        elif short_entry and short_total > long_total:
+            current_signal = "SHORT"
+            current_score = short_total
+
+        # Check for 3-signal confirmation with cooldown
+        confirmed, confirmation_reason = self._check_signal_confirmation(
+            current_signal, current_score, now_sec
+        )
+
+        # Periodic logging
+        should_log = (now_sec - self._last_decision_log_sec >= self.DECISION_LOG_INTERVAL_SEC)
+        
+        if should_log:
+            self._last_decision_log_sec = now_sec
+            
+            # Show signal history
+            signal_history_str = " → ".join([
+                f"{s[0][0]}" for s in list(self._signal_history)
+            ]) if self._signal_history else "Empty"
+            
+            logger.info("\n" + "=" * 100)
+            logger.info(f"[DECISION REPORT] {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            logger.info("=" * 100)
+            logger.info(f"PRICE: {current_price:.2f} USDT")
+            logger.info(f"")
+            logger.info(f"[SIGNAL CONFIRMATION]")
+            logger.info(f"  Current Signal: {current_signal} (score: {current_score:.3f})")
+            logger.info(f"  Signal History: {signal_history_str}")
+            logger.info(f"  Confirmation Status: {confirmation_reason}")
+            logger.info(f"")
+            logger.info(f"[SESSION INFO]")
+            logger.info(f"  Current Session: {session}")
+            logger.info(f"  Major Session: {'Yes' if is_major else 'No'}")
+            logger.info(f"  Min Signal Gap: {session_params['min_signal_gap_sec']}s")
+            logger.info(f"")
+            logger.info(f"[SESSION THRESHOLDS]")
+            logger.info(f"  Z-Score: {z_thresh:.2f}")
+            logger.info(f"  Imbalance: {imb_thresh:.2f}")
+            logger.info(f"  Entry Score: {entry_thresh:.2f}")
+            logger.info(f"  Wall Multiplier: {wall_mult:.1f}")
+            logger.info(f"")
+            logger.info(f"[VOL REGIME]")
+            logger.info(f"  Regime: {regime}")
+            logger.info(f"  ATR%: {atr_pct*100:.3f}%")
+            logger.info(f"")
+            logger.info(f"[CORE METRICS]")
+            logger.info(f"  Imbalance: {imbalance_data['imbalance']:.3f}")
+            logger.info(f"  Wall Bid/Ask: {wall_data['bid_wall_strength']:.2f} / {wall_data['ask_wall_strength']:.2f}")
+            logger.info(f"  Z-Score: {delta_data['z_score']:.2f}")
+            logger.info(f"  Touch Bid/Ask: {touch_data['bid_distance_ticks']:.1f} / {touch_data['ask_distance_ticks']:.1f} ticks")
+            logger.info(f"")
+            logger.info(f"[SCORE BREAKDOWN]")
+            logger.info(f"  LONG: Core={long_core:.3f} | Aether={long_aether:.3f} | TOTAL={long_total:.3f}")
+            logger.info(f"  SHORT: Core={short_core:.3f} | Aether={short_aether:.3f} | TOTAL={short_total:.3f}")
+            logger.info("=" * 100 + "\n")
+
+        # Only enter if confirmed
+        if confirmed and current_signal in ("LONG", "SHORT"):
+            self.pending_entry = True
+            side = "long" if current_signal == "LONG" else "short"
+            
+            self._enter_position(
+                data_manager=data_manager,
+                order_manager=order_manager,
+                risk_manager=risk_manager,
+                side=side,
+                current_price=current_price,
+                imbalance_data=imbalance_data,
+                wall_data=wall_data,
+                delta_data=delta_data,
+                touch_data=touch_data,
+                now_sec=now_sec,
+                regime_params=regime_params,
+                entry_score=current_score,
+                session_params=session_params,
+            )
+            
+            # Clear signal history after entry
+            self._signal_history.clear()
+
+    # ======================================================================
+    # POSITION ENTRY WITH SESSION PARAMETERS
+    # ======================================================================
+
+    def _enter_position(
+        self,
+        data_manager,
+        order_manager,
+        risk_manager,
+        side: str,
+        current_price: float,
+        imbalance_data: Dict,
+        wall_data: Dict,
+        delta_data: Dict,
+        touch_data: Dict,
+        now_sec: float,
+        regime_params: Dict,
+        entry_score: float,
+        session_params: Dict,
+    ) -> None:
+        """Enter position with LIMIT order + session-based TP/SL."""
+        try:
+            # Check for existing position first
+            try:
+                positions_resp = order_manager.api.get_positions(
+                    symbol=config.SYMBOL, 
+                    exchange=config.EXCHANGE
+                )
+                
+                if positions_resp and not positions_resp.get("error"):
+                    data = positions_resp.get("data", [])
+                    if isinstance(data, list):
+                        for pos in data:
+                            if pos.get("symbol") == config.SYMBOL:
+                                qty = float(pos.get("quantity", 0))
+                                if abs(qty) > 0:
+                                    logger.warning(
+                                        f"⚠️ Existing position detected: {qty:.6f} BTC - SKIPPING ENTRY"
+                                    )
+                                    self.pending_entry = False
+                                    return
+            except Exception as e:
+                logger.error(f"Error checking existing positions: {e}")
+            
+            # Clean up orphaned orders
+            cleaned = self._clean_orphaned_orders(order_manager, symbol=config.SYMBOL)
+            if cleaned:
+                time.sleep(1.0)
+            
+            # Get session and volatility info
+            session = session_params.get('session_name', 'UNKNOWN')
+            regime = regime_params["regime"]
+            
+            is_volatile, _, atr_pct, vol_explanation = self._determine_volatility_with_gates(
+                data_manager, current_price
+            )
+            
+            # Position sizing
+            quantity, margin_used = risk_manager.calculate_position_size_vol_regime(
+                entry_price=current_price,
+                regime=regime,
+            )
+            
+            if quantity <= 0:
+                logger.error("Position sizing returned 0 quantity")
+                self.pending_entry = False
+                return
+            
+            # Volatility-based entry offset
+            if is_volatile:
+                offset_ticks = config.LIMIT_ORDER_HIGH_VOL_OFFSET_TICKS
+            else:
+                offset_ticks = config.LIMIT_ORDER_LOW_VOL_OFFSET_TICKS
+            
+            if side == "long":
+                limit_entry_price = current_price - (offset_ticks * config.TICK_SIZE)
+            else:
+                limit_entry_price = current_price + (offset_ticks * config.TICK_SIZE)
+            
+            # Calculate TP/SL using session parameters
+            tp_price, sl_price, tp_roi, sl_roi = self._calculate_tp_sl_prices(
+                entry_price=limit_entry_price,
+                margin_used=margin_used,
+                quantity=quantity,
+                side=side,
+                session_params=session_params,
+            )
+            
+            logger.info("=" * 100)
+            logger.info(f"[ENTRY EXECUTION] {side.upper()} - SESSION-BASED BRACKET")
+            logger.info("=" * 100)
+            logger.info(f"  Session: {session}")
+            logger.info(f"  Cooldown: {session_params['min_signal_gap_sec']}s")
+            logger.info(f"  Volatility: {vol_explanation}")
+            logger.info(f"  Regime: {regime}")
+            logger.info(f"  Entry Score: {entry_score:.3f}")
+            logger.info(f"  Current Price: {current_price:.2f}")
+            logger.info(f"  Limit Entry: {limit_entry_price:.2f} (offset: {offset_ticks} ticks)")
+            logger.info(f"  Quantity: {quantity:.6f} BTC")
+            logger.info(f"  Margin: {margin_used:.2f} USDT")
+            logger.info(f"  TP: {tp_price:.2f} ({tp_roi*100:.2f}%)")
+            logger.info(f"  SL: {sl_price:.2f} ({sl_roi*100:.2f}%)")
+            logger.info("=" * 100)
+            
+            market_side = "BUY" if side == "long" else "SELL"
+            
+            # Place LIMIT entry
+            main_order = order_manager.place_limit_order(
+                side=market_side,
+                quantity=quantity,
+                price=limit_entry_price,
+                reduce_only=False,
+            )
+            
+            if not main_order:
+                logger.error("Limit order placement failed")
+                self.pending_entry = False
+                return
+            
+            main_order_id = main_order.get("order_id", "")
+            logger.info(f"✓ Limit order placed: {main_order_id}")
+            
+            # Place TP and SL immediately
+            tp_side = "SELL" if side == "long" else "BUY"
+            
+            tp_order = order_manager.place_take_profit(
+                side=tp_side,
+                quantity=quantity,
+                trigger_price=tp_price,
+            )
+            
+            sl_order = order_manager.place_stop_loss(
+                side=tp_side,
+                quantity=quantity,
+                trigger_price=sl_price,
+            )
+            
+            if not tp_order or not sl_order:
+                logger.error("TP/SL placement failed - cancelling limit order")
+                order_manager.cancel_order(main_order_id)
+                self.pending_entry = False
+                return
+            
+            logger.info(f"✓ TP order placed: {tp_order.get('order_id', '')}")
+            logger.info(f"✓ SL order placed: {sl_order.get('order_id', '')}")
+            
+            # Create position object
+            self.trade_seq += 1
+            htf_trend = "UNKNOWN"
+            try:
+                if hasattr(data_manager, "get_htf_trend"):
+                    htf_trend = data_manager.get_htf_trend() or "UNKNOWN"
+            except:
+                pass
+            
+            self.current_position = ZScorePosition(
+                trade_id=f"ZS{self.trade_seq:04d}",
+                side=side,
+                quantity=quantity,
+                entry_price=limit_entry_price,
+                entry_time_sec=now_sec,
+                entry_wall_volume=(
+                    wall_data["bid_vol_zone"] if side == "long" else wall_data["ask_vol_zone"]
+                ),
+                wall_zone_low=wall_data["zone_low"],
+                wall_zone_high=wall_data["zone_high"],
+                entry_imbalance=imbalance_data["imbalance"],
+                entry_z_score=delta_data["z_score"],
+                tp_price=tp_price,
+                sl_price=sl_price,
+                margin_used=margin_used,
+                tp_order_id=tp_order.get("order_id", ""),
+                sl_order_id=sl_order.get("order_id", ""),
+                main_order_id=main_order_id,
+                main_filled=False,
+                tp_reduced=False,
+                entry_htf_trend=htf_trend,
+                vol_regime=regime,
+                entry_score=entry_score,
+                is_volatile=is_volatile,
+                tp_roi=tp_roi,
+                sl_roi=sl_roi,
+                last_momentum_check_sec=now_sec,
+                last_momentum_log_sec=now_sec,
+                tp_adjustment_count=0,
+                entry_session=session,
+                limit_order_placed_time=now_sec,
+            )
+            
+            risk_manager.record_trade_opened()
+            
+            # Update last entry time for cooldown
+            self.last_entry_time_sec = now_sec
+            
+            self.pending_entry = False
+            
+            msg = (
+                f"🎯 {side.upper()} BRACKET ({session})\n"
+                f"Limit Entry: {limit_entry_price:.2f} (current {current_price:.2f})\n"
+                f"Qty: {quantity:.6f}\n"
+                f"TP: {tp_price:.2f} ({tp_roi*100:.1f}%) | SL: {sl_price:.2f} ({sl_roi*100:.1f}%)\n"
+                f"Score: {entry_score:.3f} | Next entry: {session_params['min_signal_gap_sec']}s"
+            )
+            
+            try:
+                send_telegram_message(msg)
+            except:
+                pass
+            
+            logger.info(f"✓ Position bracket created: {self.current_position.trade_id}")
+            logger.info(f"  Next entry allowed after {session_params['min_signal_gap_sec']}s cooldown")
+            
+        except Exception as e:
+            logger.error(f"Error in _enter_position: {e}", exc_info=True)
+            self.pending_entry = False
+
+    # ======================================================================
+    # POSITION MANAGEMENT WITH SAFE TIMEOUT
+    # ======================================================================
+
+    def _manage_open_position(
+        self, 
+        data_manager, 
+        order_manager, 
+        risk_manager, 
+        current_price: float, 
+        now_sec: float,
+    ) -> None:
+        """Manage open position with SINGLE-FIRE timeout handling."""
+        pos = self.current_position
+        
+        # Check if LIMIT order has filled yet
+        if not pos.main_filled:
+            elapsed_since_placement = now_sec - pos.limit_order_placed_time
+            
+            # SINGLE-FIRE TIMEOUT CHECK: 60 seconds
+            if elapsed_since_placement > 60.0 and not pos.timeout_cancelled:
+                logger.warning(f"⏱️ LIMIT ORDER TIMEOUT after {elapsed_since_placement:.1f}s")
+                logger.info("Starting timeout cancellation sequence...")
+                
+                pos.timeout_cancelled = True
+                
+                # Final status check BEFORE cancelling anything
+                try:
+                    logger.info(f"Checking final status of limit order: {pos.main_order_id}")
+                    final_check = order_manager.get_order_status(pos.main_order_id)
+                    
+                    if not final_check:
+                        logger.error("Cannot get order status - aborting for safety")
+                        self.current_position = None
+                        self.pending_entry = False
+                        return
+                    
+                    final_status = final_check.get("status", "").upper()
+                    logger.info(f"Limit order final status: {final_status}")
+                    
+                    if final_status in ("EXECUTED", "FILLED"):
+                        # Order FILLED just before timeout - keep TP/SL active
+                        logger.info(f"✅ Limit order FILLED just before timeout - keeping TP/SL active")
+                        pos.main_filled = True
+                        
+                        try:
+                            actual_fill_price = order_manager.extract_fill_price(final_check)
+                            pos.entry_price = actual_fill_price
+                            logger.info(f"Updated entry price to: {actual_fill_price:.2f}")
+                        except Exception as e:
+                            logger.warning(f"Could not extract fill price: {e}")
+                        
+                        try:
+                            msg = (
+                                f"✅ {pos.side.upper()} FILLED (last-second)\n"
+                                f"Entry: {pos.entry_price:.2f}\n"
+                                f"TP: {pos.tp_price:.2f} | SL: {pos.sl_price:.2f}\n"
+                                f"Filled after {elapsed_since_placement:.1f}s"
+                            )
+                            send_telegram_message(msg)
+                        except:
+                            pass
+                        
+                        # Continue with normal position management
+                        logger.info("Position is now ACTIVE - continuing to position management")
+                        
+                    elif final_status in ("OPEN", "PENDING", "NEW", "ACTIVE"):
+                        # Order still open - safe to cancel bracket
+                        logger.info(f"Limit order still {final_status} - proceeding with bracket cancellation")
+                        
+                        # Cancel limit order first
+                        logger.info(f"Cancelling limit order: {pos.main_order_id}")
+                        try:
+                            order_manager.cancel_order(pos.main_order_id)
+                        except Exception as e:
+                            logger.warning(f"Limit cancel error: {e}")
+                        
+                        # Wait and recheck
+                        logger.info("Waiting 0.5s before safety recheck...")
+                        time.sleep(0.5)
+                        
+                        # DOUBLE CHECK before cancelling TP/SL
+                        logger.info("Performing safety recheck...")
+                        try:
+                            recheck = order_manager.get_order_status(pos.main_order_id)
+                            recheck_status = recheck.get("status", "").upper() if recheck else "UNKNOWN"
+                            logger.info(f"Recheck status: {recheck_status}")
+                            
+                            if recheck_status in ("EXECUTED", "FILLED"):
+                                logger.warning(f"⚠️ Limit order filled DURING cancellation - KEEPING TP/SL")
+                                pos.main_filled = True
+                                pos.timeout_cancelled = False
+                                return
+                        except Exception as e:
+                            logger.error(f"Recheck failed: {e} - proceeding with caution")
+                        
+                        # Still safe - cancel TP/SL
+                        logger.info(f"Cancelling TP order: {pos.tp_order_id}")
+                        try:
+                            order_manager.cancel_order(pos.tp_order_id)
+                        except Exception as e:
+                            logger.warning(f"TP cancel error: {e}")
+                        
+                        logger.info(f"Cancelling SL order: {pos.sl_order_id}")
+                        try:
+                            order_manager.cancel_order(pos.sl_order_id)
+                        except Exception as e:
+                            logger.warning(f"SL cancel error: {e}")
+                        
+                        logger.info("✓ Bracket cancellation complete")
+                        
+                        # Send timeout notification
+                        try:
+                            msg = (
+                                f"⏱️ TIMEOUT: {pos.side.upper()} bracket cancelled\n"
+                                f"Limit order not filled in 60s\n"
+                                f"Limit: {pos.entry_price:.2f} (current {current_price:.2f})\n"
+                                f"Session: {pos.entry_session}"
+                            )
+                            send_telegram_message(msg)
+                        except:
+                            pass
+                        
+                        # Reset position state
+                        logger.info("Resetting position state")
+                        self.current_position = None
+                        self.pending_entry = False
+                        return
+                    
+                    else:
+                        # Order cancelled/rejected/expired by exchange
+                        logger.warning(f"Limit order {final_status} by exchange - cleaning up TP/SL")
+                        
+                        try:
+                            order_manager.cancel_order(pos.tp_order_id)
+                        except:
+                            pass
+                        
+                        try:
+                            order_manager.cancel_order(pos.sl_order_id)
+                        except:
+                            pass
+                        
+                        self.current_position = None
+                        self.pending_entry = False
+                        return
+                        
+                except Exception as e:
+                    logger.error(f"CRITICAL ERROR during timeout handling: {e}", exc_info=True)
+                    logger.warning("Cannot verify limit status - NOT cancelling TP/SL for safety")
+                    self.current_position = None
+                    self.pending_entry = False
+                    return
+            
+            # If timeout already processed, wait for exchange
+            if pos.timeout_cancelled and not pos.main_filled:
+                return
+            
+            # Regular status check (if not timed out yet)
+            if elapsed_since_placement <= 60.0:
+                try:
+                    main_status = order_manager.get_order_status(pos.main_order_id)
+                    if main_status:
+                        status = main_status.get("status", "").upper()
+                        if status in ("EXECUTED", "FILLED"):
+                            pos.main_filled = True
+                            actual_fill_price = order_manager.extract_fill_price(main_status)
+                            pos.entry_price = actual_fill_price
+                            logger.info(
+                                f"✓ Limit order filled at {actual_fill_price:.2f} "
+                                f"(after {elapsed_since_placement:.1f}s)"
+                            )
+                            
+                            try:
+                                msg = (
+                                    f"✅ {pos.side.upper()} FILLED\n"
+                                    f"Entry: {actual_fill_price:.2f} (after {elapsed_since_placement:.1f}s)\n"
+                                    f"TP: {pos.tp_price:.2f} | SL: {pos.sl_price:.2f}"
+                                )
+                                send_telegram_message(msg)
+                            except:
+                                pass
+                            
+                        elif status in ("CANCELLED", "REJECTED", "EXPIRED"):
+                            logger.warning(f"Limit order {status} - closing bracket")
+                            order_manager.cancel_order(pos.tp_order_id)
+                            order_manager.cancel_order(pos.sl_order_id)
+                            self.current_position = None
+                            self.pending_entry = False
+                            return
+                except Exception as e:
+                    logger.debug(f"Error checking main order status: {e}")
+            
+            # If limit not filled yet, don't do position management
+            return
+        
+        # Position is filled - normal management
+        hold_sec = now_sec - pos.entry_time_sec
+        hold_min = hold_sec / 60.0
+
+        # Periodic position logging
+        if now_sec - self._last_position_log_sec >= self.POSITION_LOG_INTERVAL_SEC:
+            self._last_position_log_sec = now_sec
+            direction = 1.0 if pos.side == "long" else -1.0
+            current_profit_pct = ((current_price - pos.entry_price) / pos.entry_price) * direction
+            upnl = (current_price - pos.entry_price) * direction * pos.quantity
+
+            logger.info("\n" + "=" * 100)
+            logger.info(f"[POSITION STATUS] {pos.trade_id}")
+            logger.info("=" * 100)
+            logger.info(f"  Side: {pos.side.upper()}")
+            logger.info(f"  Entry Session: {pos.entry_session}")
+            logger.info(f"  Entry: {pos.entry_price:.2f} | Current: {current_price:.2f}")
+            logger.info(f"  Quantity: {pos.quantity:.6f} BTC")
+            logger.info(f"  Margin: {pos.margin_used:.2f} USDT")
+            logger.info(f"  TP: {pos.tp_price:.2f} ({pos.tp_roi*100:.2f}%) | SL: {pos.sl_price:.2f} ({pos.sl_roi*100:.2f}%)")
+            logger.info(f"  Hold Time: {hold_min:.1f} min")
+            logger.info(f"  Unrealized P&L: {upnl:.2f} USDT ({current_profit_pct*100:.2f}%)")
+            logger.info(f"  TP Adjustments: {pos.tp_adjustment_count}")
+            logger.info("=" * 100 + "\n")
+
+        # Check bracket exits periodically
+        if now_sec - self._last_status_check_sec >= self.ORDER_STATUS_CHECK_INTERVAL_SEC:
+            self._last_status_check_sec = now_sec
+            self._check_bracket_exits(order_manager, risk_manager, current_price, now_sec)
+
+        # Advanced position management (existing logic)
+        direction = 1.0 if pos.side == "long" else -1.0
+        current_profit_pct = ((current_price - pos.entry_price) / pos.entry_price) * direction
+
+        if now_sec - pos.last_momentum_check_sec >= config.POSITION_CHECK_INTERVAL_SEC:
+            pos.last_momentum_check_sec = now_sec
+
+            momentum_favorable, vol_favorable, trend_favorable = self._check_market_conditions(
+                data_manager, pos.side, current_price
+            )
+
+            if now_sec - pos.last_momentum_log_sec >= config.MOMENTUM_LOG_INTERVAL_SEC:
+                pos.last_momentum_log_sec = now_sec
+                logger.info(
+                    f"[MOMENTUM CHECK] {pos.trade_id} | Hold={hold_min:.1f}min | "
+                    f"Profit={current_profit_pct*100:.2f}% | "
+                    f"M={momentum_favorable} V={vol_favorable} T={trend_favorable}"
+                )
+
+            # TP management at 10min and 15min marks
+            if hold_min >= config.FIRST_TP_WAIT_MINUTES and pos.tp_adjustment_count == 0:
+                self._manage_tp_new_logic_10min(
+                    data_manager, order_manager, current_price, now_sec,
+                    momentum_favorable, vol_favorable, trend_favorable,
+                    current_profit_pct
+                )
+
+            elif hold_min >= (config.FIRST_TP_WAIT_MINUTES + config.SECOND_TP_WAIT_MINUTES) and pos.tp_adjustment_count == 1:
+                self._manage_tp_new_logic_15min(
+                    order_manager, current_price, current_profit_pct
+                )
+
+    # ======================================================================
+    # HELPER METHODS (existing implementations)
     # ======================================================================
 
     def _get_regime_params(self, data_manager, current_price: float) -> Dict:
-        """Get dynamic params based on vol regime with error handling"""
+        """Get dynamic params based on vol regime."""
         try:
             atr_pct = data_manager.get_atr_percent()
-        except Exception as e:
-            logger.debug(f"Error getting ATR%: {e}")
+        except:
             atr_pct = None
 
         try:
             regime = data_manager.get_vol_regime(atr_pct) if hasattr(data_manager, 'get_vol_regime') else "NEUTRAL"
-        except Exception as e:
-            logger.debug(f"Error getting vol regime: {e}")
+        except:
             regime = "NEUTRAL"
 
         if regime == "LOW":
@@ -287,10 +1111,6 @@ class ZScoreIcebergHunterStrategy:
             "size_pct": size_pct,
             "atr_pct": atr_pct or 0.0,
         }
-
-    # ======================================================================
-    # WEIGHTED SCORE CALCULATION
-    # ======================================================================
 
     def _compute_signal_score(self, value: float, threshold: float) -> float:
         """Normalize signal to [0, 1] using CDF."""
@@ -389,7 +1209,6 @@ class ZScoreIcebergHunterStrategy:
             components.append((lv_score, config.AETHER_LV_WEIGHT))
             reasons.append(f"lv={lv_score:.3f}")
         else:
-            logger.debug(f"[AETHER] LV data unavailable: 1m={oracle_inputs.lv_1m}, 5m={oracle_inputs.lv_5m}, 15m={oracle_inputs.lv_15m}")
             reasons.append("lv=N/A")
 
         if oracle_inputs.hurst is not None:
@@ -428,1009 +1247,6 @@ class ZScoreIcebergHunterStrategy:
         aether_score = num / den if den > 0 else 0.0
 
         return aether_score, reasons
-
-    # ======================================================================
-    # MAIN TICK HANDLER
-    # ======================================================================
-
-    def on_tick(self, data_manager, order_manager, risk_manager) -> None:
-        """Main per-tick strategy."""
-        try:
-            current_price = data_manager.get_last_price()
-            if current_price <= 0:
-                return
-
-            now_sec = time.time()
-
-            if self.current_position is not None:
-                self._manage_open_position(
-                    data_manager=data_manager,
-                    order_manager=order_manager,
-                    risk_manager=risk_manager,
-                    current_price=current_price,
-                    now_sec=now_sec,
-                )
-                return
-
-            if self.pending_entry:
-                return
-
-            if self.last_exit_time_min > 0:
-                minutes_since_exit = (now_sec / 60.0) - self.last_exit_time_min
-                if minutes_since_exit < config.MIN_TIME_BETWEEN_TRADES:
-                    return
-
-            allowed, reason = risk_manager.check_trading_allowed()
-            if not allowed:
-                return
-
-            imbalance_data = self._compute_imbalance(data_manager)
-            wall_data = (
-                self._compute_wall_strength(data_manager, current_price, imbalance_data)
-                if imbalance_data is not None
-                else None
-            )
-            delta_data = self._compute_delta_z_score(data_manager)
-            touch_data = self._compute_price_touch(data_manager, current_price)
-
-            htf_trend: Optional[str] = None
-            try:
-                if hasattr(data_manager, "get_htf_trend"):
-                    htf_trend = data_manager.get_htf_trend()
-            except Exception as e:
-                logger.error(f"Error fetching HTF trend: {e}")
-
-            oracle_inputs: Optional[OracleInputs] = None
-            oracle_outputs: Optional[OracleOutputs] = None
-            try:
-                oracle_inputs = self._oracle.build_inputs(
-                    data_manager=data_manager,
-                    current_price=current_price,
-                    imbalance_data=imbalance_data,
-                    wall_data=wall_data,
-                    delta_data=delta_data,
-                    touch_data=touch_data,
-                    htf_trend=htf_trend,
-                    ltf_trend=None,
-                )
-                oracle_outputs = self._oracle.decide(oracle_inputs, risk_manager)
-            except Exception as e:
-                logger.error(f"Oracle error: {e}")
-
-            self._try_entries_and_log(
-                data_manager=data_manager,
-                order_manager=order_manager,
-                risk_manager=risk_manager,
-                current_price=current_price,
-                imbalance_data=imbalance_data,
-                wall_data=wall_data,
-                delta_data=delta_data,
-                touch_data=touch_data,
-                htf_trend=htf_trend,
-                now_sec=now_sec,
-                oracle_inputs=oracle_inputs,
-                oracle_outputs=oracle_outputs,
-            )
-
-        except Exception as e:
-            logger.error(f"Error in on_tick: {e}", exc_info=True)
-
-    # ======================================================================
-    # ENTRY DECISION WITH COMPREHENSIVE LOGGING
-    # ======================================================================
-
-    def _try_entries_and_log(
-        self,
-        data_manager,
-        order_manager,
-        risk_manager,
-        current_price: float,
-        imbalance_data: Optional[Dict],
-        wall_data: Optional[Dict],
-        delta_data: Optional[Dict],
-        touch_data: Optional[Dict],
-        htf_trend: Optional[str],
-        now_sec: float,
-        oracle_inputs: Optional[OracleInputs],
-        oracle_outputs: Optional[OracleOutputs],
-    ) -> None:
-        """
-        Evaluate LONG/SHORT every tick, log every minute.
-        NEW: Requires 3 consecutive identical signals before entering.
-        """
-        if not all([imbalance_data, wall_data, delta_data, touch_data]):
-            return
-
-        if self.pending_entry:
-            return
-
-        regime_params = self._get_regime_params(data_manager, current_price)
-        regime = regime_params["regime"]
-        z_thresh = regime_params["z_thresh"]
-        wall_mult = regime_params["wall_mult"]
-        atr_pct = regime_params.get("atr_pct", 0.0)
-
-        ema_val: Optional[float] = None
-        try:
-            ema_val = data_manager.get_ema(period=config.EMA_PERIOD)
-        except:
-            pass
-
-        trend_long_ok = (ema_val is not None and current_price > ema_val)
-        trend_short_ok = (ema_val is not None and current_price < ema_val)
-
-        # Calculate scores
-        long_core, long_core_reasons = self._compute_weighted_score(
-            imbalance_data, wall_data, delta_data, touch_data,
-            trend_long_ok, "long", regime, z_thresh, wall_mult
-        )
-        short_core, short_core_reasons = self._compute_weighted_score(
-            imbalance_data, wall_data, delta_data, touch_data,
-            trend_short_ok, "short", regime, z_thresh, wall_mult
-        )
-        long_aether, long_aether_reasons = self._compute_aether_fusion_score(
-            oracle_inputs, oracle_outputs, "long"
-        )
-        short_aether, short_aether_reasons = self._compute_aether_fusion_score(
-            oracle_inputs, oracle_outputs, "short"
-        )
-
-        long_total = long_core * 0.65 + long_aether * 0.35
-        short_total = short_core * 0.65 + short_aether * 0.35
-
-        long_entry = (long_total > config.SCORE_ENTRY_THRESHOLD)
-        short_entry = (short_total > config.SCORE_ENTRY_THRESHOLD)
-
-        # Determine current signal
-        current_signal = None
-        current_score = 0.0
-        if long_entry and long_total > short_total:
-            current_signal = "LONG"
-            current_score = long_total
-        elif short_entry and short_total > long_total:
-            current_signal = "SHORT"
-            current_score = short_total
-        else:
-            current_signal = "NEUTRAL"
-            current_score = max(long_total, short_total)
-
-        # Add to signal history (with timestamp)
-        self._signal_history.append({
-            "signal": current_signal,
-            "score": current_score,
-            "time": now_sec
-        })
-
-        # Check for 3 consecutive identical signals
-        confirmed_signal = None
-        if len(self._signal_history) == 3:
-            signals = [s["signal"] for s in self._signal_history]
-            if signals[0] == signals[1] == signals[2] and signals[0] != "NEUTRAL":
-                # All 3 signals are the same and not neutral
-                confirmed_signal = signals[0]
-                avg_score = sum(s["score"] for s in self._signal_history) / 3
-                time_span = now_sec - self._signal_history[0]["time"]
-                
-                logger.info(f"[SIGNAL CONFIRMATION] ✓ 3x {confirmed_signal} signals over {time_span:.1f}s (avg score: {avg_score:.3f})")
-
-        # Logging
-        should_log = (now_sec - self._last_decision_log_sec >= self.DECISION_LOG_INTERVAL_SEC)
-        
-        if should_log:
-            self._last_decision_log_sec = now_sec
-            
-            # Get session info for logging
-            session, is_major = self._get_current_session()
-            
-            # Show signal history
-            signal_history_str = " → ".join([s["signal"][0] for s in self._signal_history])
-            
-            logger.info("\n" + "=" * 100)
-            logger.info(f"[DECISION REPORT] {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
-            logger.info("=" * 100)
-            logger.info(f"PRICE: {current_price:.2f} USDT")
-            logger.info(f"")
-            logger.info(f"[SIGNAL CONFIRMATION]")
-            logger.info(f"  Current Signal: {current_signal}")
-            logger.info(f"  Signal History (last 3): {signal_history_str}")
-            logger.info(f"  Confirmed Entry: {confirmed_signal if confirmed_signal else 'None (need 3 consecutive)'}")
-            logger.info(f"")
-            logger.info(f"[SESSION INFO]")
-            logger.info(f"  Current Session: {session}")
-            logger.info(f"  Major Session: {'Yes' if is_major else 'No'}")
-            logger.info(f"")
-            logger.info(f"[VOL REGIME]")
-            logger.info(f"  Regime: {regime}")
-            logger.info(f"  ATR%: {atr_pct*100:.3f}% (LOW<{config.VOL_REGIME_LOW_ATR_PCT*100:.2f}%, HIGH>{config.VOL_REGIME_HIGH_ATR_PCT*100:.2f}%)")
-            logger.info(f"  Z Threshold: {z_thresh:.2f}")
-            logger.info(f"  Wall Multiplier: {wall_mult:.2f}")
-            logger.info(f"")
-            logger.info(f"[CORE METRICS]")
-            logger.info(f"  Imbalance: {imbalance_data['imbalance']:.3f} (threshold: ±{config.IMBALANCE_THRESHOLD})")
-            logger.info(f"    Total Bid: {imbalance_data['total_bid']:.2f} BTC")
-            logger.info(f"    Total Ask: {imbalance_data['total_ask']:.2f} BTC")
-            logger.info(f"  Wall Strength:")
-            logger.info(f"    Bid: {wall_data['bid_wall_strength']:.2f}x (volume: {wall_data['bid_vol_zone']:.2f} BTC)")
-            logger.info(f"    Ask: {wall_data['ask_wall_strength']:.2f}x (volume: {wall_data['ask_vol_zone']:.2f} BTC)")
-            logger.info(f"  Z-Score: {delta_data['z_score']:.2f} (threshold: ±{z_thresh:.2f})")
-            logger.info(f"    Buy Volume: {delta_data['buy_vol']:.4f} BTC")
-            logger.info(f"    Sell Volume: {delta_data['sell_vol']:.4f} BTC")
-            logger.info(f"    Delta: {delta_data['delta']:.4f} BTC")
-            logger.info(f"  Price Touch:")
-            logger.info(f"    Bid Distance: {touch_data['bid_distance_ticks']:.1f} ticks (threshold: {config.PRICE_TOUCH_THRESHOLD_TICKS})")
-            logger.info(f"    Ask Distance: {touch_data['ask_distance_ticks']:.1f} ticks")
-            logger.info(f"  Trend:")
-            logger.info(f"    EMA{config.EMA_PERIOD}: {ema_val:.2f}" if ema_val else "    EMA: N/A")
-            logger.info(f"    HTF Trend: {htf_trend or 'N/A'}")
-            logger.info(f"    Long Trend OK: {trend_long_ok}")
-            logger.info(f"    Short Trend OK: {trend_short_ok}")
-            logger.info(f"")
-            logger.info(f"[SCORE BREAKDOWN]")
-            logger.info(f"  LONG:")
-            logger.info(f"    Core (65%): {long_core:.3f} | {' | '.join(long_core_reasons)}")
-            logger.info(f"    Aether (35%): {long_aether:.3f} | {' | '.join(long_aether_reasons)}")
-            logger.info(f"    TOTAL: {long_total:.3f} (threshold: {config.SCORE_ENTRY_THRESHOLD})")
-            logger.info(f"    → {'✓ ENTRY SIGNAL' if long_entry else '✗ NO ENTRY'}")
-            logger.info(f"  SHORT:")
-            logger.info(f"    Core (65%): {short_core:.3f} | {' | '.join(short_core_reasons)}")
-            logger.info(f"    Aether (35%): {short_aether:.3f} | {' | '.join(short_aether_reasons)}")
-            logger.info(f"    TOTAL: {short_total:.3f} (threshold: {config.SCORE_ENTRY_THRESHOLD})")
-            logger.info(f"    → {'✓ ENTRY SIGNAL' if short_entry else '✗ NO ENTRY'}")
-            logger.info("=" * 100 + "\n")
-
-        # Only enter if we have 3 consecutive confirmed signals
-        if confirmed_signal == "LONG":
-            self.pending_entry = True
-            avg_score = sum(s["score"] for s in self._signal_history) / 3
-            self._enter_position(
-                data_manager, order_manager, risk_manager, "long", current_price,
-                imbalance_data, wall_data, delta_data, touch_data, now_sec,
-                regime_params, avg_score
-            )
-            # Clear signal history after entry
-            self._signal_history.clear()
-            
-        elif confirmed_signal == "SHORT":
-            self.pending_entry = True
-            avg_score = sum(s["score"] for s in self._signal_history) / 3
-            self._enter_position(
-                data_manager, order_manager, risk_manager, "short", current_price,
-                imbalance_data, wall_data, delta_data, touch_data, now_sec,
-                regime_params, avg_score
-            )
-            # Clear signal history after entry
-            self._signal_history.clear()
-
-
-    # ======================================================================
-    # POSITION ENTRY (WITH LIMIT ORDER + SESSION GATES)
-    # ======================================================================
-
-    def _enter_position(
-        self,
-        data_manager,
-        order_manager,
-        risk_manager,
-        side: str,
-        current_price: float,
-        imbalance_data: Dict,
-        wall_data: Dict,
-        delta_data: Dict,
-        touch_data: Dict,
-        now_sec: float,
-        regime_params: Dict,
-        entry_score: float,
-    ) -> None:
-        """Enter position with LIMIT order + SIMULTANEOUS TP/SL bracket."""
-        try:
-            # ========================================================================
-            # STEP 0: Check for existing position
-            # ========================================================================
-            try:
-                positions_resp = order_manager.api.get_positions(symbol="BTCUSDT", exchange="EXCHANGE_2")
-                
-                if positions_resp and not positions_resp.get("error"):
-                    data = positions_resp.get("data", [])
-                    if isinstance(data, list):
-                        for pos in data:
-                            if pos.get("symbol") == "BTCUSDT":
-                                qty = float(pos.get("quantity", 0))
-                                if abs(qty) > 0:
-                                    logger.warning(f"⚠️ Existing position detected: {qty:.6f} BTC - SKIPPING ENTRY")
-                                    self.pending_entry = False
-                                    return
-            except Exception as e:
-                logger.error(f"Error checking existing positions: {e}")
-            
-            # Clean up orphaned orders ONLY if no active position
-            cleaned = self._clean_orphaned_orders(order_manager, symbol="BTCUSDT")
-            if cleaned:
-                # Give exchange time to process cancellations
-                time.sleep(1.0)
-            
-            # ========================================================================
-            # Continue with your existing entry logic...
-            # ========================================================================
-            regime = regime_params["regime"]
-        
-            # Two-gate volatility check
-            is_volatile, session, atr_pct, vol_explanation = self._determine_volatility_with_gates(
-                data_manager, current_price
-            )
-            
-            # Position sizing
-            quantity, margin_used = risk_manager.calculate_position_size_vol_regime(
-                entry_price=current_price,
-                regime=regime,
-            )
-            
-            if quantity <= 0:
-                logger.error("Position sizing returned 0 quantity")
-                self.pending_entry = False
-                return
-            
-            # Volatility-based entry offset
-            if is_volatile:
-                offset_ticks = config.LIMIT_ORDER_HIGH_VOL_OFFSET_TICKS
-            else:
-                offset_ticks = config.LIMIT_ORDER_LOW_VOL_OFFSET_TICKS
-            
-            if side == "long":
-                limit_entry_price = current_price - (offset_ticks * config.TICK_SIZE)
-            else:
-                limit_entry_price = current_price + (offset_ticks * config.TICK_SIZE)
-            
-            # TP/SL ROI based on volatility
-            if is_volatile:
-                tp_roi = config.PROFIT_TARGET_ROI
-                sl_roi = config.STOP_LOSS_ROI
-            else:
-                tp_mult = regime_params["tp_mult"]
-                sl_mult = regime_params["sl_mult"]
-                tp_roi = config.PROFIT_TARGET_ROI * tp_mult
-                sl_roi = config.STOP_LOSS_ROI * sl_mult
-            
-            # Calculate TP/SL prices based on LIMIT ENTRY PRICE (not current price)
-            tp_price, sl_price = self._calculate_tp_sl_prices(
-                entry_price=limit_entry_price,  # ← KEY: use limit price, not current
-                margin_used=margin_used,
-                quantity=quantity,
-                side=side,
-                desired_profit_roi=tp_roi,
-                desired_sl_roi=sl_roi,
-            )
-            
-            logger.info("=" * 100)
-            logger.info(f"[ENTRY EXECUTION] {side.upper()} - LIMIT ORDER + BRACKET")
-            logger.info("=" * 100)
-            logger.info(f"  Session: {session}")
-            logger.info(f"  Volatility Gates: {vol_explanation}")
-            logger.info(f"  Final Volatility: {'HIGH' if is_volatile else 'LOW'}")
-            logger.info(f"  ATR%: {atr_pct*100:.3f}%")
-            logger.info(f"  Regime: {regime}")
-            logger.info(f"  Entry Score: {entry_score:.3f}")
-            logger.info(f"  Current Price: {current_price:.2f}")
-            logger.info(f"  Limit Entry Price: {limit_entry_price:.2f} (offset: {offset_ticks} ticks)")
-            logger.info(f"  Quantity: {quantity:.6f} BTC")
-            logger.info(f"  Margin: {margin_used:.2f} USDT")
-            logger.info(f"  TP ROI: {tp_roi*100:.2f}%")
-            logger.info(f"  SL ROI: {sl_roi*100:.2f}%")
-            logger.info("=" * 100)
-            
-            market_side = "BUY" if side == "long" else "SELL"
-            
-            # ========================================================================
-            # STEP 1: Place LIMIT entry order
-            # ========================================================================
-            main_order = order_manager.place_limit_order(
-                side=market_side,
-                quantity=quantity,
-                price=limit_entry_price,
-                reduce_only=False,
-            )
-            
-            if not main_order:
-                logger.error("Limit order placement failed")
-                self.pending_entry = False
-                return
-            
-            main_order_id = main_order.get("order_id", "")
-            logger.info(f"✓ Limit order placed: {main_order_id}")
-            
-            # ========================================================================
-            # STEP 2: Place TP and SL IMMEDIATELY (don't wait for fill)
-            # ========================================================================
-            tp_side = "SELL" if side == "long" else "BUY"
-            
-            tp_order = order_manager.place_take_profit(
-                side=tp_side,
-                quantity=quantity,
-                trigger_price=tp_price,
-            )
-            
-            sl_order = order_manager.place_stop_loss(
-                side=tp_side,
-                quantity=quantity,
-                trigger_price=sl_price,
-            )
-            
-            if not tp_order or not sl_order:
-                logger.error("TP/SL placement failed - cancelling limit order")
-                order_manager.cancel_order(main_order_id)
-                self.pending_entry = False
-                return
-            
-            logger.info(f"✓ TP order placed: {tp_order.get('order_id', '')}")
-            logger.info(f"✓ SL order placed: {sl_order.get('order_id', '')}")
-            
-            # ========================================================================
-            # STEP 3: Create position object (no fill wait - event-driven monitoring)
-            # ========================================================================
-            self.trade_seq += 1
-            htf_trend = "UNKNOWN"
-            try:
-                if hasattr(data_manager, "get_htf_trend"):
-                    htf_trend = data_manager.get_htf_trend() or "UNKNOWN"
-            except:
-                pass
-            
-            self.current_position = ZScorePosition(
-                trade_id=f"ZS{self.trade_seq:04d}",
-                side=side,
-                quantity=quantity,
-                entry_price=limit_entry_price,  # ← Use limit price as expected entry
-                entry_time_sec=now_sec,
-                entry_wall_volume=(
-                    wall_data["bid_vol_zone"] if side == "long" else wall_data["ask_vol_zone"]
-                ),
-                wall_zone_low=wall_data["zone_low"],
-                wall_zone_high=wall_data["zone_high"],
-                entry_imbalance=imbalance_data["imbalance"],
-                entry_z_score=delta_data["z_score"],
-                tp_price=tp_price,
-                sl_price=sl_price,
-                margin_used=margin_used,
-                tp_order_id=tp_order.get("order_id", ""),
-                sl_order_id=sl_order.get("order_id", ""),
-                main_order_id=main_order_id,
-                main_filled=False,  # ← Will be updated by status checks
-                tp_reduced=False,
-                entry_htf_trend=htf_trend,
-                vol_regime=regime,
-                entry_score=entry_score,
-                is_volatile=is_volatile,
-                tp_roi=tp_roi,
-                sl_roi=sl_roi,
-                last_momentum_check_sec=now_sec,
-                last_momentum_log_sec=now_sec,
-                tp_adjustment_count=0,
-                entry_session=session,
-                limit_order_placed_time=now_sec,
-            )
-            
-            risk_manager.record_trade_opened()
-            self.pending_entry = False
-            
-            msg = (
-                f"🎯 {side.upper()} BRACKET\n"
-                f"Session: {session}\n"
-                f"Limit Entry: {limit_entry_price:.2f} (current {current_price:.2f})\n"
-                f"Qty: {quantity:.6f}\n"
-                f"TP: {tp_price:.2f} ({tp_roi*100:.1f}%) | SL: {sl_price:.2f} ({sl_roi*100:.1f}%)\n"
-                f"Volatile: {is_volatile} | Score: {entry_score:.3f}"
-            )
-            
-            try:
-                send_telegram_message(msg)
-            except:
-                pass
-            
-            logger.info(f"✓ Position bracket created: {self.current_position.trade_id}")
-            logger.info(f"  Monitoring limit fill event-driven via order status checks")
-            
-        except Exception as e:
-            logger.error(f"Error in _enter_position: {e}", exc_info=True)
-            self.pending_entry = False
-
-
-    # ======================================================================
-    # POSITION MANAGEMENT (NEW LOGIC)
-    # ======================================================================
-
-    def _manage_open_position(
-        self, data_manager, order_manager, risk_manager, current_price: float, now_sec: float,
-    ) -> None:
-        """Manage open position with NEW logic."""
-        pos = self.current_position
-        
-        # ======================================================================
-        # Check if LIMIT order has filled yet
-        # ======================================================================
-        if not pos.main_filled:
-            # Calculate elapsed time since limit order placement
-            elapsed_since_placement = now_sec - pos.limit_order_placed_time
-            
-            # TIMEOUT CHECK: 60 seconds (SINGLE FIRE)
-            if elapsed_since_placement > 60.0 and not pos.timeout_cancelled:
-                logger.warning(f"⏱️ LIMIT ORDER TIMEOUT after {elapsed_since_placement:.1f}s")
-                logger.info("Starting timeout cancellation sequence...")
-                
-                pos.timeout_cancelled = True  # Mark as processed
-                
-                # ========================================================================
-                # CRITICAL: Check if limit order filled RIGHT BEFORE timeout
-                # ========================================================================
-                try:
-                    logger.info(f"Checking final status of limit order: {pos.main_order_id}")
-                    final_check = order_manager.get_order_status(pos.main_order_id)
-                    
-                    if not final_check:
-                        logger.error("Cannot get order status - aborting timeout cancellation for safety")
-                        self.current_position = None
-                        self.pending_entry = False
-                        return
-                    
-                    final_status = final_check.get("status", "").upper()
-                    logger.info(f"Limit order final status: {final_status}")
-                    
-                    if final_status in ("EXECUTED", "FILLED"):
-                        # ✓ ORDER FILLED! Don't cancel TP/SL
-                        logger.info(f"✅ Limit order FILLED just before timeout - keeping TP/SL active")
-                        pos.main_filled = True
-                        
-                        try:
-                            actual_fill_price = order_manager.extract_fill_price(final_check)
-                            pos.entry_price = actual_fill_price
-                            logger.info(f"Updated entry price to: {actual_fill_price:.2f}")
-                        except Exception as e:
-                            logger.warning(f"Could not extract fill price: {e}")
-                        
-                        try:
-                            msg = (
-                                f"✅ {pos.side.upper()} FILLED (last-second)\n"
-                                f"Entry: {pos.entry_price:.2f}\n"
-                                f"TP: {pos.tp_price:.2f} | SL: {pos.sl_price:.2f}\n"
-                                f"Filled after {elapsed_since_placement:.1f}s"
-                            )
-                            send_telegram_message(msg)
-                        except:
-                            pass
-                        
-                        # Continue with normal position management
-                        logger.info("Position is now ACTIVE - continuing to position management")
-                        # Don't return - fall through to position management below
-                        
-                    elif final_status in ("OPEN", "PENDING", "NEW", "ACTIVE"):
-                        # ✗ Order still open - safe to cancel bracket
-                        logger.info(f"Limit order still {final_status} - proceeding with bracket cancellation")
-                        
-                        # Cancel limit order first
-                        logger.info(f"Cancelling limit order: {pos.main_order_id}")
-                        try:
-                            cancel_result = order_manager.cancel_order(pos.main_order_id)
-                            logger.info(f"Limit order cancel result: {cancel_result}")
-                        except Exception as e:
-                            logger.warning(f"Limit cancel error: {e}")
-                        
-                        # Wait and recheck
-                        logger.info("Waiting 0.5s before rechecking...")
-                        import time
-                        time.sleep(0.5)
-                        
-                        # DOUBLE CHECK before cancelling TP/SL
-                        logger.info("Performing safety recheck...")
-                        try:
-                            recheck = order_manager.get_order_status(pos.main_order_id)
-                            recheck_status = recheck.get("status", "").upper() if recheck else "UNKNOWN"
-                            logger.info(f"Recheck status: {recheck_status}")
-                            
-                            if recheck_status in ("EXECUTED", "FILLED"):
-                                logger.warning(f"⚠️ Limit order filled DURING cancellation - KEEPING TP/SL")
-                                pos.main_filled = True
-                                pos.timeout_cancelled = False  # Reset flag
-                                return
-                        except Exception as e:
-                            logger.error(f"Recheck failed: {e} - proceeding with caution")
-                        
-                        # Still safe - cancel TP/SL
-                        logger.info(f"Cancelling TP order: {pos.tp_order_id}")
-                        try:
-                            tp_result = order_manager.cancel_order(pos.tp_order_id)
-                            logger.info(f"TP cancel result: {tp_result}")
-                        except Exception as e:
-                            logger.warning(f"TP cancel error: {e}")
-                        
-                        logger.info(f"Cancelling SL order: {pos.sl_order_id}")
-                        try:
-                            sl_result = order_manager.cancel_order(pos.sl_order_id)
-                            logger.info(f"SL cancel result: {sl_result}")
-                        except Exception as e:
-                            logger.warning(f"SL cancel error: {e}")
-                        
-                        logger.info("✓ Bracket cancellation complete")
-                        
-                        # Send timeout notification
-                        try:
-                            msg = (
-                                f"⏱️ TIMEOUT: {pos.side.upper()} bracket cancelled\n"
-                                f"Limit order not filled in 60s\n"
-                                f"Limit Entry: {pos.entry_price:.2f} (current {current_price:.2f})\n"
-                                f"Moving to next analysis"
-                            )
-                            send_telegram_message(msg)
-                        except Exception as e:
-                            logger.debug(f"Telegram notification failed: {e}")
-                        
-                        # Reset position state
-                        logger.info("Resetting position state")
-                        self.current_position = None
-                        self.pending_entry = False
-                        return
-                    
-                    else:
-                        # Order cancelled/rejected/expired by exchange
-                        logger.warning(f"Limit order {final_status} by exchange - cleaning up TP/SL")
-                        
-                        try:
-                            order_manager.cancel_order(pos.tp_order_id)
-                        except Exception as e:
-                            logger.debug(f"TP cleanup error: {e}")
-                        
-                        try:
-                            order_manager.cancel_order(pos.sl_order_id)
-                        except Exception as e:
-                            logger.debug(f"SL cleanup error: {e}")
-                        
-                        self.current_position = None
-                        self.pending_entry = False
-                        return
-                        
-                except Exception as e:
-                    logger.error(f"CRITICAL ERROR during timeout handling: {e}", exc_info=True)
-                    # Play it safe - don't cancel TP/SL if we can't verify status
-                    logger.warning("Cannot verify limit status - NOT cancelling TP/SL for safety")
-                    self.current_position = None
-                    self.pending_entry = False
-                    return
-            
-            # If timeout already processed and not filled, wait for exchange to update
-            if pos.timeout_cancelled and not pos.main_filled:
-                return
-            
-            # Regular status check (if not timed out yet)
-            if elapsed_since_placement <= 60.0:
-                try:
-                    main_status = order_manager.get_order_status(pos.main_order_id)
-                    if main_status:
-                        status = main_status.get("status", "").upper()
-                        if status in ("EXECUTED", "FILLED"):
-                            pos.main_filled = True
-                            actual_fill_price = order_manager.extract_fill_price(main_status)
-                            pos.entry_price = actual_fill_price
-                            logger.info(f"✓ Limit order filled at {actual_fill_price:.2f} (after {elapsed_since_placement:.1f}s)")
-                            
-                            try:
-                                msg = (
-                                    f"✅ {pos.side.upper()} FILLED\n"
-                                    f"Entry: {actual_fill_price:.2f} (after {elapsed_since_placement:.1f}s)\n"
-                                    f"TP: {pos.tp_price:.2f} | SL: {pos.sl_price:.2f}"
-                                )
-                                send_telegram_message(msg)
-                            except:
-                                pass
-                            
-                        elif status in ("CANCELLED", "REJECTED", "EXPIRED"):
-                            logger.warning(f"Limit order {status} - closing bracket")
-                            order_manager.cancel_order(pos.tp_order_id)
-                            order_manager.cancel_order(pos.sl_order_id)
-                            self.current_position = None
-                            self.pending_entry = False
-                            return
-                except Exception as e:
-                    logger.debug(f"Error checking main order status: {e}")
-            
-            # If limit not filled yet, don't do position management
-            return
-        
-        # ======================================================================
-        # Rest of position management (existing code)
-        # ======================================================================
-        hold_sec = now_sec - pos.entry_time_sec
-        hold_min = hold_sec / 60.0
-
-        if now_sec - self._last_position_log_sec >= self.POSITION_LOG_INTERVAL_SEC:
-            self._last_position_log_sec = now_sec
-            direction = 1.0 if pos.side == "long" else -1.0
-            current_profit_pct = ((current_price - pos.entry_price) / pos.entry_price) * direction
-            upnl = (current_price - pos.entry_price) * direction * pos.quantity
-
-            logger.info("\n" + "=" * 100)
-            logger.info(f"[POSITION STATUS] {pos.trade_id}")
-            logger.info("=" * 100)
-            logger.info(f"  Side: {pos.side.upper()}")
-            logger.info(f"  Entry Session: {pos.entry_session}")
-            logger.info(f"  Entry: {pos.entry_price:.2f} | Current: {current_price:.2f}")
-            logger.info(f"  Quantity: {pos.quantity:.6f} BTC")
-            logger.info(f"  Margin: {pos.margin_used:.2f} USDT")
-            logger.info(f"  TP: {pos.tp_price:.2f} ({pos.tp_roi*100:.2f}%) | SL: {pos.sl_price:.2f} ({pos.sl_roi*100:.2f}%)")
-            logger.info(f"  Hold Time: {hold_min:.1f} min")
-            logger.info(f"  Unrealized P&L: {upnl:.2f} USDT ({current_profit_pct*100:.2f}%)")
-            logger.info(f"  Volatile: {pos.is_volatile} | TP Adjustments: {pos.tp_adjustment_count}")
-            logger.info("=" * 100 + "\n")
-
-        if now_sec - self._last_status_check_sec >= self.ORDER_STATUS_CHECK_INTERVAL_SEC:
-            self._last_status_check_sec = now_sec
-            self._check_bracket_exits(order_manager, risk_manager, current_price, now_sec)
-
-        direction = 1.0 if pos.side == "long" else -1.0
-        current_profit_pct = ((current_price - pos.entry_price) / pos.entry_price) * direction
-
-        if now_sec - pos.last_momentum_check_sec >= config.POSITION_CHECK_INTERVAL_SEC:
-            pos.last_momentum_check_sec = now_sec
-
-            momentum_favorable, vol_favorable, trend_favorable = self._check_market_conditions(
-                data_manager, pos.side, current_price
-            )
-
-            if now_sec - pos.last_momentum_log_sec >= config.MOMENTUM_LOG_INTERVAL_SEC:
-                pos.last_momentum_log_sec = now_sec
-                logger.info(f"[MOMENTUM CHECK] {pos.trade_id} | Hold={hold_min:.1f}min | "
-                           f"Profit={current_profit_pct*100:.2f}% | "
-                           f"Momentum={momentum_favorable} Vol={vol_favorable} Trend={trend_favorable}")
-
-            if hold_min >= config.FIRST_TP_WAIT_MINUTES and pos.tp_adjustment_count == 0:
-                self._manage_tp_new_logic_10min(
-                    data_manager, order_manager, current_price, now_sec,
-                    momentum_favorable, vol_favorable, trend_favorable,
-                    current_profit_pct
-                )
-
-            elif hold_min >= (config.FIRST_TP_WAIT_MINUTES + config.SECOND_TP_WAIT_MINUTES) and pos.tp_adjustment_count == 1:
-                self._manage_tp_new_logic_15min(
-                    order_manager, current_price, current_profit_pct
-                )
-
-    def _check_market_conditions(
-        self,
-        data_manager,
-        side: str,
-        current_price: float,
-    ) -> Tuple[bool, bool, bool]:
-        """Check if momentum, volatility, and trend are favorable."""
-        momentum_favorable = False
-        try:
-            delta_data = self._compute_delta_z_score(data_manager)
-            if delta_data:
-                z_score = delta_data["z_score"]
-                if side == "long" and z_score > 0:
-                    momentum_favorable = True
-                elif side == "short" and z_score < 0:
-                    momentum_favorable = True
-        except:
-            pass
-
-        vol_favorable = True
-        try:
-            atr_pct = data_manager.get_atr_percent()
-            if atr_pct is not None:
-                if atr_pct > config.MAX_ATR_PERCENT:
-                    vol_favorable = False
-        except:
-            pass
-
-        trend_favorable = False
-        try:
-            ema_val = data_manager.get_ema(period=config.EMA_PERIOD)
-            if ema_val is not None:
-                if side == "long" and current_price > ema_val:
-                    trend_favorable = True
-                elif side == "short" and current_price < ema_val:
-                    trend_favorable = True
-        except:
-            pass
-
-        return momentum_favorable, vol_favorable, trend_favorable
-
-    def _manage_tp_new_logic_10min(
-        self,
-        data_manager,
-        order_manager,
-        current_price: float,
-        now_sec: float,
-        momentum_favorable: bool,
-        vol_favorable: bool,
-        trend_favorable: bool,
-        current_profit_pct: float,
-    ) -> None:
-        """NEW LOGIC: After 10 minutes, adjust TP based on conditions."""
-        pos = self.current_position
-        if pos is None:
-            return
-
-        half_tp = pos.tp_roi * config.HALF_TP_THRESHOLD
-        all_favorable = momentum_favorable and vol_favorable and trend_favorable
-
-        logger.info("=" * 100)
-        logger.info(f"[TP MANAGEMENT 10MIN] {pos.trade_id}")
-        logger.info(f"  All favorable (M/V/T): {all_favorable}")
-        logger.info(f"  Current profit: {current_profit_pct*100:.2f}%")
-        logger.info(f"  Half TP: {half_tp*100:.2f}%")
-
-        if all_favorable:
-            if current_profit_pct >= half_tp:
-                self._move_sl_to_half_tp(order_manager, current_price)
-                logger.info("  → Moved SL to half TP, waiting 5min more")
-            else:
-                logger.info("  → Waiting 5min more")
-        else:
-            if current_profit_pct >= half_tp:
-                new_tp_roi = current_profit_pct + config.TP_BUFFER_PERCENT
-                self._adjust_tp_order(order_manager, current_price, new_tp_roi)
-                logger.info(f"  → New TP set to {new_tp_roi*100:.2f}% (near current profit)")
-            else:
-                new_tp_roi = half_tp
-                self._adjust_tp_order(order_manager, current_price, new_tp_roi)
-                logger.info(f"  → New TP set to half TP ({new_tp_roi*100:.2f}%)")
-
-        logger.info("=" * 100)
-        pos.tp_adjustment_count = 1
-
-    def _manage_tp_new_logic_15min(
-        self,
-        order_manager,
-        current_price: float,
-        current_profit_pct: float,
-    ) -> None:
-        """NEW LOGIC: After 15 minutes (10+5), final TP tighten."""
-        pos = self.current_position
-        if pos is None:
-            return
-
-        new_tp_roi = current_profit_pct + config.TP_BUFFER_PERCENT
-        self._adjust_tp_order(order_manager, current_price, new_tp_roi)
-        logger.info(f"[TP MANAGEMENT 15MIN] Final tightening TP to {new_tp_roi*100:.2f}%")
-        pos.tp_adjustment_count = 2
-
-    def _move_sl_to_half_tp(self, order_manager, current_price: float) -> None:
-        """Move SL to half TP price."""
-        pos = self.current_position
-        if pos is None or pos.tp_reduced:
-            return
-
-        half_tp_roi = pos.tp_roi * config.HALF_TP_THRESHOLD
-        direction = 1.0 if pos.side == "long" else -1.0
-        price_movement = pos.entry_price * half_tp_roi
-        new_sl_price = pos.entry_price + (price_movement * direction)
-
-        order_manager.cancel_order(pos.sl_order_id)
-        tp_side = "SELL" if pos.side == "long" else "BUY"
-
-        new_sl_order = order_manager.place_stop_loss(
-            side=tp_side,
-            quantity=pos.quantity,
-            trigger_price=new_sl_price,
-        )
-
-        if new_sl_order:
-            pos.sl_order_id = new_sl_order.get("order_id", "")
-            pos.sl_price = new_sl_price
-            pos.tp_reduced = True
-            logger.info(f"✓ Moved SL to half TP: {new_sl_price:.2f}")
-
-    def _adjust_tp_order(self, order_manager, current_price: float, new_tp_roi: float) -> None:
-        """Adjust TP order to new ROI."""
-        pos = self.current_position
-        if pos is None:
-            return
-
-        direction = 1.0 if pos.side == "long" else -1.0
-        price_movement = pos.entry_price * new_tp_roi
-        new_tp_price = pos.entry_price + (price_movement * direction)
-
-        order_manager.cancel_order(pos.tp_order_id)
-        tp_side = "SELL" if pos.side == "long" else "BUY"
-
-        new_tp_order = order_manager.place_take_profit(
-            side=tp_side,
-            quantity=pos.quantity,
-            trigger_price=new_tp_price,
-        )
-
-        if new_tp_order:
-            pos.tp_order_id = new_tp_order.get("order_id", "")
-            pos.tp_price = new_tp_price
-            pos.tp_roi = new_tp_roi
-            logger.info(f"✓ Adjusted TP to: {new_tp_price:.2f} ({new_tp_roi*100:.2f}%)")
-
-    def _check_bracket_exits(
-        self,
-        order_manager,
-        risk_manager,
-        current_price: float,
-        now_sec: float,
-    ) -> None:
-        """Check TP/SL order status."""
-        pos = self.current_position
-        if pos is None:
-            return
-
-        tp_status = order_manager.get_order_status(pos.tp_order_id)
-        sl_status = order_manager.get_order_status(pos.sl_order_id)
-
-        if tp_status and tp_status.get("status", "").upper() in ("EXECUTED", "FILLED"):
-            logger.info("TP hit")
-            self._exit_position(order_manager, risk_manager, current_price, "TP_HIT", now_sec)
-        elif sl_status and sl_status.get("status", "").upper() in ("EXECUTED", "FILLED"):
-            logger.info("SL hit")
-            self._exit_position(order_manager, risk_manager, current_price, "SL_HIT", now_sec)
-
-    def _exit_position(
-        self,
-        order_manager,
-        risk_manager,
-        exit_price: float,
-        reason: str,
-        now_sec: float,
-    ) -> None:
-        """Exit position and cleanup."""
-        pos = self.current_position
-        if pos is None:
-            return
-
-        order_manager.cancel_order(pos.tp_order_id)
-        order_manager.cancel_order(pos.sl_order_id)
-
-        exit_side = "SELL" if pos.side == "long" else "BUY"
-        exit_order = order_manager.place_market_order(
-            side=exit_side,
-            quantity=pos.quantity,
-            reduce_only=True,
-        )
-
-        if exit_order:
-            try:
-                filled = order_manager.wait_for_fill(exit_order.get("order_id", ""), timeout_sec=3.0)
-                exit_price = order_manager.extract_fill_price(filled)
-            except:
-                pass
-
-        direction = 1.0 if pos.side == "long" else -1.0
-        pnl = (exit_price - pos.entry_price) * direction * pos.quantity
-        roi = pnl / pos.margin_used if pos.margin_used > 0 else 0.0
-
-        risk_manager.update_trade_stats(pnl)
-
-        logger.info("\n" + "=" * 100)
-        logger.info(f"[POSITION CLOSED] {pos.trade_id} | {reason}")
-        logger.info("=" * 100)
-        logger.info(f"  Side: {pos.side.upper()}")
-        logger.info(f"  Entry Session: {pos.entry_session}")
-        logger.info(f"  Entry: {pos.entry_price:.2f} | Exit: {exit_price:.2f}")
-        logger.info(f"  Quantity: {pos.quantity:.6f} BTC")
-        logger.info(f"  P&L: {pnl:.2f} USDT ({roi*100:.2f}%)")
-        logger.info(f"  Hold Time: {(now_sec - pos.entry_time_sec)/60.0:.1f} min")
-        logger.info("=" * 100 + "\n")
-
-        msg = (
-            f"🛑 EXIT {pos.side.upper()} | {reason}\n"
-            f"Session: {pos.entry_session}\n"
-            f"Entry: {pos.entry_price:.2f} → Exit: {exit_price:.2f}\n"
-            f"P&L: {pnl:.2f} USDT ({roi*100:.2f}%)\n"
-            f"Hold: {(now_sec - pos.entry_time_sec)/60.0:.1f}min"
-        )
-
-        try:
-            send_telegram_message(msg)
-        except:
-            pass
-
-        self.last_exit_time_min = now_sec / 60.0
-        self.current_position = None
-        self.pending_entry = False
-
-    # ======================================================================
-    # CORE METRIC CALCULATORS
-    # ======================================================================
 
     def _compute_imbalance(self, data_manager) -> Optional[Dict]:
         """Compute orderbook imbalance."""
@@ -1566,14 +1382,278 @@ class ZScoreIcebergHunterStrategy:
             "short_touch_ok": short_touch_ok,
         }
 
+    def _check_market_conditions(
+        self,
+        data_manager,
+        side: str,
+        current_price: float,
+    ) -> Tuple[bool, bool, bool]:
+        """Check if momentum, volatility, and trend are favorable."""
+        momentum_favorable = False
+        try:
+            delta_data = self._compute_delta_z_score(data_manager)
+            if delta_data:
+                z_score = delta_data["z_score"]
+                if side == "long" and z_score > 0:
+                    momentum_favorable = True
+                elif side == "short" and z_score < 0:
+                    momentum_favorable = True
+        except:
+            pass
+
+        vol_favorable = True
+        try:
+            atr_pct = data_manager.get_atr_percent()
+            if atr_pct is not None:
+                if atr_pct > config.MAX_ATR_PERCENT:
+                    vol_favorable = False
+        except:
+            pass
+
+        trend_favorable = False
+        try:
+            ema_val = data_manager.get_ema(period=config.EMA_PERIOD)
+            if ema_val is not None:
+                if side == "long" and current_price > ema_val:
+                    trend_favorable = True
+                elif side == "short" and current_price < ema_val:
+                    trend_favorable = True
+        except:
+            pass
+
+        return momentum_favorable, vol_favorable, trend_favorable
+
+    def _manage_tp_new_logic_10min(
+        self,
+        data_manager,
+        order_manager,
+        current_price: float,
+        now_sec: float,
+        momentum_favorable: bool,
+        vol_favorable: bool,
+        trend_favorable: bool,
+        current_profit_pct: float,
+    ) -> None:
+        """TP management at 10 minute mark."""
+        pos = self.current_position
+        if pos is None:
+            return
+
+        half_tp = pos.tp_roi * config.HALF_TP_THRESHOLD
+        all_favorable = momentum_favorable and vol_favorable and trend_favorable
+
+        logger.info("=" * 100)
+        logger.info(f"[TP MANAGEMENT 10MIN] {pos.trade_id}")
+        logger.info(f"  All favorable (M/V/T): {all_favorable}")
+        logger.info(f"  Current profit: {current_profit_pct*100:.2f}%")
+        logger.info(f"  Half TP: {half_tp*100:.2f}%")
+
+        if all_favorable:
+            if current_profit_pct >= half_tp:
+                self._move_sl_to_half_tp(order_manager, current_price)
+                logger.info("  → Moved SL to half TP, waiting 5min more")
+            else:
+                logger.info("  → Waiting 5min more")
+        else:
+            if current_profit_pct >= half_tp:
+                new_tp_roi = current_profit_pct + config.TP_BUFFER_PERCENT
+                self._adjust_tp_order(order_manager, current_price, new_tp_roi)
+                logger.info(f"  → New TP set to {new_tp_roi*100:.2f}% (near current profit)")
+            else:
+                new_tp_roi = half_tp
+                self._adjust_tp_order(order_manager, current_price, new_tp_roi)
+                logger.info(f"  → New TP set to half TP ({new_tp_roi*100:.2f}%)")
+
+        logger.info("=" * 100)
+        pos.tp_adjustment_count = 1
+
+    def _manage_tp_new_logic_15min(
+        self,
+        order_manager,
+        current_price: float,
+        current_profit_pct: float,
+    ) -> None:
+        """TP management at 15 minute mark (final tighten)."""
+        pos = self.current_position
+        if pos is None:
+            return
+
+        new_tp_roi = current_profit_pct + config.TP_BUFFER_PERCENT
+        self._adjust_tp_order(order_manager, current_price, new_tp_roi)
+        logger.info(f"[TP MANAGEMENT 15MIN] Final tightening TP to {new_tp_roi*100:.2f}%")
+        pos.tp_adjustment_count = 2
+
+    def _move_sl_to_half_tp(self, order_manager, current_price: float) -> None:
+        """Move SL to half TP price."""
+        pos = self.current_position
+        if pos is None or pos.tp_reduced:
+            return
+
+        half_tp_roi = pos.tp_roi * config.HALF_TP_THRESHOLD
+        direction = 1.0 if pos.side == "long" else -1.0
+        price_movement = pos.entry_price * half_tp_roi
+        new_sl_price = pos.entry_price + (price_movement * direction)
+
+        order_manager.cancel_order(pos.sl_order_id)
+        tp_side = "SELL" if pos.side == "long" else "BUY"
+
+        new_sl_order = order_manager.place_stop_loss(
+            side=tp_side,
+            quantity=pos.quantity,
+            trigger_price=new_sl_price,
+        )
+
+        if new_sl_order:
+            pos.sl_order_id = new_sl_order.get("order_id", "")
+            pos.sl_price = new_sl_price
+            pos.tp_reduced = True
+            logger.info(f"✓ Moved SL to half TP: {new_sl_price:.2f}")
+
+    def _adjust_tp_order(self, order_manager, current_price: float, new_tp_roi: float) -> None:
+        """Adjust TP order to new ROI."""
+        pos = self.current_position
+        if pos is None:
+            return
+
+        direction = 1.0 if pos.side == "long" else -1.0
+        price_movement = pos.entry_price * new_tp_roi
+        new_tp_price = pos.entry_price + (price_movement * direction)
+
+        order_manager.cancel_order(pos.tp_order_id)
+        tp_side = "SELL" if pos.side == "long" else "BUY"
+
+        new_tp_order = order_manager.place_take_profit(
+            side=tp_side,
+            quantity=pos.quantity,
+            trigger_price=new_tp_price,
+        )
+
+        if new_tp_order:
+            pos.tp_order_id = new_tp_order.get("order_id", "")
+            pos.tp_price = new_tp_price
+            pos.tp_roi = new_tp_roi
+            logger.info(f"✓ Adjusted TP to: {new_tp_price:.2f} ({new_tp_roi*100:.2f}%)")
+
+    def _check_bracket_exits(
+        self,
+        order_manager,
+        risk_manager,
+        current_price: float,
+        now_sec: float,
+    ) -> None:
+        """Check TP/SL order status periodically."""
+        pos = self.current_position
+        if pos is None:
+            return
+
+        tp_status = order_manager.get_order_status(pos.tp_order_id)
+        sl_status = order_manager.get_order_status(pos.sl_order_id)
+
+        if tp_status and tp_status.get("status", "").upper() in ("EXECUTED", "FILLED"):
+            logger.info("TP hit")
+            self._exit_position(order_manager, risk_manager, current_price, "TP_HIT", now_sec)
+        elif sl_status and sl_status.get("status", "").upper() in ("EXECUTED", "FILLED"):
+            logger.info("SL hit")
+            self._exit_position(order_manager, risk_manager, current_price, "SL_HIT", now_sec)
+
+    def _exit_position(
+        self,
+        order_manager,
+        risk_manager,
+        exit_price: float,
+        reason: str,
+        now_sec: float,
+    ) -> None:
+        """Exit position and cleanup."""
+        pos = self.current_position
+        if pos is None:
+            return
+
+        order_manager.cancel_order(pos.tp_order_id)
+        order_manager.cancel_order(pos.sl_order_id)
+
+        exit_side = "SELL" if pos.side == "long" else "BUY"
+        exit_order = order_manager.place_market_order(
+            side=exit_side,
+            quantity=pos.quantity,
+            reduce_only=True,
+        )
+
+        if exit_order:
+            try:
+                filled = order_manager.wait_for_fill(exit_order.get("order_id", ""), timeout_sec=3.0)
+                exit_price = order_manager.extract_fill_price(filled)
+            except:
+                pass
+
+        direction = 1.0 if pos.side == "long" else -1.0
+        pnl = (exit_price - pos.entry_price) * direction * pos.quantity
+        roi = pnl / pos.margin_used if pos.margin_used > 0 else 0.0
+
+        risk_manager.update_trade_stats(pnl)
+
+        logger.info("\n" + "=" * 100)
+        logger.info(f"[POSITION CLOSED] {pos.trade_id} | {reason}")
+        logger.info("=" * 100)
+        logger.info(f"  Side: {pos.side.upper()}")
+        logger.info(f"  Entry Session: {pos.entry_session}")
+        logger.info(f"  Entry: {pos.entry_price:.2f} | Exit: {exit_price:.2f}")
+        logger.info(f"  Quantity: {pos.quantity:.6f} BTC")
+        logger.info(f"  P&L: {pnl:.2f} USDT ({roi*100:.2f}%)")
+        logger.info(f"  Hold Time: {(now_sec - pos.entry_time_sec)/60.0:.1f} min")
+        logger.info("=" * 100 + "\n")
+
+        msg = (
+            f"🛑 EXIT {pos.side.upper()} | {reason}\n"
+            f"Session: {pos.entry_session}\n"
+            f"Entry: {pos.entry_price:.2f} → Exit: {exit_price:.2f}\n"
+            f"P&L: {pnl:.2f} USDT ({roi*100:.2f}%)\n"
+            f"Hold: {(now_sec - pos.entry_time_sec)/60.0:.1f}min"
+        )
+
+        try:
+            send_telegram_message(msg)
+        except:
+            pass
+
+        # Log to Excel if available
+        if self.excel_logger:
+            try:
+                self.excel_logger.log_trade(
+                    trade_id=pos.trade_id,
+                    entry_time=datetime.fromtimestamp(pos.entry_time_sec).strftime("%Y-%m-%d %H:%M:%S"),
+                    exit_time=datetime.fromtimestamp(now_sec).strftime("%Y-%m-%d %H:%M:%S"),
+                    duration_minutes=(now_sec - pos.entry_time_sec) / 60.0,
+                    side=pos.side,
+                    entry_price=pos.entry_price,
+                    exit_price=exit_price,
+                    quantity=pos.quantity,
+                    margin_used=pos.margin_used,
+                    leverage=config.LEVERAGE,
+                    tp_price=pos.tp_price,
+                    sl_price=pos.sl_price,
+                    entry_imbalance=pos.entry_imbalance,
+                    entry_z_score=pos.entry_z_score,
+                    entry_wall_volume=pos.entry_wall_volume,
+                    exit_reason=reason,
+                    pnl_usdt=pnl,
+                    entry_htf_trend=pos.entry_htf_trend,
+                )
+            except Exception as e:
+                logger.error(f"Error logging to Excel: {e}")
+
+        self.last_exit_time_min = now_sec / 60.0
+        self.current_position = None
+        self.pending_entry = False
+
     def _clean_orphaned_orders(self, order_manager, symbol: str = "BTCUSDT") -> bool:
         """
         Cancel ALL open orders for symbol ONLY if no filled position exists.
         Returns True if cleanup was performed, False if skipped.
         """
         try:
-            # STEP 1: Check if there's an active position
-            positions_resp = order_manager.api.get_positions(symbol=symbol, exchange="EXCHANGE_2")
+            # Check if there's an active position
+            positions_resp = order_manager.api.get_positions(symbol=symbol, exchange=config.EXCHANGE)
             
             if positions_resp and not positions_resp.get("error"):
                 data = positions_resp.get("data", [])
@@ -1582,13 +1662,16 @@ class ZScoreIcebergHunterStrategy:
                         if pos.get("symbol") == symbol:
                             qty = float(pos.get("quantity", 0))
                             if abs(qty) > 0:
-                                logger.warning(f"⚠️ Active position detected ({qty:.6f} BTC) - SKIPPING orphaned order cleanup")
+                                logger.warning(
+                                    f"⚠️ Active position detected ({qty:.6f} BTC) - "
+                                    f"SKIPPING orphaned order cleanup"
+                                )
                                 return False
             
-            # STEP 2: No active position - safe to clean up
+            # No active position - safe to clean up
             logger.info(f"🧹 No active position - cleaning up orphaned orders for {symbol}")
             
-            result = order_manager.api.cancel_all_orders(symbol=symbol, exchange="EXCHANGE_2")
+            result = order_manager.api.cancel_all_orders(symbol=symbol, exchange=config.EXCHANGE)
             
             if result and not result.get("error"):
                 logger.info(f"✓ All orphaned orders cancelled for {symbol}")
