@@ -16,6 +16,7 @@ import logging
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
 
 class FuturesAPI:
     """CoinSwitch Futures Trading API Client"""
