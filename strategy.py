@@ -823,24 +823,25 @@ class ZScoreIcebergHunterStrategy:
         now_sec: float
     ) -> None:
         """
-        Production-safe position management:
-
-        - SINGLE-FIRE timeout (120s) with position verification
-        - Rate-limit aware status checks (1Hz fill, 10s bracket)
-        - Session-based TP/SL adjustments (T+10min, T+15min)
-        - CoinSwitch v2 API compatible
+        PRODUCTION-SAFE position management with ROBUST partial fill handling:
+        
+        - Treats UNKNOWN status as "potentially filled" (KEEPS TP/SL)
+        - Treats partial fills as full fills (activates position management)
+        - 120s timeout with final 3-retry status check
+        - Never cancels TP/SL unless 100% certain order is cancelled
+        - Rate-limit safe (2s minimum between status checks)
         """
         pos = self.current_position
         if pos is None:
             return
 
         # ========================================
-        # PHASE 1: Wait for Limit Fill (120s SINGLE-FIRE timeout)
+        # PHASE 1: Wait for Limit Fill (120s timeout)
         # ========================================
         if not pos.main_filled:
             elapsed_since_place = now_sec - pos.limit_order_placed_time
 
-            # SINGLE-FIRE: Atomic flag check (prevents multi-fire across threads)
+            # SINGLE-FIRE timeout handler
             if (
                 elapsed_since_place > config.LIMIT_ORDER_WAIT_TIMEOUT_SEC
                 and not pos.timeout_cancelled
@@ -851,7 +852,7 @@ class ZScoreIcebergHunterStrategy:
                 )
 
                 # ========================================
-                # SAFETY CHECK 1: Verify NO position exists (API positions)
+                # SAFETY CHECK 1: Verify NO position exists via API
                 # ========================================
                 try:
                     positions_resp = order_manager.api.get_positions(
@@ -866,160 +867,125 @@ class ZScoreIcebergHunterStrategy:
                                     qty = abs(float(p.get("quantity", 0)))
                                     if qty > 0:
                                         logger.info(
-                                            f"🛡️ ACTIVE POSITION qty={qty:.6f} → KEEP BRACKET"
+                                            f"🛡️ ACTIVE POSITION qty={qty:.6f} → ACTIVATING MANAGEMENT"
                                         )
                                         pos.main_filled = True
-                                        pos.timeout_cancelled = False  # Reset flag
+                                        pos.timeout_cancelled = False
                                         pos.entry_price = float(
                                             p.get("entry_price", current_price)
                                         )
-                                        return  # Proceed to Phase 2
+                                        logger.info(f"✅ Position detected @ {pos.entry_price:.2f} - TP/SL PROTECTED")
+                                        return  # Proceed to Phase 2 next tick
                 except Exception as e:
                     logger.debug(f"Position check error: {e}")
 
                 # ========================================
-                # FINAL STATUS POLL (3x retry with backoff) - Rate limit safe
+                # FINAL STATUS CHECK (3x retry with 2s rate limit)
                 # ========================================
-                final_status = None
-                final_check = None
-                for attempt in range(3):
+                final_status_normalized = order_manager.get_order_status_safe(pos.main_order_id)
+                
+                logger.info(f"📊 Final status check result: {final_status_normalized}")
+
+                # ========================================
+                # DECISION TREE: What to do based on final status
+                # ========================================
+                
+                if final_status_normalized == "FILLED":
+                    # Order is FILLED or PARTIALLY_FILLED
+                    logger.info("✅ ORDER FILLED (confirmed) - Activating position management")
                     try:
-                        logger.info(
-                            f"🔍 Final status check #{attempt+1}: {pos.main_order_id}"
-                        )
-                        final_check = order_manager.get_order_status(pos.main_order_id)
-                        if final_check and isinstance(final_check, dict):
-                            # CoinSwitch v2: data.order.status
-                            order_data = final_check.get("order") or final_check
-                            final_status = str(order_data.get("status", "")).upper()
-                            logger.info(f"Final status: {final_status}")
-                            break
-                        time.sleep(1 * (attempt + 1))  # Progressive backoff
+                        # Get full order details for fill price
+                        full_status = order_manager.get_order_status(pos.main_order_id)
+                        if full_status:
+                            pos.entry_price = order_manager.extract_fill_price(full_status)
+                        else:
+                            pos.entry_price = current_price  # Fallback
                     except Exception as e:
-                        logger.debug(f"Status poll #{attempt+1} error: {e}")
-                        time.sleep(1 * (attempt + 1))
-
-                # FILLED? → Activate position management (KEEP TP/SL)
-                if final_status in (
-                    "EXECUTED",
-                    "FILLED",
-                    "PARTIALLY_FILLED",
-                    "PARTIALLY_EXECUTED",
-                ):
+                        logger.warning(f"Could not extract fill price: {e}")
+                        pos.entry_price = current_price
+                    
+                    pos.main_filled = True
+                    pos.timeout_cancelled = False
+                    
+                    msg = (
+                        f"⚡ {pos.side.upper()} FILLED (timeout edge-case)\n"
+                        f"Entry: {pos.entry_price:.2f}\nTP/SL ACTIVE"
+                    )
+                    send_telegram_message(msg)
+                    return  # Proceed to Phase 2 next tick
+                
+                elif final_status_normalized == "UNKNOWN":
+                    # Cannot determine status - MUST assume potentially filled
+                    logger.warning(
+                        "⚠️ ORDER STATUS UNKNOWN (API failed) - Treating as POTENTIALLY FILLED\n"
+                        "TP/SL will be KEPT for safety. Manual verification recommended."
+                    )
+                    pos.main_filled = True
+                    pos.timeout_cancelled = False
+                    pos.entry_price = current_price  # Use current price as estimate
+                    
+                    msg = (
+                        f"⚠️ {pos.side.upper()} STATUS UNKNOWN\n"
+                        f"API failed to confirm status after timeout.\n"
+                        f"TP/SL PROTECTED (assuming filled @ {pos.entry_price:.2f})\n"
+                        f"⚠️ MANUAL VERIFICATION RECOMMENDED"
+                    )
+                    send_telegram_message(msg)
+                    return  # Proceed to Phase 2 (keep TP/SL)
+                
+                elif final_status_normalized == "CANCELLED":
+                    # Order confirmed cancelled - safe to cancel TP/SL
+                    logger.info("🧹 Order confirmed CANCELLED - cleaning up bracket")
                     try:
-                        pos.main_filled = True
-                        pos.entry_price = order_manager.extract_fill_price(final_check)
-                        logger.info(
-                            f"✅ FILLED last-second @ {pos.entry_price:.2f} → KEEP TP/SL"
-                        )
-                        msg = (
-                            f"⚡ {pos.side.upper()} FILLED (timeout edge-case)\n"
-                            f"Entry: {pos.entry_price:.2f}\nTP/SL PROTECTED"
-                        )
-                        send_telegram_message(msg)
-                        return  # Proceed to Phase 2 next tick
-                    except Exception as e:
-                        logger.warning(f"Fill price extraction failed: {e}")
-                        pos.main_filled = True  # Assume filled, use approx price
-                        return  # KEEP TP/SL
-
-                # STILL OPEN? → Attempt to cancel, but never drop TP/SL if order is actually filled
-                logger.info("🧹 Attempting to cancel unfilled bracket (no position detected)")
-                try:
-                    # Try to cancel main order first
-                    main_cancelled = order_manager.cancel_order(pos.main_order_id)
-
-                    # If main order cancellation failed, check if it's because order was filled/partially filled
-                    if not main_cancelled:
-                        logger.warning(
-                            "⚠️ Main order cancellation failed - checking if order was filled..."
-                        )
-                        time.sleep(0.5)
-
-                        # Re-check order status
-                        recheck_status = order_manager.get_order_status(pos.main_order_id)
-                        if recheck_status:
-                            order_data = recheck_status.get("order") or recheck_status
-                            order_status = str(order_data.get("status", "")).upper()
-
-                            if order_status in (
-                                "EXECUTED",
-                                "FILLED",
-                                "PARTIALLY_FILLED",
-                                "PARTIALLY_EXECUTED",
-                            ):
-                                logger.info(
-                                    f"🛡️ CANNOT CANCEL - Order was {order_status}! Activating position management..."
-                                )
-                                pos.main_filled = True
-                                try:
-                                    pos.entry_price = order_manager.extract_fill_price(
-                                        recheck_status
-                                    )
-                                except Exception:
-                                    pos.entry_price = current_price  # Fallback
-
-                                msg = (
-                                    f"⚡ {pos.side.upper()} FILLED "
-                                    f"(detected during cancel attempt)\n"
-                                    f"Entry: {pos.entry_price:.2f}\nTP/SL PROTECTED"
-                                )
-                                send_telegram_message(msg)
-                                return  # KEEP TP/SL, proceed to Phase 2
-
-                    # If we reach here and main was successfully cancelled, there is no position so we can cancel TP/SL
-                    if main_cancelled:
                         time.sleep(0.3)
-                        order_manager.cancel_order(pos.tp_order_id)  # TP
-                        order_manager.cancel_order(pos.sl_order_id)  # SL
-
+                        order_manager.cancel_order(pos.tp_order_id)
+                        order_manager.cancel_order(pos.sl_order_id)
+                        
                         msg = (
                             f"⏱️ TIMEOUT {pos.side.upper()}\n"
                             f"Limit: {pos.entry_price:.2f} → {elapsed_since_place:.1f}s\n"
-                            f"Bracket cancelled - no fill"
+                            f"Order cancelled - no fill"
                         )
                         send_telegram_message(msg)
-                        self.current_position = None
-                        self.pending_entry = False
-                        self.last_entry_time_sec = now_sec  # Enforce cooldown
-                        return
-                    else:
-                        # Cancellation failed but order wasn't reported as filled - safest is to keep TP/SL
-                        logger.error(
-                            "⚠️ Order cancellation failed and status not clearly FILLED → keeping bracket for safety"
-                        )
-                        return
-
-                except Exception as e:
-                    logger.error(f"Error during bracket cancellation: {e}", exc_info=True)
-                    # On exception, DO NOT cancel TP/SL to be safe
-                    logger.warning("🛡️ Exception during cancellation - KEEPING TP/SL for safety")
+                    except Exception as e:
+                        logger.error(f"Error cancelling TP/SL: {e}")
+                    
+                    self.current_position = None
+                    self.pending_entry = False
+                    self.last_entry_time_sec = now_sec
+                    return
+                
+                else:
+                    # Shouldn't happen, but treat as UNKNOWN
+                    logger.error(f"Unexpected status: {final_status_normalized}")
+                    pos.main_filled = True
+                    pos.entry_price = current_price
                     return
 
             # ========================================
-            # EARLY CHECK: Rate-limit aware (max 1Hz per order)
+            # EARLY FILL DETECTION (1Hz rate-limited)
             # ========================================
-            if not hasattr(pos, "_last_status_check_time"):
-                pos._last_status_check_time = 0.0
+            if not hasattr(pos, "_last_early_check_time"):
+                pos._last_early_check_time = 0.0
 
-            if now_sec - pos._last_status_check_time >= 1.0:  # ✅ 1Hz throttle
-                pos._last_status_check_time = now_sec
-                try:
-                    status = order_manager.get_order_status(pos.main_order_id)
-                    if status:
-                        order_data = status.get("order") or status
-                        order_status = str(order_data.get("status", "")).upper()
-                        if order_status in (
-                            "EXECUTED",
-                            "FILLED",
-                            "PARTIALLY_FILLED",
-                            "PARTIALLY_EXECUTED",
-                        ):
-                            pos.main_filled = True
-                            pos.entry_price = order_manager.extract_fill_price(status)
-                            logger.info(f"✓ EARLY FILL detected: {pos.entry_price:.2f}")
-                except Exception as e:
-                    logger.debug(f"Early status check error: {e}")
+            if now_sec - pos._last_early_check_time >= 2.0:  # 2s interval
+                pos._last_early_check_time = now_sec
+                
+                status_normalized = order_manager.get_order_status_safe(pos.main_order_id)
+                
+                if status_normalized == "FILLED":
+                    logger.info(f"✅ EARLY FILL detected: {pos.main_order_id}")
+                    try:
+                        full_status = order_manager.get_order_status(pos.main_order_id)
+                        if full_status:
+                            pos.entry_price = order_manager.extract_fill_price(full_status)
+                        else:
+                            pos.entry_price = current_price
+                    except Exception:
+                        pos.entry_price = current_price
+                    
+                    pos.main_filled = True
+                    logger.info(f"Position activated @ {pos.entry_price:.2f}")
 
             return  # Continue waiting for fill...
 
@@ -1027,7 +993,6 @@ class ZScoreIcebergHunterStrategy:
         # PHASE 2: FILLED POSITION MANAGEMENT
         # ========================================
 
-        # Calculate hold time FIRST (used everywhere)
         hold_min = (now_sec - pos.entry_time_sec) / 60.0
 
         # ========================================
@@ -1084,7 +1049,7 @@ class ZScoreIcebergHunterStrategy:
         # SESSION-BASED TP MANAGEMENT TIMELINE
         # ========================================
         
-        # T+10min: Half-TP Logic (uses pos.tp_roi from entry session)
+        # T+10min: Half-TP Logic
         if (hold_min >= config.FIRST_TP_WAIT_MINUTES and 
             pos.tp_adjustment_count == 0):
             
