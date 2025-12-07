@@ -720,37 +720,38 @@ class ZScoreIcebergHunterStrategy:
         regime_params: Dict,
         entry_score: float,
     ) -> None:
-        """Enter position with LIMIT order and volatility-based entry price."""
+        """Enter position with LIMIT order + SIMULTANEOUS TP/SL bracket."""
         try:
             regime = regime_params["regime"]
             
-            # TWO-GATE VOLATILITY CHECK
+            # Two-gate volatility check
             is_volatile, session, atr_pct, vol_explanation = self._determine_volatility_with_gates(
                 data_manager, current_price
             )
-
+            
+            # Position sizing
             quantity, margin_used = risk_manager.calculate_position_size_vol_regime(
                 entry_price=current_price,
                 regime=regime,
             )
-
+            
             if quantity <= 0:
                 logger.error("Position sizing returned 0 quantity")
                 self.pending_entry = False
                 return
-
-            # Entry price offset based on two-gate volatility
+            
+            # Volatility-based entry offset
             if is_volatile:
                 offset_ticks = config.LIMIT_ORDER_HIGH_VOL_OFFSET_TICKS
             else:
                 offset_ticks = config.LIMIT_ORDER_LOW_VOL_OFFSET_TICKS
-
+            
             if side == "long":
                 limit_entry_price = current_price - (offset_ticks * config.TICK_SIZE)
             else:
                 limit_entry_price = current_price + (offset_ticks * config.TICK_SIZE)
-
-            # TP/SL based on two-gate volatility
+            
+            # TP/SL ROI based on volatility
             if is_volatile:
                 tp_roi = config.PROFIT_TARGET_ROI
                 sl_roi = config.STOP_LOSS_ROI
@@ -759,9 +760,19 @@ class ZScoreIcebergHunterStrategy:
                 sl_mult = regime_params["sl_mult"]
                 tp_roi = config.PROFIT_TARGET_ROI * tp_mult
                 sl_roi = config.STOP_LOSS_ROI * sl_mult
-
-            logger.info("\n" + "=" * 100)
-            logger.info(f"[ENTRY EXECUTION] {side.upper()} - LIMIT ORDER")
+            
+            # Calculate TP/SL prices based on LIMIT ENTRY PRICE (not current price)
+            tp_price, sl_price = self._calculate_tp_sl_prices(
+                entry_price=limit_entry_price,  # ← KEY: use limit price, not current
+                margin_used=margin_used,
+                quantity=quantity,
+                side=side,
+                desired_profit_roi=tp_roi,
+                desired_sl_roi=sl_roi,
+            )
+            
+            logger.info("=" * 100)
+            logger.info(f"[ENTRY EXECUTION] {side.upper()} - LIMIT ORDER + BRACKET")
             logger.info("=" * 100)
             logger.info(f"  Session: {session}")
             logger.info(f"  Volatility Gates: {vol_explanation}")
@@ -776,59 +787,56 @@ class ZScoreIcebergHunterStrategy:
             logger.info(f"  TP ROI: {tp_roi*100:.2f}%")
             logger.info(f"  SL ROI: {sl_roi*100:.2f}%")
             logger.info("=" * 100)
-
+            
             market_side = "BUY" if side == "long" else "SELL"
+            
+            # ========================================================================
+            # STEP 1: Place LIMIT entry order
+            # ========================================================================
             main_order = order_manager.place_limit_order(
                 side=market_side,
                 quantity=quantity,
                 price=limit_entry_price,
                 reduce_only=False,
             )
-
+            
             if not main_order:
+                logger.error("Limit order placement failed")
                 self.pending_entry = False
                 return
-
+            
             main_order_id = main_order.get("order_id", "")
             logger.info(f"✓ Limit order placed: {main_order_id}")
-
-            try:
-                filled_order = order_manager.wait_for_fill(
-                    main_order_id,
-                    timeout_sec=config.LIMIT_ORDER_WAIT_TIMEOUT_SEC,
-                )
-                entry_price = order_manager.extract_fill_price(filled_order)
-                logger.info(f"Limit order filled at {entry_price:.2f}")
-            except Exception as e:
-                logger.error(f"Limit order fill failed or timeout: {e}")
-                order_manager.cancel_order(main_order_id)
-                logger.warning("Limit order cancelled due to timeout")
-                self.pending_entry = False
-                return
-
-            tp_price, sl_price = self._calculate_tp_sl_prices(
-                entry_price=entry_price,
-                margin_used=margin_used,
-                quantity=quantity,
-                side=side,
-                desired_profit_roi=tp_roi,
-                desired_sl_roi=sl_roi,
-            )
-
+            
+            # ========================================================================
+            # STEP 2: Place TP and SL IMMEDIATELY (don't wait for fill)
+            # ========================================================================
             tp_side = "SELL" if side == "long" else "BUY"
+            
             tp_order = order_manager.place_take_profit(
-                side=tp_side, quantity=quantity, trigger_price=tp_price
+                side=tp_side,
+                quantity=quantity,
+                trigger_price=tp_price,
             )
+            
             sl_order = order_manager.place_stop_loss(
-                side=tp_side, quantity=quantity, trigger_price=sl_price
+                side=tp_side,
+                quantity=quantity,
+                trigger_price=sl_price,
             )
-
+            
             if not tp_order or not sl_order:
-                logger.error("TP/SL placement failed - flattening")
-                order_manager.place_market_order(side=tp_side, quantity=quantity, reduce_only=True)
+                logger.error("TP/SL placement failed - cancelling limit order")
+                order_manager.cancel_order(main_order_id)
                 self.pending_entry = False
                 return
-
+            
+            logger.info(f"✓ TP order placed: {tp_order.get('order_id', '')}")
+            logger.info(f"✓ SL order placed: {sl_order.get('order_id', '')}")
+            
+            # ========================================================================
+            # STEP 3: Create position object (no fill wait - event-driven monitoring)
+            # ========================================================================
             self.trade_seq += 1
             htf_trend = "UNKNOWN"
             try:
@@ -836,14 +844,16 @@ class ZScoreIcebergHunterStrategy:
                     htf_trend = data_manager.get_htf_trend() or "UNKNOWN"
             except:
                 pass
-
+            
             self.current_position = ZScorePosition(
                 trade_id=f"ZS{self.trade_seq:04d}",
                 side=side,
                 quantity=quantity,
-                entry_price=entry_price,
+                entry_price=limit_entry_price,  # ← Use limit price as expected entry
                 entry_time_sec=now_sec,
-                entry_wall_volume=wall_data["bid_vol_zone"] if side == "long" else wall_data["ask_vol_zone"],
+                entry_wall_volume=(
+                    wall_data["bid_vol_zone"] if side == "long" else wall_data["ask_vol_zone"]
+                ),
                 wall_zone_low=wall_data["zone_low"],
                 wall_zone_high=wall_data["zone_high"],
                 entry_imbalance=imbalance_data["imbalance"],
@@ -854,7 +864,7 @@ class ZScoreIcebergHunterStrategy:
                 tp_order_id=tp_order.get("order_id", ""),
                 sl_order_id=sl_order.get("order_id", ""),
                 main_order_id=main_order_id,
-                main_filled=True,
+                main_filled=False,  # ← Will be updated by status checks
                 tp_reduced=False,
                 entry_htf_trend=htf_trend,
                 vol_regime=regime,
@@ -867,43 +877,77 @@ class ZScoreIcebergHunterStrategy:
                 tp_adjustment_count=0,
                 entry_session=session,
             )
-
+            
             risk_manager.record_trade_opened()
             self.pending_entry = False
-
+            
             msg = (
-                f"🚀 {side.upper()} ENTRY (LIMIT)\n"
+                f"🎯 {side.upper()} BRACKET\n"
                 f"Session: {session}\n"
-                f"Price: {entry_price:.2f} | Qty: {quantity:.6f}\n"
+                f"Limit Entry: {limit_entry_price:.2f} (current {current_price:.2f})\n"
+                f"Qty: {quantity:.6f}\n"
                 f"TP: {tp_price:.2f} ({tp_roi*100:.1f}%) | SL: {sl_price:.2f} ({sl_roi*100:.1f}%)\n"
                 f"Volatile: {is_volatile} | Score: {entry_score:.3f}"
             )
-
+            
             try:
                 send_telegram_message(msg)
             except:
                 pass
-
-            logger.info(f"✓ Position opened: {self.current_position.trade_id}\n")
-
+            
+            logger.info(f"✓ Position bracket created: {self.current_position.trade_id}")
+            logger.info(f"  Monitoring limit fill event-driven via order status checks")
+            
         except Exception as e:
             logger.error(f"Error in _enter_position: {e}", exc_info=True)
             self.pending_entry = False
+
 
     # ======================================================================
     # POSITION MANAGEMENT (NEW LOGIC)
     # ======================================================================
 
     def _manage_open_position(
-        self,
-        data_manager,
-        order_manager,
-        risk_manager,
-        current_price: float,
-        now_sec: float,
+        self, data_manager, order_manager, risk_manager, current_price: float, now_sec: float,
     ) -> None:
         """Manage open position with NEW logic."""
         pos = self.current_position
+        
+        # ======================================================================
+        # Check if LIMIT order has filled yet
+        # ======================================================================
+        if not pos.main_filled:
+            try:
+                main_status = order_manager.get_order_status(pos.main_order_id)
+                if main_status:
+                    status = main_status.get("status", "").upper()
+                    if status in ("EXECUTED", "FILLED"):
+                        pos.main_filled = True
+                        # Update entry price from actual fill
+                        actual_fill_price = order_manager.extract_fill_price(main_status)
+                        pos.entry_price = actual_fill_price
+                        logger.info(f"✓ Limit order filled at {actual_fill_price:.2f}")
+                        
+                        # Recalculate TP/SL based on ACTUAL fill price if needed
+                        # (optional: only if fill price differs significantly)
+                        
+                    elif status in ("CANCELLED", "REJECTED", "EXPIRED"):
+                        logger.warning(f"Limit order {status} - closing bracket")
+                        order_manager.cancel_order(pos.tp_order_id)
+                        order_manager.cancel_order(pos.sl_order_id)
+                        self.current_position = None
+                        self.pending_entry = False
+                        return
+            except Exception as e:
+                logger.debug(f"Error checking main order status: {e}")
+            
+            # If limit not filled yet, don't do position management
+            return
+        
+        # ======================================================================
+        # Rest of position management (existing code)
+        # ======================================================================
+
         hold_sec = now_sec - pos.entry_time_sec
         hold_min = hold_sec / 60.0
 
