@@ -19,6 +19,7 @@ from zscore_excel_logger import ZScoreExcelLogger
 import telegram_config
 from telegram_notifier import send_telegram_message, install_global_telegram_log_handler
 
+
 logging.basicConfig(
     level=config.LOG_LEVEL,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",

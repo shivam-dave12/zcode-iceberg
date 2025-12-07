@@ -376,40 +376,41 @@ class OrderManager:
             logger.error(f"Error cancelling all orders: {e}")
             return False
 
-    def get_order_status(self, order_id: str) -> Optional[Dict]:
-        """Get order status with proper error handling."""
-        try:
-            # Use the correct CoinSwitch API endpoint
-            endpoint = f"/trade/api/v2/futures/order"
-            params = {
-                "order_id": order_id,
-                "exchange": "EXCHANGE_2"
-            }
-            
-            resp = self.api.make_request("GET", endpoint, params=params, payload={})
-            
-            if not isinstance(resp, dict):
-                logger.warning(f"Invalid order status response: {resp}")
-                return None
-            
-            if resp.get("error"):
-                logger.warning(f"Order status error: {resp.get('error')}")
-                return None
-            
-            # Extract order data
-            data = resp.get("data", resp)
-            if isinstance(data, list) and len(data) > 0:
-                data = data[0]
-            
-            if isinstance(data, dict):
-                order = data.get("order", data)
-                return order
-            
-            return None
-            
-        except Exception as e:
-            logger.debug(f"Exception getting order status for {order_id}: {e}")
-            return None
+    def get_order_status(self, order_id: str, max_retries: int = 3) -> Optional[Dict]:
+        """Robust order status with retries + CoinSwitch error handling."""
+        for attempt in range(max_retries):
+            try:
+                response = self.api.get_order(order_id)
+                
+                if not isinstance(response, dict):
+                    time.sleep(0.2 * attempt)
+                    continue
+                
+                if response.get("error"):
+                    error_msg = str(response.get("error")).lower()
+                    if "not found" in error_msg or "invalid" in error_msg:
+                        return {"status": "NOT_FOUND", "order_id": order_id}
+                    logger.debug(f"Status error {attempt+1}/{max_retries}: {error_msg}")
+                    time.sleep(0.3 * (attempt + 1))
+                    continue
+                
+                # Parse various response formats
+                data = response.get("data") or response
+                if isinstance(data, dict):
+                    order = data.get("order") or data
+                    status = str(order.get("status") or order.get("state") or "").upper()
+                    
+                    if order_id in self.active_orders:
+                        self.active_orders[order_id]["status"] = status
+                    
+                    return order
+                
+            except Exception as e:
+                logger.debug(f"Status attempt {attempt+1} exception: {e}")
+                time.sleep(0.2 * (attempt + 1))
+        
+        logger.warning(f"get_order_status FAILED after {max_retries} retries: {order_id}")
+        return None
 
     def get_open_orders(self) -> list:
         """Get all open orders."""
