@@ -904,18 +904,18 @@ class ZScoreIcebergHunterStrategy:
                 self.last_entry_time_sec = now_sec  # Enforce cooldown
                 return
             
-            # EARLY CHECK: Non-blocking poll (throttled to 1Hz via tracker)
+            # EARLY CHECK: Rate-limit aware (max 1Hz, skips if recently called)
             if not hasattr(pos, '_last_status_check_time'):
                 pos._last_status_check_time = 0.0
-            
-            if now_sec - pos._last_status_check_time >= 1.0:  # ✅ FIXED: Proper 1Hz throttle
+
+            if now_sec - pos._last_status_check_time >= 1.0:  # 1Hz max
                 pos._last_status_check_time = now_sec
-                try:
-                    status = order_manager.get_order_status(pos.main_order_id)
-                    if status and status.get("status", "").upper() in ("EXECUTED", "FILLED"):
-                        pos.main_filled = True
-                        pos.entry_price = order_manager.extract_fill_price(status)
-                        logger.info(f"✓ EARLY FILL: {pos.entry_price:.2f}")
+                status = self.order_manager.get_order_status(pos.main_order_id)  # Now rate-limited
+                if status and status.get("status", "").upper() in ("EXECUTED", "FILLED"):
+                    pos.main_filled = True
+                    pos.entry_price = self.order_manager.extract_fill_price(status)
+                    logger.info(f"✓ EARLY FILL: {pos.entry_price:.2f}")
+
                 except:
                     pass
             

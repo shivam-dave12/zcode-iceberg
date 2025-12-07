@@ -377,37 +377,57 @@ class OrderManager:
             return False
 
     def get_order_status(self, order_id: str, max_retries: int = 3) -> Optional[Dict]:
-        """Robust order status with retries + CoinSwitch error handling."""
+        """FIXED: CoinSwitch v2 /trade/api/v2/futures/order + RATE LIMIT RESPECT."""
+        
+        # RATE LIMIT: 20 req/60s → Max 1 call every 3s per order
+        if not hasattr(self, '_last_status_times'):
+            self._last_status_times = {}
+        
+        now = time.time()
+        last_call = self._last_status_times.get(order_id, 0)
+        
+        if now - last_call < 3.0:  # ✅ ENFORCE 3s cooldown per order
+            return None  # Skip - respect rate limit
+        
+        self._last_status_times[order_id] = now
+        
         for attempt in range(max_retries):
             try:
-                response = self.api.get_order(order_id)
+                # ✅ CORRECT ENDPOINT: /trade/api/v2/futures/order
+                response = self.api.get_order_status(order_id)  # Must call v2 endpoint
                 
                 if not isinstance(response, dict):
-                    time.sleep(0.2 * attempt)
+                    time.sleep(0.5 * (attempt + 1))
                     continue
                 
+                # ✅ CORRECT PARSING: data.order.status
                 if response.get("error"):
                     error_msg = str(response.get("error")).lower()
                     if "not found" in error_msg or "invalid" in error_msg:
                         return {"status": "NOT_FOUND", "order_id": order_id}
                     logger.debug(f"Status error {attempt+1}/{max_retries}: {error_msg}")
-                    time.sleep(0.3 * (attempt + 1))
+                    time.sleep(0.5 * (attempt + 1))
                     continue
                 
-                # Parse various response formats
-                data = response.get("data") or response
+                # FIXED: Navigate data → order → status
+                data = response.get("data")
                 if isinstance(data, dict):
-                    order = data.get("order") or data
-                    status = str(order.get("status") or order.get("state") or "").upper()
-                    
-                    if order_id in self.active_orders:
-                        self.active_orders[order_id]["status"] = status
-                    
-                    return order
+                    order_data = data.get("order") or data
+                    if isinstance(order_data, dict):
+                        status = str(order_data.get("status") or "").upper()
+                        
+                        # Update cache
+                        if order_id in self.active_orders:
+                            self.active_orders[order_id]["status"] = status
+                        
+                        logger.debug(f"✓ Order status: {order_id} → {status}")
+                        return order_data
+                
+                time.sleep(0.5 * (attempt + 1))
                 
             except Exception as e:
                 logger.debug(f"Status attempt {attempt+1} exception: {e}")
-                time.sleep(0.2 * (attempt + 1))
+                time.sleep(0.5 * (attempt + 1))
         
         logger.warning(f"get_order_status FAILED after {max_retries} retries: {order_id}")
         return None

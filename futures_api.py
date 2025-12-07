@@ -156,49 +156,20 @@ class FuturesAPI:
         }
         return self._make_request("DELETE", endpoint, payload=payload)
    
-    def get_order_status(self, order_id: str) -> Optional[Dict]:
+    def get_order_status(self, order_id: str) -> Dict:
+        """CoinSwitch v2: GET /trade/api/v2/futures/order?order_id=xxx"""
         try:
-            resp = self.api.get_order(order_id)   # CoinSwitch futures API call
-            logger.info(f"[DEBUG] get_order({order_id}) raw response: {resp}")
-
-            if not isinstance(resp, dict):
-                return None
-
-            # Unwrap common shapes:
-            data = resp.get("data", resp)
-            if isinstance(data, list):
-                data = data[0] if data else None
-            if not isinstance(data, dict):
-                return None
-
-            # Some APIs nest under "order"
-            order = data.get("order", data)
-
-            # Normalize status field
-            status = (
-                order.get("status")
-                or order.get("order_status")
-                or order.get("state")
-                or ""
-            )
-            status = str(status).upper()
-
-            if not status:
-                # Nothing usable yet
-                return None
-
-            order["status"] = status  # ensure key exists
-
-            # Keep local cache in sync
-            if order_id in self.active_orders:
-                self.active_orders[order_id]["status"] = status
-
-            return order
-
+            params = {"order_id": order_id}
+            endpoint = "/trade/api/v2/futures/order"
+            
+            response = self._make_request("GET", endpoint, params=params)
+            logger.debug(f"Order status response: {response}")
+            return response
         except Exception as e:
-            logger.debug(f"Exception getting order status for {order_id}: {e}")
-            return None
-               
+            logger.error(f"API get_order_status error: {e}")
+            return {"error": str(e)}
+
+
     def get_open_orders(self, exchange: str = "EXCHANGE_2", symbol: str = None,
                        limit: int = 50, from_time: int = None, to_time: int = None) -> Dict:
         """
