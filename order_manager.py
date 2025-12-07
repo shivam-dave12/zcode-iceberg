@@ -1,6 +1,5 @@
 """
-Order Manager - Handles order placement and management
-Updated to use new CoinSwitch API plugins
+Order Manager - FIXED: Aggressive rate limit protection
 """
 
 import time
@@ -15,6 +14,11 @@ logger = logging.getLogger(__name__)
 
 class OrderManager:
     """Manages order placement, cancellation, and tracking"""
+    
+    # CRITICAL: Rate limit protection
+    _GLOBAL_API_LOCK = {}
+    _MIN_REQUEST_INTERVAL = 2.0  # 2 seconds between ANY API calls
+    _LAST_REQUEST_TIME = 0.0
     
     def __init__(self):
         """Initialize order manager with new API plugin"""
@@ -32,11 +36,20 @@ class OrderManager:
         self.order_count = 0
         self.rate_limit_window_start = time.time()
         
-        logger.info("✓ OrderManager initialized with new API plugin")
+        logger.info("✓ OrderManager initialized with aggressive rate limiting")
     
-    # ======================================================================
-    # Rate limiting / helpers
-    # ======================================================================
+    @classmethod
+    def _wait_for_rate_limit(cls):
+        """GLOBAL rate limiter - ensures 2s between ANY API call"""
+        now = time.time()
+        elapsed = now - cls._LAST_REQUEST_TIME
+        
+        if elapsed < cls._MIN_REQUEST_INTERVAL:
+            wait_time = cls._MIN_REQUEST_INTERVAL - elapsed
+            logger.debug(f"[RATE LIMIT] Waiting {wait_time:.2f}s before API call")
+            time.sleep(wait_time)
+        
+        cls._LAST_REQUEST_TIME = time.time()
     
     def _check_rate_limit(self) -> bool:
         """Check if rate limit allows new order."""
@@ -52,14 +65,72 @@ class OrderManager:
         self.last_order_time = current_time
         return True
     
+    def get_order_status(self, order_id: str, retry_count: int = 3) -> Optional[Dict]:
+        """
+        Get order status with AGGRESSIVE rate limiting and retries.
+        Returns None on failure after all retries.
+        """
+        for attempt in range(retry_count):
+            try:
+                # CRITICAL: Wait before EVERY API call
+                self._wait_for_rate_limit()
+                
+                response = self.api.get_order(order_id)
+                
+                if "data" in response:
+                    order_data = response["data"].get("order", response["data"])
+                    if order_id in self.active_orders:
+                        self.active_orders[order_id]["status"] = order_data.get(
+                            "status", "UNKNOWN"
+                        )
+                    return order_data
+                else:
+                    # Check if 429 error
+                    if response.get("status_code") == 429:
+                        wait_time = 3.0 * (attempt + 1)  # Exponential backoff
+                        logger.warning(f"[429] Rate limit hit, waiting {wait_time}s (attempt {attempt + 1}/{retry_count})")
+                        time.sleep(wait_time)
+                        continue
+                    
+                    logger.warning(f"Could not get order status for {order_id} (attempt {attempt + 1}/{retry_count})")
+                    return None
+            
+            except Exception as e:
+                logger.error(f"Error getting order status (attempt {attempt + 1}/{retry_count}): {e}")
+                if attempt < retry_count - 1:
+                    time.sleep(2.0 * (attempt + 1))
+                    continue
+                return None
+        
+        logger.error(f"Failed to get order status for {order_id} after {retry_count} attempts")
+        return None
+    
+    def get_order_status_safe(self, order_id: str) -> str:
+        """
+        Safe wrapper for get_order_status that never raises exceptions.
+        Returns: "FILLED", "CANCELLED", or "UNKNOWN"
+        
+        CRITICAL: Uses aggressive rate limiting
+        """
+        try:
+            response = self.get_order_status(order_id, retry_count=2)  # Only 2 retries for safety checks
+            if response is None:
+                return "UNKNOWN"
+            
+            status = str(response.get("status", "UNKNOWN")).upper()
+            
+            if status in ("EXECUTED", "FILLED", "PARTIALLY_FILLED", "PARTIALLY_EXECUTED"):
+                return "FILLED"
+            elif status in ("CANCELLED", "REJECTED", "EXPIRED"):
+                return "CANCELLED"
+            else:
+                return "UNKNOWN"
+        except Exception as e:
+            logger.error(f"Exception in get_order_status_safe: {e}")
+            return "UNKNOWN"
+    
     def extract_fill_price(self, order_data: Dict) -> float:
-        """
-        Extract a valid fill price from API order dict or raise.
-        Enforces:
-        - non-zero
-        - non-NaN
-        - not obviously rate-limit/error stub
-        """
+        """Extract a valid fill price from API order dict or raise."""
         price_fields = ["avg_execution_price", "avg_price", "average_price", "price"]
         price = None
         
@@ -90,19 +161,11 @@ class OrderManager:
         self,
         order_id: str,
         timeout_sec: float = 3.0,
-        poll_interval_sec: float = 0.1,
+        poll_interval_sec: float = 2.0,  # INCREASED from 0.1s to 2s
     ) -> Dict:
         """
         Poll order status until a real fill is present or timeout.
-        Conditions to return:
-        - status in EXECUTED / PARTIALLY_EXECUTED / FILLED (case-insensitive)
-        - exec_quantity > 0
-        - avg_execution_price (or equivalent) > 0
-        
-        Raises RuntimeError on:
-        - timeout without valid fill
-        - status in CANCELLED / REJECTED
-        - API / rate limit errors
+        CRITICAL: Uses 2s polling interval to avoid rate limits.
         """
         start = time.time()
         last_data: Optional[Dict] = None
@@ -114,7 +177,7 @@ class OrderManager:
                     f"Timed out waiting for fill on order {order_id}. Last status: {last_data}"
                 )
             
-            status_resp = self.get_order_status(order_id)
+            status_resp = self.get_order_status(order_id, retry_count=1)  # Only 1 retry in polling
             if not status_resp:
                 time.sleep(poll_interval_sec)
                 continue
@@ -142,27 +205,20 @@ class OrderManager:
             time.sleep(poll_interval_sec)
     
     # ======================================================================
-    # Order placement
+    # Order placement (unchanged but with rate limiting)
     # ======================================================================
     
     def place_market_order(
         self, side: str, quantity: float, reduce_only: bool = False
     ) -> Optional[Dict]:
-        """
-        Place a market order.
-        
-        Args:
-            side: 'BUY' or 'SELL'
-            quantity: Order quantity
-            reduce_only: If True, only reduces position
-            
-        Returns:
-            Order details or None on failure
-        """
+        """Place a market order."""
         try:
             if not self._check_rate_limit():
                 logger.warning("Rate limit exceeded for orders; delaying by 2 seconds")
                 time.sleep(2)
+            
+            # CRITICAL: Wait before API call
+            self._wait_for_rate_limit()
             
             logger.info(f"Placing MARKET {side} order: {quantity} {config.SYMBOL}")
             
@@ -192,12 +248,10 @@ class OrderManager:
                 
                 self.order_history.append(self.active_orders[order_id].copy())
                 logger.info(f"✓ Order placed successfully: {order_id}")
-                logger.info(f"  Status: {order_details.get('status')}")
                 return order_details
             else:
                 error_msg = response.get("response", {}).get("message", "Unknown error")
                 logger.error(f"✗ Order placement failed: {error_msg}")
-                logger.error(f"  Full response: {response}")
                 return None
         
         except Exception as e:
@@ -216,6 +270,9 @@ class OrderManager:
             if not self._check_rate_limit():
                 logger.warning("Rate limit exceeded for orders; delaying by 2 seconds")
                 time.sleep(2)
+            
+            # CRITICAL: Wait before API call
+            self._wait_for_rate_limit()
             
             logger.info(
                 f"Placing LIMIT {side} order: {quantity} {config.SYMBOL} @ ${price:,.2f}"
@@ -264,6 +321,9 @@ class OrderManager:
     ) -> Optional[Dict]:
         """Place a stop loss order."""
         try:
+            # CRITICAL: Wait before API call
+            self._wait_for_rate_limit()
+            
             logger.info(f"Placing STOP LOSS {side} @ ${trigger_price:,.2f}")
             
             response = self.api.place_order(
@@ -305,6 +365,9 @@ class OrderManager:
     ) -> Optional[Dict]:
         """Place a take profit order."""
         try:
+            # CRITICAL: Wait before API call
+            self._wait_for_rate_limit()
+            
             logger.info(f"Placing TAKE PROFIT {side} @ ${trigger_price:,.2f}")
             
             response = self.api.place_order(
@@ -341,13 +404,12 @@ class OrderManager:
             logger.error(f"Error placing take profit: {e}")
             return None
     
-    # ======================================================================
-    # Cancellation / status
-    # ======================================================================
-    
     def cancel_order(self, order_id: str) -> bool:
         """Cancel an order."""
         try:
+            # CRITICAL: Wait before API call
+            self._wait_for_rate_limit()
+            
             logger.info(f"Cancelling order: {order_id}")
             
             response = self.api.cancel_order(
@@ -371,6 +433,9 @@ class OrderManager:
     def cancel_all_orders(self) -> bool:
         """Cancel all open orders for the symbol."""
         try:
+            # CRITICAL: Wait before API call
+            self._wait_for_rate_limit()
+            
             logger.info(f"Cancelling all orders for {config.SYMBOL}")
             
             response = self.api.cancel_all_orders(
@@ -390,28 +455,12 @@ class OrderManager:
             logger.error(f"Error cancelling all orders: {e}")
             return False
     
-    def get_order_status(self, order_id: str) -> Optional[Dict]:
-        """Get order status."""
-        try:
-            response = self.api.get_order(order_id)
-            if "data" in response:
-                order_data = response["data"].get("order", response["data"])
-                if order_id in self.active_orders:
-                    self.active_orders[order_id]["status"] = order_data.get(
-                        "status", "UNKNOWN"
-                    )
-                return order_data
-            else:
-                logger.warning(f"Could not get order status for {order_id}")
-                return None
-        
-        except Exception as e:
-            logger.error(f"Error getting order status: {e}")
-            return None
-    
     def get_open_orders(self) -> list:
         """Get all open orders."""
         try:
+            # CRITICAL: Wait before API call
+            self._wait_for_rate_limit()
+            
             response = self.api.get_open_orders(
                 exchange=config.EXCHANGE,
                 symbol=config.SYMBOL,
@@ -428,10 +477,6 @@ class OrderManager:
         except Exception as e:
             logger.error(f"Error getting open orders: {e}")
             return []
-    
-    # ======================================================================
-    # Stats
-    # ======================================================================
     
     def get_order_statistics(self) -> Dict:
         """Get order statistics."""
@@ -456,32 +501,3 @@ class OrderManager:
             "success_rate": (successful / total_orders) * 100 if total_orders > 0 else 0,
             "last_order_time": self.last_order_time,
         }
-
-    def get_order_status_safe(self, order_id: str) -> str:
-        """
-        Safe wrapper for get_order_status that never raises exceptions.
-        Returns: "FILLED", "CANCELLED", or "UNKNOWN"
-        """
-        try:
-            response = self.get_order_status(order_id)
-            if response is None:
-                return "UNKNOWN"
-            
-            status = str(response.get("status", "UNKNOWN")).upper()
-            
-            if status in ("EXECUTED", "FILLED", "PARTIALLY_FILLED", "PARTIALLY_EXECUTED"):
-                return "FILLED"
-            elif status in ("CANCELLED", "REJECTED", "EXPIRED"):
-                return "CANCELLED"
-            else:
-                return "UNKNOWN"
-        except Exception:
-            return "UNKNOWN"
-
-
-if __name__ == "__main__":
-    om = OrderManager()
-    print("Order Manager initialized")
-    print(f"Statistics: {om.get_order_statistics()}")
-    open_orders = om.get_open_orders()
-    print(f"Open orders: {len(open_orders)}")

@@ -158,22 +158,23 @@ class ZScoreIcebergHunterStrategy:
         """
         if session == "WEEKEND":
             params = config.WEEKEND_PARAMS.copy()
-            session_type = "WEEKEND (Conservative)"
+            session_type = "WEEKEND"
         elif session in ("LONDON_NY_OVERLAP", "ASIA_LONDON_OVERLAP"):
             params = config.OVERLAP_SESSION_PARAMS.copy()
-            session_type = f"{session} (Aggressive)"
+            session_type = session
         elif is_major_session:
             params = config.MAJOR_SESSION_PARAMS.copy()
-            session_type = "MAJOR SESSION (Standard)"
+            session_type = session
         else:
             # Off-peak hours
             params = config.WEEKEND_PARAMS.copy()
-            session_type = "OFF-PEAK (Conservative)"
+            session_type = "OFF_PEAK"
+        
+        # CRITICAL FIX: Add session_name to params dict
+        params['session_name'] = session_type
         
         logger.debug(f"Session: {session_type} | Params: {params}")
         return params
-
-    # ... (rest of the methods remain unchanged until _exit_position)
 
     def _exit_position(
         self,
@@ -423,9 +424,12 @@ class ZScoreIcebergHunterStrategy:
             tp_roi_target = session_params["tp_roi_target"]
             sl_roi_max = session_params["sl_roi_max"]
             
+            # CRITICAL FIX: Use actual session name from params
+            session_name = session_params.get('session_name', 'UNKNOWN')
+            
             logger.info("=" * 80)
             logger.info("[TP/SL CALCULATION] Using session-based parameters")
-            logger.info(f"  Session: {session_params.get('session_name', 'UNKNOWN')}")
+            logger.info(f"  Session: {session_name}")  # Now logs actual session
             logger.info(f"  Entry Price: {entry_price:.2f}")
             logger.info(f"  Margin Used: {margin_used:.2f} USDT")
             logger.info(f"  Quantity: {quantity:.6f} BTC")
@@ -748,6 +752,9 @@ class ZScoreIcebergHunterStrategy:
     ) -> None:
         """Enter position with LIMIT order + session-based TP/SL."""
         try:
+            # CRITICAL FIX: Get fresh session (don't use stale variable)
+            current_session, current_is_major = self._get_current_session()
+            session = current_session
             # Check for existing position first
             try:
                 positions_resp = order_manager.api.get_positions(
@@ -887,6 +894,7 @@ class ZScoreIcebergHunterStrategy:
                 quantity=quantity,
                 entry_price=limit_entry_price,
                 entry_time_sec=now_sec,
+                entry_session=session
                 entry_wall_volume=(
                     wall_data["bid_vol_zone"] if side == "long" else wall_data["ask_vol_zone"]
                 ),
