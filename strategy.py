@@ -57,7 +57,7 @@ class ZScorePosition:
     last_momentum_log_sec: float
     tp_adjustment_count: int
     entry_session: str
-
+    limit_order_placed_time: float
 
 class ZScoreIcebergHunterStrategy:
     """
@@ -876,6 +876,7 @@ class ZScoreIcebergHunterStrategy:
                 last_momentum_log_sec=now_sec,
                 tp_adjustment_count=0,
                 entry_session=session,
+                limit_order_placed_time=now_sec,
             )
             
             risk_manager.record_trade_opened()
@@ -917,6 +918,36 @@ class ZScoreIcebergHunterStrategy:
         # Check if LIMIT order has filled yet
         # ======================================================================
         if not pos.main_filled:
+            # Calculate elapsed time since limit order placement
+            elapsed_since_placement = now_sec - pos.limit_order_placed_time
+            
+            # TIMEOUT CHECK: 60 seconds
+            if elapsed_since_placement > 60.0:
+                logger.warning(f"⏱️ LIMIT ORDER TIMEOUT after {elapsed_since_placement:.1f}s - Cancelling bracket")
+                
+                # Cancel all orders
+                order_manager.cancel_order(pos.main_order_id)
+                order_manager.cancel_order(pos.tp_order_id)
+                order_manager.cancel_order(pos.sl_order_id)
+                
+                # Send Telegram notification
+                try:
+                    msg = (
+                        f"⏱️ TIMEOUT: {pos.side.upper()} bracket cancelled\n"
+                        f"Limit order not filled in 60s\n"
+                        f"Limit Entry: {pos.entry_price:.2f} (current {current_price:.2f})\n"
+                        f"Moving to next analysis"
+                    )
+                    send_telegram_message(msg)
+                except:
+                    pass
+                
+                # Reset position state
+                self.current_position = None
+                self.pending_entry = False
+                return
+            
+            # Check order status (if not timed out yet)
             try:
                 main_status = order_manager.get_order_status(pos.main_order_id)
                 if main_status:
@@ -926,10 +957,18 @@ class ZScoreIcebergHunterStrategy:
                         # Update entry price from actual fill
                         actual_fill_price = order_manager.extract_fill_price(main_status)
                         pos.entry_price = actual_fill_price
-                        logger.info(f"✓ Limit order filled at {actual_fill_price:.2f}")
+                        logger.info(f"✓ Limit order filled at {actual_fill_price:.2f} (after {elapsed_since_placement:.1f}s)")
                         
-                        # Recalculate TP/SL based on ACTUAL fill price if needed
-                        # (optional: only if fill price differs significantly)
+                        # Notify fill
+                        try:
+                            msg = (
+                                f"✅ {pos.side.upper()} FILLED\n"
+                                f"Entry: {actual_fill_price:.2f} (after {elapsed_since_placement:.1f}s)\n"
+                                f"TP: {pos.tp_price:.2f} | SL: {pos.sl_price:.2f}"
+                            )
+                            send_telegram_message(msg)
+                        except:
+                            pass
                         
                     elif status in ("CANCELLED", "REJECTED", "EXPIRED"):
                         logger.warning(f"Limit order {status} - closing bracket")
@@ -947,9 +986,9 @@ class ZScoreIcebergHunterStrategy:
         # ======================================================================
         # Rest of position management (existing code)
         # ======================================================================
-
         hold_sec = now_sec - pos.entry_time_sec
         hold_min = hold_sec / 60.0
+
 
         if now_sec - self._last_position_log_sec >= self.POSITION_LOG_INTERVAL_SEC:
             self._last_position_log_sec = now_sec
