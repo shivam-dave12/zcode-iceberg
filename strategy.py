@@ -884,10 +884,10 @@ class ZScoreIcebergHunterStrategy:
                             final_status = str(order_data.get("status", "")).upper()
                             logger.info(f"Final status: {final_status}")
                             break
-                        time.sleep(0.5 * (attempt + 1))  # Progressive backoff
+                        time.sleep(1 * (attempt + 1))  # Progressive backoff
                     except Exception as e:
                         logger.debug(f"Status poll #{attempt+1} error: {e}")
-                        time.sleep(0.5 * (attempt + 1))
+                        time.sleep(1 * (attempt + 1))
                 
                 # FILLED? → Activate position management
                 if final_status in ("EXECUTED", "FILLED", "PARTIALLY_FILLED"):
