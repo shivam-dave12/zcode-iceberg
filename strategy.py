@@ -8,6 +8,7 @@ IMPROVEMENTS:
 4. Single-fire timeout handling for limit orders
 5. Safe orphaned order cleanup
 6. Session-based TP/SL calculations
+7. FIXED: No manual cancel on TP/SL hit (exchange auto-cancels); check position open before market close
 """
 
 import time
@@ -169,12 +170,134 @@ class ZScoreIcebergHunterStrategy:
             params = config.WEEKEND_PARAMS.copy()
             session_type = "OFF-PEAK (Conservative)"
         
-        # Store for debugging
-        self.current_session_params = params
-        params['session_name'] = session
-        
-        logger.debug(f"Using {session_type} parameters")
+        logger.debug(f"Session: {session_type} | Params: {params}")
         return params
+
+    # ... (rest of the methods remain unchanged until _exit_position)
+
+    def _exit_position(
+        self,
+        order_manager,
+        risk_manager,
+        exit_price: float,
+        reason: str,
+        now_sec: float,
+    ) -> None:
+        """Exit position and cleanup - FIXED: Skip manual cancels on TP/SL hit; check position before market close."""
+        pos = self.current_position
+        if pos is None:
+            return
+
+        # FIXED: Check TP/SL status before attempting cancel - exchange auto-cancels on trigger
+        tp_status = order_manager.get_order_status_safe(pos.tp_order_id)
+        sl_status = order_manager.get_order_status_safe(pos.sl_order_id)
+        
+        if tp_status != "EXECUTED" and tp_status != "FILLED":
+            order_manager.cancel_order(pos.tp_order_id)
+        else:
+            logger.info(f"TP order {pos.tp_order_id} already EXECUTED/FILLED - skipping cancel")
+        
+        if sl_status != "EXECUTED" and sl_status != "FILLED":
+            order_manager.cancel_order(pos.sl_order_id)
+        else:
+            logger.info(f"SL order {pos.sl_order_id} already EXECUTED/FILLED - skipping cancel")
+
+        # FIXED: Check if position still open before market close (e.g., SL may have auto-closed)
+        positions_resp = order_manager.api.get_positions(symbol=config.SYMBOL, exchange=config.EXCHANGE)
+        position_open = False
+        if positions_resp and not positions_resp.get("error"):
+            data = positions_resp.get("data", [])
+            if isinstance(data, list):
+                for p in data:
+                    if p.get("symbol") == config.SYMBOL:
+                        qty = float(p.get("quantity", 0))
+                        if abs(qty) > 0:
+                            position_open = True
+                            break
+        
+        if position_open:
+            logger.info("Position still open - placing market close order")
+            exit_side = "SELL" if pos.side == "long" else "BUY"
+            exit_order = order_manager.place_market_order(
+                side=exit_side,
+                quantity=pos.quantity,
+                reduce_only=True,
+            )
+
+            if exit_order:
+                try:
+                    filled = order_manager.wait_for_fill(exit_order.get("order_id", ""), timeout_sec=3.0)
+                    exit_price = order_manager.extract_fill_price(filled)
+                except Exception as e:
+                    logger.warning(f"Market close failed: {e} - using provided exit_price")
+        else:
+            logger.info("Position already closed (e.g., by SL) - skipping market order")
+
+        direction = 1.0 if pos.side == "long" else -1.0
+        pnl = (exit_price - pos.entry_price) * direction * pos.quantity
+        roi = pnl / pos.margin_used if pos.margin_used > 0 else 0.0
+
+        risk_manager.update_trade_stats(pnl)
+
+        logger.info("\n" + "=" * 100)
+        logger.info(f"[POSITION CLOSED] {pos.trade_id} | {reason}")
+        logger.info("=" * 100)
+        logger.info(f"  Side: {pos.side.upper()}")
+        logger.info(f"  Entry Session: {pos.entry_session}")
+        logger.info(f"  Entry: {pos.entry_price:.2f} | Exit: {exit_price:.2f}")
+        logger.info(f"  Quantity: {pos.quantity:.6f} BTC")
+        logger.info(f"  P&L: {pnl:.2f} USDT ({roi*100:.2f}%)")
+        logger.info(f"  Hold Time: {(now_sec - pos.entry_time_sec)/60.0:.1f} min")
+        logger.info("=" * 100 + "\n")
+
+        try:
+            msg = format_exit_message(
+                trade_id=pos.trade_id,
+                side=pos.side,
+                entry_price=pos.entry_price,
+                exit_price=exit_price,
+                quantity=pos.quantity,
+                margin=pos.margin_used,
+                pnl=pnl,
+                roi=roi,
+                hold_min=(now_sec - pos.entry_time_sec) / 60.0,
+                exit_reason=reason,
+                session=pos.entry_session,
+            )
+            send_telegram_message(msg)
+        except Exception as e:
+            logger.error(f"Error sending exit notification: {e}")
+
+        # Log to Excel if available
+        if self.excel_logger:
+            try:
+                self.excel_logger.log_trade(
+                    trade_id=pos.trade_id,
+                    entry_time=datetime.fromtimestamp(pos.entry_time_sec).strftime("%Y-%m-%d %H:%M:%S"),
+                    exit_time=datetime.fromtimestamp(now_sec).strftime("%Y-%m-%d %H:%M:%S"),
+                    duration_minutes=(now_sec - pos.entry_time_sec) / 60.0,
+                    side=pos.side,
+                    entry_price=pos.entry_price,
+                    exit_price=exit_price,
+                    quantity=pos.quantity,
+                    margin_used=pos.margin_used,
+                    leverage=config.LEVERAGE,
+                    tp_price=pos.tp_price,
+                    sl_price=pos.sl_price,
+                    entry_imbalance=pos.entry_imbalance,
+                    entry_z_score=pos.entry_z_score,
+                    entry_wall_volume=pos.entry_wall_volume,
+                    exit_reason=reason,
+                    pnl_usdt=pnl,
+                    entry_htf_trend=pos.entry_htf_trend,
+                )
+            except Exception as e:
+                logger.error(f"Error logging to Excel: {e}")
+
+        self.last_exit_time_min = now_sec / 60.0
+        self.current_position = None
+        self.pending_entry = False
+
 
     def _determine_volatility_with_gates(
         self, 
@@ -1641,100 +1764,128 @@ class ZScoreIcebergHunterStrategy:
             self._exit_position(order_manager, risk_manager, current_price, "SL_HIT", now_sec)
 
     def _exit_position(
-        self,
-        order_manager,
-        risk_manager,
-        exit_price: float,
-        reason: str,
-        now_sec: float,
-    ) -> None:
-        """Exit position and cleanup."""
-        pos = self.current_position
-        if pos is None:
-            return
+            self,
+            order_manager,
+            risk_manager,
+            exit_price: float,
+            reason: str,
+            now_sec: float,
+        ) -> None:
+            """Exit position and cleanup - FIXED: Skip manual cancels on TP/SL hit; check position before market close."""
+            pos = self.current_position
+            if pos is None:
+                return
 
-        order_manager.cancel_order(pos.tp_order_id)
-        order_manager.cancel_order(pos.sl_order_id)
+            # FIXED: Check TP/SL status before attempting cancel - exchange auto-cancels on trigger
+            tp_status = order_manager.get_order_status_safe(pos.tp_order_id)
+            sl_status = order_manager.get_order_status_safe(pos.sl_order_id)
+            
+            if tp_status != "EXECUTED" and tp_status != "FILLED":
+                order_manager.cancel_order(pos.tp_order_id)
+            else:
+                logger.info(f"TP order {pos.tp_order_id} already EXECUTED/FILLED - skipping cancel")
+            
+            if sl_status != "EXECUTED" and sl_status != "FILLED":
+                order_manager.cancel_order(pos.sl_order_id)
+            else:
+                logger.info(f"SL order {pos.sl_order_id} already EXECUTED/FILLED - skipping cancel")
 
-        exit_side = "SELL" if pos.side == "long" else "BUY"
-        exit_order = order_manager.place_market_order(
-            side=exit_side,
-            quantity=pos.quantity,
-            reduce_only=True,
-        )
+            # FIXED: Check if position still open before market close (e.g., SL may have auto-closed)
+            positions_resp = order_manager.api.get_positions(symbol=config.SYMBOL, exchange=config.EXCHANGE)
+            position_open = False
+            if positions_resp and not positions_resp.get("error"):
+                data = positions_resp.get("data", [])
+                if isinstance(data, list):
+                    for p in data:
+                        if p.get("symbol") == config.SYMBOL:
+                            qty = float(p.get("quantity", 0))
+                            if abs(qty) > 0:
+                                position_open = True
+                                break
+            
+            if position_open:
+                logger.info("Position still open - placing market close order")
+                exit_side = "SELL" if pos.side == "long" else "BUY"
+                exit_order = order_manager.place_market_order(
+                    side=exit_side,
+                    quantity=pos.quantity,
+                    reduce_only=True,
+                )
 
-        if exit_order:
+                if exit_order:
+                    try:
+                        filled = order_manager.wait_for_fill(exit_order.get("order_id", ""), timeout_sec=3.0)
+                        exit_price = order_manager.extract_fill_price(filled)
+                    except Exception as e:
+                        logger.warning(f"Market close failed: {e} - using provided exit_price")
+            else:
+                logger.info("Position already closed (e.g., by SL) - skipping market order")
+
+            direction = 1.0 if pos.side == "long" else -1.0
+            pnl = (exit_price - pos.entry_price) * direction * pos.quantity
+            roi = pnl / pos.margin_used if pos.margin_used > 0 else 0.0
+
+            risk_manager.update_trade_stats(pnl)
+
+            logger.info("\n" + "=" * 100)
+            logger.info(f"[POSITION CLOSED] {pos.trade_id} | {reason}")
+            logger.info("=" * 100)
+            logger.info(f"  Side: {pos.side.upper()}")
+            logger.info(f"  Entry Session: {pos.entry_session}")
+            logger.info(f"  Entry: {pos.entry_price:.2f} | Exit: {exit_price:.2f}")
+            logger.info(f"  Quantity: {pos.quantity:.6f} BTC")
+            logger.info(f"  P&L: {pnl:.2f} USDT ({roi*100:.2f}%)")
+            logger.info(f"  Hold Time: {(now_sec - pos.entry_time_sec)/60.0:.1f} min")
+            logger.info("=" * 100 + "\n")
+
             try:
-                filled = order_manager.wait_for_fill(exit_order.get("order_id", ""), timeout_sec=3.0)
-                exit_price = order_manager.extract_fill_price(filled)
-            except:
-                pass
-
-        direction = 1.0 if pos.side == "long" else -1.0
-        pnl = (exit_price - pos.entry_price) * direction * pos.quantity
-        roi = pnl / pos.margin_used if pos.margin_used > 0 else 0.0
-
-        risk_manager.update_trade_stats(pnl)
-
-        logger.info("\n" + "=" * 100)
-        logger.info(f"[POSITION CLOSED] {pos.trade_id} | {reason}")
-        logger.info("=" * 100)
-        logger.info(f"  Side: {pos.side.upper()}")
-        logger.info(f"  Entry Session: {pos.entry_session}")
-        logger.info(f"  Entry: {pos.entry_price:.2f} | Exit: {exit_price:.2f}")
-        logger.info(f"  Quantity: {pos.quantity:.6f} BTC")
-        logger.info(f"  P&L: {pnl:.2f} USDT ({roi*100:.2f}%)")
-        logger.info(f"  Hold Time: {(now_sec - pos.entry_time_sec)/60.0:.1f} min")
-        logger.info("=" * 100 + "\n")
-
-        try:
-            msg = format_exit_message(
-                trade_id=pos.trade_id,
-                side=pos.side,
-                entry_price=pos.entry_price,
-                exit_price=exit_price,
-                quantity=pos.quantity,
-                margin=pos.margin_used,
-                pnl=pnl,
-                roi=roi,
-                hold_min=(now_sec - pos.entry_time_sec) / 60.0,
-                exit_reason=reason,
-                session=pos.entry_session,
-            )
-            send_telegram_message(msg)
-        except Exception as e:
-            logger.error(f"Error sending exit notification: {e}")
-
-        # Log to Excel if available
-        if self.excel_logger:
-            try:
-                self.excel_logger.log_trade(
+                msg = format_exit_message(
                     trade_id=pos.trade_id,
-                    entry_time=datetime.fromtimestamp(pos.entry_time_sec).strftime("%Y-%m-%d %H:%M:%S"),
-                    exit_time=datetime.fromtimestamp(now_sec).strftime("%Y-%m-%d %H:%M:%S"),
-                    duration_minutes=(now_sec - pos.entry_time_sec) / 60.0,
                     side=pos.side,
                     entry_price=pos.entry_price,
                     exit_price=exit_price,
                     quantity=pos.quantity,
-                    margin_used=pos.margin_used,
-                    leverage=config.LEVERAGE,
-                    tp_price=pos.tp_price,
-                    sl_price=pos.sl_price,
-                    entry_imbalance=pos.entry_imbalance,
-                    entry_z_score=pos.entry_z_score,
-                    entry_wall_volume=pos.entry_wall_volume,
+                    margin=pos.margin_used,
+                    pnl=pnl,
+                    roi=roi,
+                    hold_min=(now_sec - pos.entry_time_sec) / 60.0,
                     exit_reason=reason,
-                    pnl_usdt=pnl,
-                    entry_htf_trend=pos.entry_htf_trend,
+                    session=pos.entry_session,
                 )
+                send_telegram_message(msg)
             except Exception as e:
-                logger.error(f"Error logging to Excel: {e}")
+                logger.error(f"Error sending exit notification: {e}")
 
-        self.last_exit_time_min = now_sec / 60.0
-        self.current_position = None
-        self.pending_entry = False
+            # Log to Excel if available
+            if self.excel_logger:
+                try:
+                    self.excel_logger.log_trade(
+                        trade_id=pos.trade_id,
+                        entry_time=datetime.fromtimestamp(pos.entry_time_sec).strftime("%Y-%m-%d %H:%M:%S"),
+                        exit_time=datetime.fromtimestamp(now_sec).strftime("%Y-%m-%d %H:%M:%S"),
+                        duration_minutes=(now_sec - pos.entry_time_sec) / 60.0,
+                        side=pos.side,
+                        entry_price=pos.entry_price,
+                        exit_price=exit_price,
+                        quantity=pos.quantity,
+                        margin_used=pos.margin_used,
+                        leverage=config.LEVERAGE,
+                        tp_price=pos.tp_price,
+                        sl_price=pos.sl_price,
+                        entry_imbalance=pos.entry_imbalance,
+                        entry_z_score=pos.entry_z_score,
+                        entry_wall_volume=pos.entry_wall_volume,
+                        exit_reason=reason,
+                        pnl_usdt=pnl,
+                        entry_htf_trend=pos.entry_htf_trend,
+                    )
+                except Exception as e:
+                    logger.error(f"Error logging to Excel: {e}")
 
+            self.last_exit_time_min = now_sec / 60.0
+            self.current_position = None
+            self.pending_entry = False
+            
     def _clean_orphaned_orders(self, order_manager, symbol: str = "BTCUSDT") -> bool:
         """
         Cancel ALL open orders for symbol ONLY if no filled position exists.
