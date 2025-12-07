@@ -209,11 +209,11 @@ class TelegramBotController:
                 elapsed += check_interval
                 
                 if self.bot_running:
-                            self._send_message(
-                                "✅ <b>BOT STARTED</b>\n"
-                                "━━━━━━━━━━━━━━━━━━━━\n"
-                                "Trading engine active"
-                            )
+                    self._send_message(
+                        "✅ <b>BOT STARTED</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━\n"
+                        "Trading engine active"
+                    )
                     logger.info("Trading bot started successfully")
                     return
             
