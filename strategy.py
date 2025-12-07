@@ -778,7 +778,13 @@ class ZScoreIcebergHunterStrategy:
             logger.info("=" * 100)
 
             market_side = "BUY" if side == "long" else "SELL"
-            main_order = order_manager.place_limit_order(...)
+            main_order = order_manager.place_limit_order(
+                side=market_side,
+                quantity=quantity,
+                price=limit_entry_price,
+                reduce_only=False,
+            )
+
             if not main_order:
                 self.pending_entry = False
                 return

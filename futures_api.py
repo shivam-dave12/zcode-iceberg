@@ -156,46 +156,49 @@ class FuturesAPI:
         }
         return self._make_request("DELETE", endpoint, payload=payload)
    
-    def get_order(self, order_id: str) -> Dict:
-        """
-        Get order status with debug logging
-        """
-        endpoint = "/trade/api/v2/futures/order"
-        params = {"order_id": order_id}
-        
+    def get_order_status(self, order_id: str) -> Optional[Dict]:
         try:
-            response = self._make_request("GET", endpoint, params=params, payload={})
-            
-            # DEBUG: Log what we're actually receiving
-            logger.info(f"[ORDER API] Response for {order_id}: {response}")
-            
-            if isinstance(response, dict):
-                # Handle error responses
-                if "error" in response:
-                    return response
-                
-                # Try all possible structures
-                if "data" in response:
-                    data = response["data"]
-                    if isinstance(data, dict):
-                        # Structure 1: data.order
-                        if "order" in data:
-                            return data["order"]
-                        # Structure 2: data itself
-                        if "order_id" in data or "status" in data:
-                            return data
-                
-                # Structure 3: response itself
-                if "order_id" in response or "status" in response:
-                    return response
-            
-            # If we can't parse it, return as-is
-            return response
-            
+            resp = self.api.get_order(order_id)   # CoinSwitch futures API call
+            logger.info(f"[DEBUG] get_order({order_id}) raw response: {resp}")
+
+            if not isinstance(resp, dict):
+                return None
+
+            # Unwrap common shapes:
+            data = resp.get("data", resp)
+            if isinstance(data, list):
+                data = data[0] if data else None
+            if not isinstance(data, dict):
+                return None
+
+            # Some APIs nest under "order"
+            order = data.get("order", data)
+
+            # Normalize status field
+            status = (
+                order.get("status")
+                or order.get("order_status")
+                or order.get("state")
+                or ""
+            )
+            status = str(status).upper()
+
+            if not status:
+                # Nothing usable yet
+                return None
+
+            order["status"] = status  # ensure key exists
+
+            # Keep local cache in sync
+            if order_id in self.active_orders:
+                self.active_orders[order_id]["status"] = status
+
+            return order
+
         except Exception as e:
-            logger.error(f"Exception in get_order: {e}")
-            return {"error": str(e), "order_id": order_id}
-                
+            logger.debug(f"Exception getting order status for {order_id}: {e}")
+            return None
+               
     def get_open_orders(self, exchange: str = "EXCHANGE_2", symbol: str = None,
                        limit: int = 50, from_time: int = None, to_time: int = None) -> Dict:
         """
