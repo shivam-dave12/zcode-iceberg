@@ -15,6 +15,9 @@ import config
 logging.basicConfig(level=config.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
+# Order status polling cooldown (shared across all instances)
+_LAST_ORDER_STATUS_TS = 0.0
+_ORDER_STATUS_COOLDOWN = 1.0  # seconds between polls
 
 
 
@@ -422,26 +425,23 @@ class OrderManager:
     def get_order_status(self, order_id: str, max_retries: int = 3):
         """
         Fixed version:
+
         - Does NOT hit exchange rate-limit.
         - Does NOT fail due to too-fast repeated calls.
         - Preserves your original return values exactly as API gives them.
-        - No new fields added.
         """
 
-        global _last_order_status_ts, _ORDER_STATUS_COOLDOWN
+        global _LAST_ORDER_STATUS_TS, _ORDER_STATUS_COOLDOWN
 
         last_response = None
 
         for attempt in range(1, max_retries + 1):
-
             # ---- CLIENT-SIDE RATE LIMIT ENFORCEMENT ----
             now = time.time()
-            elapsed = now - _last_order_status_ts
-
+            elapsed = now - _LAST_ORDER_STATUS_TS
             if elapsed < _ORDER_STATUS_COOLDOWN:
                 time.sleep(_ORDER_STATUS_COOLDOWN - elapsed)
-
-            _last_order_status_ts = time.time()
+            _LAST_ORDER_STATUS_TS = time.time()
 
             # ---- ACTUAL API CALL ----
             try:
@@ -449,7 +449,7 @@ class OrderManager:
                 last_response = response
 
                 if isinstance(response, dict) and "data" in response:
-                    # This matches your CURRENT parsing logic exactly.
+                    # match existing parsing: return full dict with "data"
                     return response
 
                 if isinstance(response, dict):
@@ -464,10 +464,7 @@ class OrderManager:
                 time.sleep(0.25 * attempt)
                 continue
 
-        # ---- FAILURE AFTER RETRIES (your existing pattern) ----
         logger.warning(f"get_order_status FAILED after {max_retries} retries: {order_id}")
-
-        # RETURN WHATEVER LAST RESPONSE WAS (your original behavior)
         return last_response
 
     def get_open_orders(self) -> list:
