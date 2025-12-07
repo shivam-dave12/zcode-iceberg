@@ -1,246 +1,48 @@
 """
-Order Manager - PRODUCTION GRADE (COMPLETE)
+Order Manager - SIMPLE & WORKING
 
-Rate Limiting: Token bucket + adaptive backoff + circuit breaker
-Error Handling: 429 detection, exponential backoff with jitter
-Thread Safety: Request queue + operation deduplication
+Focus: Get order status working correctly with proper rate limiting
 """
 
 import time
 import logging
-import random
-import hashlib
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 from datetime import datetime
 import threading
-from collections import deque
 from futures_api import FuturesAPI
 import config
 
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# ADAPTIVE RATE LIMITER WITH CIRCUIT BREAKER
+# SIMPLE GLOBAL RATE LIMITER
 # ============================================================================
 
-class AdaptiveRateLimiter:
-    """Token bucket rate limiter with adaptive backoff and circuit breaker."""
-    
-    def __init__(self, base_interval: float = 3.0, max_tokens: int = 20):
-        self.lock = threading.Lock()
-        self.base_interval = base_interval
-        self.current_interval = base_interval
-        self.last_request_time = 0.0
-        self.tokens = float(max_tokens)
-        self.max_tokens = float(max_tokens)
-        self.refill_rate = max_tokens / 60.0  # 20 tokens per 60 seconds
-        self.last_refill_time = time.time()
-        
-        # Circuit breaker
-        self.consecutive_failures = 0
-        self.circuit_open_until = 0.0
-        self.max_failures_before_circuit = 3
-        self.circuit_cooldown = 10.0
-        
-        # 429 tracking
-        self.last_429_time = 0.0
-        self.penalty_until = 0.0
-        
-        logger.info(f"✓ AdaptiveRateLimiter: base={base_interval}s, max_tokens={max_tokens} (refill={self.refill_rate:.2f}/s)")
-    
-    def _refill_tokens(self):
-        """Refill tokens based on elapsed time."""
-        now = time.time()
-        elapsed = now - self.last_refill_time
-        if elapsed > 0:
-            new_tokens = elapsed * self.refill_rate
-            self.tokens = min(self.max_tokens, self.tokens + new_tokens)
-            self.last_refill_time = now
-    
-    def acquire(self, operation: str = "generic") -> Tuple[bool, float]:
-        """
-        Attempt to acquire permission to make a request.
-        Returns: (allowed, wait_time_if_denied)
-        """
-        with self.lock:
-            now = time.time()
-            
-            # Check circuit breaker
-            if now < self.circuit_open_until:
-                wait_time = self.circuit_open_until - now
-                logger.debug(f"⛔ Circuit breaker OPEN for {operation}: wait {wait_time:.1f}s")
-                return False, wait_time
-            
-            # Check 429 penalty
-            if now < self.penalty_until:
-                wait_time = self.penalty_until - now
-                logger.debug(f"⏸️ 429 penalty active for {operation}: wait {wait_time:.1f}s")
-                return False, wait_time
-            
-            # Refill tokens
-            self._refill_tokens()
-            
-            # Check if we have tokens
-            if self.tokens < 1.0:
-                wait_time = (1.0 - self.tokens) / self.refill_rate
-                logger.debug(f"⏳ No tokens for {operation}: wait {wait_time:.1f}s (tokens={self.tokens:.2f})")
-                return False, wait_time
-            
-            # Check minimum interval
-            elapsed_since_last = now - self.last_request_time
-            if elapsed_since_last < self.current_interval:
-                wait_time = self.current_interval - elapsed_since_last
-                logger.debug(f"⏱️ Interval not met for {operation}: wait {wait_time:.1f}s")
-                return False, wait_time
-            
-            # All checks passed - consume token
-            self.tokens -= 1.0
-            self.last_request_time = now
-            logger.debug(f"✓ Acquired token for {operation} (remaining={self.tokens:.2f})")
-            return True, 0.0
-    
-    def report_success(self):
-        """Report successful API call - reduce backoff."""
-        with self.lock:
-            self.consecutive_failures = 0
-            # Gradually reduce interval back to base
-            self.current_interval = max(
-                self.base_interval,
-                self.current_interval * 0.9
-            )
-    
-    def report_failure(self, is_429: bool = False):
-        """Report failed API call - increase backoff."""
-        with self.lock:
-            self.consecutive_failures += 1
-            now = time.time()
-            
-            if is_429:
-                # Aggressive penalty for rate limit
-                self.last_429_time = now
-                penalty_duration = min(30.0, 5.0 * (2 ** self.consecutive_failures))
-                self.penalty_until = now + penalty_duration
-                logger.warning(f"⚠️ 429 Rate Limit Hit - Penalty: {penalty_duration:.1f}s")
-            
-            # Exponential backoff on current interval
-            self.current_interval = min(
-                10.0,  # Max 10 seconds between requests
-                self.current_interval * 1.5
-            )
-            
-            # Open circuit breaker if too many failures
-            if self.consecutive_failures >= self.max_failures_before_circuit:
-                self.circuit_open_until = now + self.circuit_cooldown
-                logger.error(
-                    f"💥 Circuit breaker OPENED: {self.consecutive_failures} consecutive failures. "
-                    f"Cooldown: {self.circuit_cooldown}s"
-                )
-    
-    def wait_with_jitter(self, base_wait: float) -> None:
-        """Sleep with jittered duration to prevent thundering herd."""
-        jitter = random.uniform(0, base_wait * 0.2)  # Add up to 20% jitter
-        actual_wait = base_wait + jitter
-        time.sleep(actual_wait)
-
-# Global rate limiter instance
-_GLOBAL_RATE_LIMITER = AdaptiveRateLimiter(base_interval=3.0, max_tokens=20)
-
-# ============================================================================
-# OPERATION DEDUPLICATOR (FIXED)
-# ============================================================================
-
-class OperationDeduplicator:
-    """
-    Prevents duplicate SIMULTANEOUS operations.
-    CRITICAL FIX: Only blocks concurrent requests, NOT sequential retries.
-    """
+class SimpleRateLimiter:
+    """Simple rate limiter: 20 requests per 60 seconds with 3 second minimum gap."""
     
     def __init__(self):
         self.lock = threading.Lock()
-        self.in_flight = {}  # operation_hash -> (timestamp, thread_id)
-        self.max_in_flight_age = 30.0  # Auto-cleanup after 30 seconds
+        self.last_request_time = 0.0
+        self.min_interval = 3.0  # 3 seconds between requests
+        
+        logger.info(f"✓ SimpleRateLimiter: {self.min_interval}s between requests")
     
-    def _hash_operation(self, op_type: str, **kwargs) -> str:
-        """Create hash of operation for deduplication."""
-        # For status checks, include timestamp in hash to allow retries
-        if op_type == "get_order_status":
-            # Don't include order_id in hash - we want to allow retries
-            # Just use thread ID to prevent same thread from double-checking
-            key_str = f"{op_type}:thread_{threading.get_ident()}"
-        else:
-            # For placement operations, use full deduplication
-            key_str = f"{op_type}:" + ":".join(f"{k}={v}" for k, v in sorted(kwargs.items()))
-        
-        return hashlib.md5(key_str.encode()).hexdigest()[:16]
-    
-    def check_and_register(self, op_type: str, **kwargs) -> Tuple[bool, str]:
-        """
-        Check if operation is already in flight.
-        Returns: (is_duplicate, operation_hash)
-        
-        CRITICAL FIX: Only blocks if SAME THREAD is making concurrent request.
-        Different threads can check status simultaneously (rate limiter handles throttling).
-        """
-        op_hash = self._hash_operation(op_type, **kwargs)
-        
+    def wait_if_needed(self):
+        """Wait if needed to respect rate limit."""
         with self.lock:
             now = time.time()
+            elapsed = now - self.last_request_time
             
-            # Clean up stale in-flight operations
-            stale_keys = [
-                h for h, (start_time, _) in self.in_flight.items()
-                if now - start_time > self.max_in_flight_age
-            ]
-            for key in stale_keys:
-                logger.warning(f"Cleaning up stale in-flight operation: {key}")
-                del self.in_flight[key]
+            if elapsed < self.min_interval:
+                wait_time = self.min_interval - elapsed
+                logger.debug(f"Rate limit: waiting {wait_time:.1f}s")
+                time.sleep(wait_time)
             
-            # For status checks, only block if same thread has concurrent request
-            if op_type == "get_order_status":
-                thread_id = threading.get_ident()
-                if op_hash in self.in_flight:
-                    start_time, in_flight_thread = self.in_flight[op_hash]
-                    age = now - start_time
-                    
-                    # Only block if it's the SAME thread (prevents double-check in same call stack)
-                    if in_flight_thread == thread_id:
-                        logger.debug(
-                            f"🔄 Same thread checking status concurrently (hash={op_hash}, age={age:.1f}s)"
-                        )
-                        return True, op_hash
-                    else:
-                        # Different thread - allow it (rate limiter will throttle)
-                        logger.debug(
-                            f"✓ Different thread checking status (this={thread_id}, other={in_flight_thread})"
-                        )
-            else:
-                # For placement operations, strict deduplication
-                if op_hash in self.in_flight:
-                    start_time, thread_id = self.in_flight[op_hash]
-                    age = now - start_time
-                    logger.warning(
-                        f"🔄 Duplicate {op_type} detected (hash={op_hash}, age={age:.1f}s, thread={thread_id})"
-                    )
-                    return True, op_hash
-            
-            # Register as in-flight
-            self.in_flight[op_hash] = (now, threading.get_ident())
-            return False, op_hash
-    
-    def mark_complete(self, op_hash: str):
-        """Mark operation as complete."""
-        with self.lock:
-            if op_hash in self.in_flight:
-                del self.in_flight[op_hash]
-    
-    def mark_failed(self, op_hash: str):
-        """Mark operation as failed (remove from in-flight)."""
-        with self.lock:
-            if op_hash in self.in_flight:
-                del self.in_flight[op_hash]
+            self.last_request_time = time.time()
 
-# Global deduplicator
-_OPERATION_DEDUP = OperationDeduplicator()
+# Global rate limiter
+_RATE_LIMITER = SimpleRateLimiter()
 
 # ============================================================================
 # ORDER MANAGER
@@ -265,7 +67,7 @@ class OrderManager:
         self.order_count = 0
         self.rate_limit_window_start = time.time()
         
-        logger.info("✓ OrderManager initialized with production-grade rate limiting")
+        logger.info("✓ OrderManager initialized")
     
     # ======================================================================
     # HELPER METHODS
@@ -313,172 +115,76 @@ class OrderManager:
         
         return price
     
-    def _is_rate_limit_error(self, response: Dict) -> bool:
-        """Check if response indicates rate limiting."""
-        if not isinstance(response, dict):
-            return False
-        
-        # Check status code
-        if response.get("status_code") == 429:
-            return True
-        
-        # Check error message
-        error_msg = str(response.get("error", "")).lower()
-        if "too many requests" in error_msg or "rate limit" in error_msg:
-            return True
-        
-        # Check response message
-        if "response" in response and isinstance(response["response"], dict):
-            resp_msg = str(response["response"].get("message", "")).lower()
-            if "too many requests" in resp_msg:
-                return True
-        
-        return False
-    
     # ======================================================================
-    # PRODUCTION-GRADE ORDER STATUS CHECKING
+    # SIMPLE ORDER STATUS CHECKING
     # ======================================================================
     
     def get_order_status(self, order_id: str, max_retries: int = 3) -> Optional[Dict]:
         """
-        PRODUCTION-GRADE order status checking with:
-        - Adaptive rate limiting with circuit breaker
-        - Exponential backoff with jitter on failures
-        - 429 detection and aggressive penalty
-        - FIXED: Allows legitimate retries, blocks only concurrent same-thread calls
+        SIMPLE order status checking with basic rate limiting.
         """
-        global _GLOBAL_RATE_LIMITER, _OPERATION_DEDUP
+        global _RATE_LIMITER
         
-        # FIXED: Check for duplicate operation (only blocks same thread concurrent)
-        is_duplicate, op_hash = _OPERATION_DEDUP.check_and_register(
-            "get_order_status",
-            order_id=order_id
-        )
-        
-        if is_duplicate:
-            logger.debug(f"Blocking duplicate concurrent get_order_status for {order_id}")
-            return None
-        
-        last_response = None
-        attempt = 0
-        
-        try:
-            while attempt < max_retries:
-                attempt += 1
-                
-                # Wait for rate limiter permission
-                max_wait_attempts = 5
-                wait_attempt = 0
-                allowed = False
-                
-                while wait_attempt < max_wait_attempts:
-                    allowed, wait_time = _GLOBAL_RATE_LIMITER.acquire("get_order_status")
-                    if allowed:
-                        break
-                    
-                    if wait_time > 0:
-                        logger.debug(f"Rate limit: waiting {wait_time:.1f}s")
-                        _GLOBAL_RATE_LIMITER.wait_with_jitter(min(wait_time, 5.0))
-                    
-                    wait_attempt += 1
-                
-                if not allowed:
-                    logger.warning(f"⚠️ Could not acquire rate limit permission after {max_wait_attempts} waits")
-                    _GLOBAL_RATE_LIMITER.report_failure()
-                    backoff_time = 1.0 * attempt
-                    _GLOBAL_RATE_LIMITER.wait_with_jitter(backoff_time)
-                    continue
+        for attempt in range(1, max_retries + 1):
+            try:
+                # Wait for rate limit
+                _RATE_LIMITER.wait_if_needed()
                 
                 # Make API call
-                try:
-                    logger.debug(f"[STATUS CHECK #{attempt}] Calling API for {order_id}")
-                    response = self.api.get_order_status(order_id)
-                    last_response = response
+                logger.debug(f"[STATUS CHECK #{attempt}] Checking order: {order_id}")
+                response = self.api.get_order_status(order_id)
+                
+                # Check for errors
+                if "error" in response:
+                    error_msg = str(response.get("error", ""))
+                    logger.warning(f"[STATUS CHECK #{attempt}] Error: {error_msg}")
                     
-                    # Check for rate limit error
-                    if self._is_rate_limit_error(response):
-                        logger.warning(f"[STATUS CHECK #{attempt}] 429 Rate Limit Error")
-                        _GLOBAL_RATE_LIMITER.report_failure(is_429=True)
-                        
-                        # Exponential backoff with jitter
-                        backoff_time = min(30.0, 2.0 * (2 ** attempt))
-                        _GLOBAL_RATE_LIMITER.wait_with_jitter(backoff_time)
+                    # If 429, wait longer
+                    if response.get("status_code") == 429 or "too many requests" in error_msg.lower():
+                        logger.warning(f"Rate limited - waiting 5 seconds")
+                        time.sleep(5.0)
                         continue
                     
-                    # Check for other errors
-                    if "error" in response:
-                        logger.warning(f"[STATUS CHECK #{attempt}] API error: {response.get('error')}")
-                        _GLOBAL_RATE_LIMITER.report_failure()
-                        
-                        backoff_time = 1.0 * attempt
-                        _GLOBAL_RATE_LIMITER.wait_with_jitter(backoff_time)
-                        continue
-                    
-                    # Successful response structure check
-                    if isinstance(response, dict):
-                        # CoinSwitch v2: data.order.status OR direct status
-                        if "data" in response:
-                            order_data = response.get("data", {})
-                            if isinstance(order_data, dict) and ("order" in order_data or "status" in order_data):
-                                logger.debug(f"✓ Got status for {order_id}: {response}")
-                                _GLOBAL_RATE_LIMITER.report_success()
-                                _OPERATION_DEDUP.mark_complete(op_hash)
-                                return response
-                        elif "order" in response or "status" in response:
-                            logger.debug(f"✓ Got status for {order_id}")
-                            _GLOBAL_RATE_LIMITER.report_success()
-                            _OPERATION_DEDUP.mark_complete(op_hash)
-                            return response
-                    
-                    # Unexpected response
-                    logger.warning(f"[STATUS CHECK #{attempt}] Unexpected response structure: {response}")
-                    _GLOBAL_RATE_LIMITER.report_failure()
-                    backoff_time = 1.0 * attempt
-                    _GLOBAL_RATE_LIMITER.wait_with_jitter(backoff_time)
-                    
-                except Exception as exc:
-                    logger.warning(f"[STATUS CHECK #{attempt}] Exception: {exc}")
-                    _GLOBAL_RATE_LIMITER.report_failure()
-                    backoff_time = 1.0 * attempt
-                    _GLOBAL_RATE_LIMITER.wait_with_jitter(backoff_time)
-            
-            # Exhausted all retries
-            logger.error(
-                f"❌ get_order_status FAILED after {max_retries} retries: {order_id}\n"
-                f"Last response: {last_response}"
-            )
-            _OPERATION_DEDUP.mark_failed(op_hash)
-            return None
-            
-        except Exception as e:
-            logger.error(f"Fatal error in get_order_status: {e}", exc_info=True)
-            _OPERATION_DEDUP.mark_failed(op_hash)
-            return None
+                    # Other error - retry with backoff
+                    time.sleep(attempt * 1.0)
+                    continue
+                
+                # Check for valid response
+                if isinstance(response, dict) and "data" in response:
+                    logger.debug(f"✓ Got status for {order_id}")
+                    return response
+                
+                # Unexpected response
+                logger.warning(f"[STATUS CHECK #{attempt}] Unexpected response: {response}")
+                time.sleep(attempt * 1.0)
+                
+            except Exception as e:
+                logger.warning(f"[STATUS CHECK #{attempt}] Exception: {e}")
+                time.sleep(attempt * 1.0)
+        
+        # All retries failed
+        logger.error(f"❌ get_order_status FAILED after {max_retries} retries: {order_id}")
+        return None
     
     def get_order_status_safe(self, order_id: str) -> str:
         """
         SAFE wrapper that NEVER raises exceptions.
-        Returns normalized status string: FILLED, CANCELLED, UNKNOWN
+        Returns: FILLED, CANCELLED, or UNKNOWN
         """
         try:
             response = self.get_order_status(order_id)
             
             if response is None:
-                logger.debug(f"⚠️ Cannot determine status for {order_id} - treating as UNKNOWN")
                 return "UNKNOWN"
             
-            # Extract status from various response structures
-            order_data = response
-            if "data" in response:
-                order_data = response["data"]
-                if isinstance(order_data, dict) and "order" in order_data:
-                    order_data = order_data["order"]
-            elif "order" in response:
-                order_data = response["order"]
+            # Extract status
+            order_data = response.get("data", {})
+            if "order" in order_data:
+                order_data = order_data["order"]
             
             status = str(order_data.get("status", "UNKNOWN")).upper()
             
-            # Normalize status
+            # Normalize
             if status in ("EXECUTED", "FILLED", "PARTIALLY_FILLED", "PARTIALLY_EXECUTED"):
                 return "FILLED"
             elif status in ("CANCELLED", "REJECTED", "EXPIRED"):
@@ -491,12 +197,9 @@ class OrderManager:
             return "UNKNOWN"
     
     def wait_for_fill(self, order_id: str, timeout_sec: float = 30.0) -> Dict:
-        """
-        Wait for order to fill with timeout.
-        IMPROVED: Rate-limited polling with exponential backoff.
-        """
+        """Wait for order to fill with timeout."""
         start_time = time.time()
-        check_interval = 2.0  # Start with 2 second interval
+        check_interval = 3.0
         
         while time.time() - start_time < timeout_sec:
             try:
@@ -504,30 +207,24 @@ class OrderManager:
                 if status:
                     order_status = status.get("status", "").upper()
                     
-                    # Treat partial fills as complete
                     if order_status in ("EXECUTED", "FILLED", "PARTIALLY_FILLED", "PARTIALLY_EXECUTED"):
-                        logger.info(f"✓ Order filled: {order_id} (status: {order_status})")
+                        logger.info(f"✓ Order filled: {order_id}")
                         return status
                     elif order_status in ("CANCELLED", "REJECTED", "EXPIRED"):
                         raise Exception(f"Order {order_id} terminated: {order_status}")
                 
                 time.sleep(check_interval)
-                # Exponential backoff (2s -> 3s -> 4s)
-                check_interval = min(4.0, check_interval + 1.0)
             
             except Exception as e:
                 logger.debug(f"Error checking order status: {e}")
                 time.sleep(check_interval)
         
-        # Timeout - get final status
+        # Timeout
         final_status = self.get_order_status(order_id)
-        raise Exception(
-            f"Timed out waiting for fill on order {order_id}. "
-            f"Last status: {final_status}"
-        )
+        raise Exception(f"Timed out waiting for fill on order {order_id}")
     
     # ======================================================================
-    # ORDER PLACEMENT WITH DEDUPLICATION
+    # ORDER PLACEMENT
     # ======================================================================
     
     def place_market_order(
@@ -567,12 +264,10 @@ class OrderManager:
                 
                 self.order_history.append(self.active_orders[order_id].copy())
                 logger.info(f"✓ Order placed successfully: {order_id}")
-                logger.info(f"  Status: {order_details.get('status')}")
                 return order_details
             else:
                 error_msg = response.get("response", {}).get("message", "Unknown error")
                 logger.error(f"✗ Order placement failed: {error_msg}")
-                logger.error(f"  Full response: {response}")
                 return None
         
         except Exception as e:
@@ -592,9 +287,7 @@ class OrderManager:
                 logger.warning("Rate limit exceeded for orders; delaying by 2 seconds")
                 time.sleep(2)
             
-            logger.info(
-                f"Placing LIMIT {side} order: {quantity} {config.SYMBOL} @ ${price:,.2f}"
-            )
+            logger.info(f"Placing LIMIT {side} order: {quantity} {config.SYMBOL} @ ${price:,.2f}")
             
             response = self.api.place_order(
                 symbol=config.SYMBOL,
@@ -637,21 +330,7 @@ class OrderManager:
     def place_stop_loss(
         self, side: str, quantity: float, trigger_price: float
     ) -> Optional[Dict]:
-        """Place a stop loss order with deduplication."""
-        is_duplicate, op_hash = _OPERATION_DEDUP.check_and_register(
-            "place_stop_loss",
-            side=side,
-            quantity=quantity,
-            trigger_price=trigger_price,
-            symbol=config.SYMBOL
-        )
-        
-        if is_duplicate:
-            logger.warning(
-                f"🔄 Blocking duplicate SL order: {side} {quantity} @ {trigger_price}"
-            )
-            return None
-        
+        """Place a stop loss order."""
         try:
             logger.info(f"Placing STOP LOSS {side} @ ${trigger_price:,.2f}")
             
@@ -664,18 +343,6 @@ class OrderManager:
                 exchange=config.EXCHANGE,
                 reduce_only=True,
             )
-            
-            # Check for "already exists" error
-            if "error" in response or response.get("status_code") in (400, 500):
-                error_msg = str(response.get("response", {}).get("message", "")).lower()
-                if "already exists" in error_msg:
-                    logger.warning(f"ℹ️ SL order already exists (skipping duplicate)")
-                    _OPERATION_DEDUP.mark_complete(op_hash)
-                    return None
-                
-                logger.error(f"✗ Stop loss order failed: {response}")
-                _OPERATION_DEDUP.mark_failed(op_hash)
-                return None
             
             if "data" in response and "order_id" in response["data"]:
                 order_id = response["data"]["order_id"]
@@ -692,36 +359,19 @@ class OrderManager:
                     "timestamp": datetime.now().isoformat(),
                 }
                 
-                _OPERATION_DEDUP.mark_complete(op_hash)
                 return response["data"]
             else:
                 logger.error(f"✗ Stop loss order failed: {response}")
-                _OPERATION_DEDUP.mark_failed(op_hash)
                 return None
         
         except Exception as e:
             logger.error(f"Error placing stop loss: {e}")
-            _OPERATION_DEDUP.mark_failed(op_hash)
             return None
     
     def place_take_profit(
         self, side: str, quantity: float, trigger_price: float
     ) -> Optional[Dict]:
-        """Place a take profit order with deduplication."""
-        is_duplicate, op_hash = _OPERATION_DEDUP.check_and_register(
-            "place_take_profit",
-            side=side,
-            quantity=quantity,
-            trigger_price=trigger_price,
-            symbol=config.SYMBOL
-        )
-        
-        if is_duplicate:
-            logger.warning(
-                f"🔄 Blocking duplicate TP order: {side} {quantity} @ {trigger_price}"
-            )
-            return None
-        
+        """Place a take profit order."""
         try:
             logger.info(f"Placing TAKE PROFIT {side} @ ${trigger_price:,.2f}")
             
@@ -734,18 +384,6 @@ class OrderManager:
                 exchange=config.EXCHANGE,
                 reduce_only=True,
             )
-            
-            # Check for "already exists" error
-            if "error" in response or response.get("status_code") in (400, 500):
-                error_msg = str(response.get("response", {}).get("message", "")).lower()
-                if "already exists" in error_msg:
-                    logger.warning(f"ℹ️ TP order already exists (skipping duplicate)")
-                    _OPERATION_DEDUP.mark_complete(op_hash)
-                    return None
-                
-                logger.error(f"✗ Take profit order failed: {response}")
-                _OPERATION_DEDUP.mark_failed(op_hash)
-                return None
             
             if "data" in response and "order_id" in response["data"]:
                 order_id = response["data"]["order_id"]
@@ -762,16 +400,13 @@ class OrderManager:
                     "timestamp": datetime.now().isoformat(),
                 }
                 
-                _OPERATION_DEDUP.mark_complete(op_hash)
                 return response["data"]
             else:
                 logger.error(f"✗ Take profit order failed: {response}")
-                _OPERATION_DEDUP.mark_failed(op_hash)
                 return None
         
         except Exception as e:
             logger.error(f"Error placing take profit: {e}")
-            _OPERATION_DEDUP.mark_failed(op_hash)
             return None
     
     # ======================================================================
@@ -779,7 +414,7 @@ class OrderManager:
     # ======================================================================
     
     def cancel_order(self, order_id: str) -> bool:
-        """Cancel an order with better error handling."""
+        """Cancel an order."""
         try:
             logger.info(f"Cancelling order: {order_id}")
             
@@ -788,7 +423,6 @@ class OrderManager:
                 exchange=config.EXCHANGE,
             )
             
-            # Check if already cancelled
             if response.get("status_code") == 500:
                 error_msg = str(response.get("response", {}).get("message", "")).lower()
                 if "already" in error_msg and "cancelled" in error_msg:
@@ -852,10 +486,6 @@ class OrderManager:
             logger.error(f"Error getting open orders: {e}")
             return []
     
-    # ======================================================================
-    # STATS
-    # ======================================================================
-    
     def get_order_statistics(self) -> Dict:
         """Get order statistics."""
         total_orders = len(self.order_history)
@@ -885,5 +515,3 @@ if __name__ == "__main__":
     om = OrderManager()
     print("Order Manager initialized")
     print(f"Statistics: {om.get_order_statistics()}")
-    open_orders = om.get_open_orders()
-    print(f"Open orders: {len(open_orders)}")
