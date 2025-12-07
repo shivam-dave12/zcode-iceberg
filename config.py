@@ -35,8 +35,8 @@ WEEKEND_PARAMS = {
     "entry_score_threshold": 0.70,
     "wall_multiplier": 5.0,
     "min_signal_gap_sec": 180.0,  # 3 minutes
-    "tp_roi_target": 0.06,        # 6%
-    "sl_roi_max": 0.02,           # 2%
+    "tp_roi_target": 0.03,        # 6%
+    "sl_roi_max": 0.01,           # 2%
 }
 
 # Major Sessions (Standard)
