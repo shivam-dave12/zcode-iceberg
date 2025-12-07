@@ -1,6 +1,6 @@
 """
 CoinSwitch Futures Trading API Plugin
-CORRECTED: Proper signature generation matching official specification
+CORRECTED: Proper GET request handling + accurate rate limiting
 """
 
 import os
@@ -15,7 +15,6 @@ from dotenv import load_dotenv
 import logging
 
 load_dotenv()
-
 logger = logging.getLogger(__name__)
 
 class FuturesAPI:
@@ -41,32 +40,43 @@ class FuturesAPI:
         Generate ED25519 signature
         
         CRITICAL: Based on official documentation
-        - GET: signature = METHOD + ENDPOINT + JSON_PAYLOAD (even if empty {})
+        - GET with params: signature = METHOD + ENDPOINT_WITH_PARAMS + "{}"
         - POST/DELETE: signature = METHOD + ENDPOINT + JSON_PAYLOAD (sorted keys)
         
         Args:
             method: HTTP method
             endpoint: API endpoint
             params: Query parameters for GET
-            payload: Body payload
-            
+            payload: Body payload for POST/DELETE
+        
         Returns:
             Signature as hex string
         """
         params = params or {}
         payload = payload or {}
         
-        unquote_endpoint = endpoint
+        # Build endpoint with query params for GET
+        signature_endpoint = endpoint
+        if method == "GET" and params:
+            query_string = urlencode(params)
+            signature_endpoint = f"{endpoint}?{query_string}"
         
-        # Add query parameters to endpoint if GET
-        if method == "GET" and len(params) != 0:
-            endpoint += ('&', '?')[urlparse(endpoint).query == ''] + urlencode(params)
-            unquote_endpoint = urllib.parse.unquote_plus(endpoint)
+        # Unquote the endpoint (decode URL encoding)
+        unquoted_endpoint = urllib.parse.unquote_plus(signature_endpoint)
         
-        # CRITICAL: Always include JSON payload in signature (even empty {})
-        payload_json = json.dumps(payload, separators=(',', ':'), sort_keys=True)
-        signature_msg = method + unquote_endpoint + payload_json
+        # CRITICAL FIX: For GET requests, always use empty object {}
+        # For POST/DELETE, use actual payload
+        if method == "GET":
+            payload_json = "{}"
+        else:
+            payload_json = json.dumps(payload, separators=(',', ':'), sort_keys=True)
         
+        # Build signature message
+        signature_msg = method + unquoted_endpoint + payload_json
+        
+        logger.debug(f"Signature message: {signature_msg}")
+        
+        # Sign with ED25519
         request_string = bytes(signature_msg, 'utf-8')
         secret_key_bytes = bytes.fromhex(self.secret_key)
         secret_key_obj = ed25519.Ed25519PrivateKey.from_private_bytes(secret_key_bytes)
@@ -75,12 +85,17 @@ class FuturesAPI:
         return signature_bytes.hex()
     
     def _make_request(self, method: str, endpoint: str, params: Dict = None, payload: Dict = None) -> Dict:
-        """Make authenticated API request"""
+        """
+        Make authenticated API request
+        
+        CRITICAL FIX: GET requests should NOT send request body
+        """
         signature = self._generate_signature(method, endpoint, params, payload)
         
+        # Build URL with query params for GET
         url = self.base_url + endpoint
         if method == "GET" and params:
-            url += ('&', '?')[urlparse(endpoint).query == ''] + urlencode(params)
+            url = f"{url}?{urlencode(params)}"
         
         headers = {
             'Content-Type': 'application/json',
@@ -89,25 +104,35 @@ class FuturesAPI:
         }
         
         try:
-            response = requests.request(method, url, headers=headers, json=payload if payload else {})
+            # CRITICAL FIX: Don't send body for GET requests
+            if method == "GET":
+                response = requests.request(method, url, headers=headers)
+            else:
+                # For POST/DELETE, send payload as JSON body
+                response = requests.request(method, url, headers=headers, json=payload if payload else {})
+            
             response.raise_for_status()
             return response.json()
+        
         except requests.exceptions.RequestException as e:
             error_response = {
                 "error": str(e),
                 "status_code": getattr(e.response, 'status_code', None) if hasattr(e, 'response') else None,
             }
+            
             if hasattr(e, 'response') and e.response is not None:
                 try:
                     error_response['response'] = e.response.json()
                 except:
                     error_response['response'] = e.response.text
+            
+            logger.error(f"API request failed: {error_response}")
             return error_response
     
     # ============ ORDER MANAGEMENT ============
     
     def place_order(self, symbol: str, side: str, order_type: str, quantity: float,
-                   exchange: str = "EXCHANGE_2", price: float = None, 
+                   exchange: str = "EXCHANGE_2", price: float = None,
                    trigger_price: float = None, reduce_only: bool = False) -> Dict:
         """
         Place a futures order
@@ -121,11 +146,12 @@ class FuturesAPI:
             price: Limit price (required for LIMIT orders)
             trigger_price: Trigger price (for TAKE_PROFIT_MARKET/STOP_MARKET)
             reduce_only: Reduce only flag (for TP/SL orders)
-            
+        
         Returns:
             Order response with order_id
         """
         endpoint = "/trade/api/v2/futures/order"
+        
         payload = {
             "symbol": symbol,
             "exchange": exchange,
@@ -152,26 +178,37 @@ class FuturesAPI:
             exchange: Exchange identifier
         """
         endpoint = "/trade/api/v2/futures/order"
+        
         payload = {
             "order_id": order_id,
             "exchange": exchange
         }
+        
         return self._make_request("DELETE", endpoint, payload=payload)
-   
+    
     def get_order_status(self, order_id: str) -> Dict:
-        """CoinSwitch v2: GET /trade/api/v2/futures/order?order_id=xxx"""
+        """
+        Get order status
+        
+        CoinSwitch v2: GET /trade/api/v2/futures/order?order_id=xxx
+        Rate Limit: 20 requests per 60 seconds
+        
+        CRITICAL FIX: Use query params, NO payload
+        """
         try:
             params = {"order_id": order_id}
             endpoint = "/trade/api/v2/futures/order"
             
-            response = self._make_request("GET", endpoint, params=params)
+            # CRITICAL: Pass None for payload (not empty dict)
+            response = self._make_request("GET", endpoint, params=params, payload=None)
+            
             logger.debug(f"Order status response: {response}")
             return response
+        
         except Exception as e:
             logger.error(f"API get_order_status error: {e}")
             return {"error": str(e)}
-
-
+    
     def get_open_orders(self, exchange: str = "EXCHANGE_2", symbol: str = None,
                        limit: int = 50, from_time: int = None, to_time: int = None) -> Dict:
         """
@@ -185,8 +222,8 @@ class FuturesAPI:
             to_time: End time in milliseconds
         """
         endpoint = "/trade/api/v2/futures/orders/open"
-        payload = {"exchange": exchange}
         
+        payload = {"exchange": exchange}
         if symbol:
             payload["symbol"] = symbol
         if limit:
@@ -211,8 +248,8 @@ class FuturesAPI:
             to_time: End time in milliseconds
         """
         endpoint = "/trade/api/v2/futures/orders/closed"
-        payload = {"exchange": exchange}
         
+        payload = {"exchange": exchange}
         if symbol:
             payload["symbol"] = symbol
         if limit:
@@ -233,8 +270,8 @@ class FuturesAPI:
             symbol: Cancel orders for specific symbol (optional)
         """
         endpoint = "/trade/api/v2/futures/cancel_all"
-        payload = {"exchange": exchange}
         
+        payload = {"exchange": exchange}
         if symbol:
             payload["symbol"] = symbol
         
@@ -252,11 +289,13 @@ class FuturesAPI:
             exchange: Exchange identifier
         """
         endpoint = "/trade/api/v2/futures/leverage"
+        
         payload = {
             "symbol": symbol,
             "exchange": exchange,
             "leverage": leverage
         }
+        
         return self._make_request("POST", endpoint, payload=payload)
     
     def get_leverage(self, symbol: str, exchange: str = "EXCHANGE_2") -> Dict:
@@ -268,11 +307,13 @@ class FuturesAPI:
             exchange: Exchange identifier
         """
         endpoint = "/trade/api/v2/futures/leverage"
+        
         params = {
             "symbol": symbol,
             "exchange": exchange
         }
-        return self._make_request("GET", endpoint, params=params, payload={})
+        
+        return self._make_request("GET", endpoint, params=params, payload=None)
     
     def add_margin(self, symbol: str, margin: float, exchange: str = "EXCHANGE_2") -> Dict:
         """
@@ -284,11 +325,13 @@ class FuturesAPI:
             exchange: Exchange identifier
         """
         endpoint = "/trade/api/v2/futures/add_margin"
+        
         payload = {
             "exchange": exchange,
             "symbol": symbol,
             "margin": margin
         }
+        
         return self._make_request("POST", endpoint, payload=payload)
     
     # ============ POSITIONS & ACCOUNT ============
@@ -302,17 +345,17 @@ class FuturesAPI:
             symbol: Filter by symbol
         """
         endpoint = "/trade/api/v2/futures/positions"
-        params = {"exchange": exchange}
         
+        params = {"exchange": exchange}
         if symbol:
             params["symbol"] = symbol
         
-        return self._make_request("GET", endpoint, params=params, payload={})
+        return self._make_request("GET", endpoint, params=params, payload=None)
     
     def get_wallet_balance(self) -> Dict:
         """Get futures wallet balance"""
         endpoint = "/trade/api/v2/futures/wallet_balance"
-        return self._make_request("GET", endpoint, params={}, payload={})
+        return self._make_request("GET", endpoint, params={}, payload=None)
     
     def get_transactions(self, exchange: str = "EXCHANGE_2", symbol: str = None,
                         transaction_type: str = None, transaction_id: str = None) -> Dict:
@@ -326,8 +369,8 @@ class FuturesAPI:
             transaction_id: Specific transaction ID
         """
         endpoint = "/trade/api/v2/futures/transactions"
-        params = {"exchange": exchange}
         
+        params = {"exchange": exchange}
         if symbol:
             params["symbol"] = symbol
         if transaction_type:
@@ -335,7 +378,7 @@ class FuturesAPI:
         if transaction_id:
             params["transaction_id"] = transaction_id
         
-        return self._make_request("GET", endpoint, params=params, payload={})
+        return self._make_request("GET", endpoint, params=params, payload=None)
     
     def get_instrument_info(self, exchange: str = "EXCHANGE_2") -> Dict:
         """
@@ -345,111 +388,85 @@ class FuturesAPI:
             exchange: Exchange identifier
         """
         endpoint = "/trade/api/v2/futures/instrument_info"
+        
         params = {"exchange": exchange}
-        return self._make_request("GET", endpoint, params=params, payload={})
-
+        return self._make_request("GET", endpoint, params=params, payload=None)
+    
     # -------------------------
     # REST klines / candles API
     # -------------------------
+    
     def get_klines(self, symbol: str, interval: int = 1, limit: int = 100, exchange: str = "EXCHANGE_2") -> Dict:
         """
         Retrieve historical klines/candles for warmup.
-          - symbol: "BTCUSDT"
-          - interval: minutes (1,5,15,...)
-          - limit: number of bars
+        - symbol: "BTCUSDT"
+        - interval: minutes (1,5,15,...)
+        - limit: number of bars
+        
         Returns parsed JSON or error dict.
         """
-        # Best-effort endpoint name / params (adjust if your exchange uses different names)
         endpoint = "/trade/api/v2/futures/klines"
         params = {"symbol": symbol, "interval": interval, "limit": limit, "exchange": exchange}
+        
         try:
-            resp = self._make_request("GET", endpoint, params=params, payload={})
+            resp = self._make_request("GET", endpoint, params=params, payload=None)
             return resp
         except Exception as e:
             return {"error": str(e)}
-
-    # Alternate names some adapters use
-    def get_candles(self, symbol: str, interval: int = 1, limit: int = 100, exchange: str = "EXCHANGE_2") -> Dict:
-        return self.get_klines(symbol=symbol, interval=interval, limit=limit, exchange=exchange)
-
-    def fetch_klines(self, *args, **kwargs):
-        return self.get_klines(*args, **kwargs)
-
-
+    
     def get_balance(self, currency: str = "USDT") -> Dict:
         """
         Get futures wallet balance for a base asset (e.g. USDT).
-
-        Uses the actual CoinSwitch response structure observed in logs:
-        {
-          "data": {
-            "base_asset_balances": [
-              {
-                "base_asset": "USDT",
-                "balances": {
-                  "total_balance": "100.6873",
-                  "total_available_balance": "100.6873",
-                  "total_blocked_balance": "0",
-                  "total_position_margin": "0",
-                  "total_open_order_margin": "0"
-                }
-              },
-              ...
-            ],
-            "asset": [ ... per-symbol rows ... ]
-          }
-        }
         """
         result = {
             "available": 0.0,
             "locked": 0.0,
             "currency": currency,
         }
-
+        
         try:
             wallet = self.get_wallet_balance()
-
+            
             # Basic error pass-through
             if not isinstance(wallet, dict):
                 return {"error": "wallet response not dict", "raw_response": wallet, **result}
-
+            
             data = wallet.get("data")
             if not isinstance(data, dict):
                 return {"error": "wallet.data missing or not dict", "raw_response": wallet, **result}
-
+            
             base_list = data.get("base_asset_balances")
             if not isinstance(base_list, list):
                 return {"error": "wallet.data.base_asset_balances missing or not list", "raw_response": wallet, **result}
-
+            
             # Find the entry for the requested base asset (USDT)
             for entry in base_list:
                 if entry.get("base_asset") == currency:
                     balances = entry.get("balances", {})
                     total_avail_str = balances.get("total_available_balance", "0")
                     total_blocked_str = balances.get("total_blocked_balance", "0")
-
+                    
                     available = float(total_avail_str)
                     locked = float(total_blocked_str)
-
+                    
                     return {
                         "available": available,
                         "locked": locked,
                         "currency": currency,
                     }
-
+            
             # If we reach here, USDT was not found
             return {
                 "error": f"base_asset {currency} not found in base_asset_balances",
                 "raw_response": wallet,
                 **result,
             }
-
+        
         except Exception as e:
             return {
                 "error": f"Exception in get_balance: {e}",
                 **result,
             }
-
 
 
 if __name__ == "__main__":
@@ -460,11 +477,11 @@ if __name__ == "__main__":
         
         # Test getting positions
         positions = api.get_positions()
-        print(f"✓ Positions retrieved")
+        print(f"✓ Positions retrieved: {positions}")
         
         # Test getting wallet balance
         balance = api.get_wallet_balance()
         print(f"✓ Wallet balance retrieved")
-        
+    
     except Exception as e:
         print(f"✗ Error: {e}")

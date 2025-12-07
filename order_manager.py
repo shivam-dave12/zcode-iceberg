@@ -143,7 +143,7 @@ class AdaptiveRateLimiter:
         time.sleep(actual_wait)
 
 # Global rate limiter instance
-_GLOBAL_RATE_LIMITER = AdaptiveRateLimiter(base_interval=2.5, max_tokens=5)
+_GLOBAL_RATE_LIMITER = AdaptiveRateLimiter(base_interval=3.5, max_tokens=20)
 
 # ============================================================================
 # OPERATION DEDUPLICATOR (prevents duplicate simultaneous requests)
