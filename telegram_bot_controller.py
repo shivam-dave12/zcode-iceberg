@@ -81,12 +81,14 @@ class TelegramBotController:
         logger.info("=" * 80)
         
         self._send_message(
-            "🤖 Telegram Bot Controller Online\n\n"
-            "Available commands:\n"
-            "• START - Start trading bot\n"
-            "• STOP - Stop trading bot\n"
-            "• STATUS - Get current status"
+            "🤖 <b>BOT CONTROLLER ONLINE</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<b>Commands:</b>\n"
+            "  • START - Start trading\n"
+            "  • STOP - Stop trading\n"
+            "  • STATUS - Get stats"
         )
+
         
         self._stop_polling = False
         
@@ -169,11 +171,12 @@ class TelegramBotController:
                 self._handle_status_command()
             else:
                 self._send_message(
-                    f"❓ Unknown command: {text}\n\n"
-                    "Available commands:\n"
-                    "• START - Start trading bot\n"
-                    "• STOP - Stop trading bot\n"
-                    "• STATUS - Get current status"
+                    f"❌ <b>Unknown:</b> {text}\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "<b>Commands:</b>\n"
+                    "  • START\n"
+                    "  • STOP\n"
+                    "  • STATUS"
                 )
         except Exception as e:
             logger.error(f"Error processing update: {e}", exc_info=True)
@@ -182,10 +185,10 @@ class TelegramBotController:
         """Handle START command"""
         try:
             if self.bot_running:
-                self._send_message("✅ Trading bot is already running")
+                self._send_message("✅ <b>Already running</b>")
                 return
             
-            self._send_message("🚀 Starting trading bot...")
+            self._send_message("🚀 <b>Starting bot...</b>")
             logger.info("Starting trading bot from Telegram command...")
             
             # Start bot in separate thread
@@ -206,19 +209,24 @@ class TelegramBotController:
                 elapsed += check_interval
                 
                 if self.bot_running:
-                    self._send_message("✅ Trading bot started successfully")
+                            self._send_message(
+                                "✅ <b>BOT STARTED</b>\n"
+                                "━━━━━━━━━━━━━━━━━━━━\n"
+                                "Trading engine active"
+                            )
                     logger.info("Trading bot started successfully")
                     return
             
             # Timeout - but bot might still be starting
             if self.bot_thread.is_alive():
                 self._send_message(
-                    "⚠️ Bot is starting (taking longer than expected)...\n"
-                    "Send 'Status' in a few seconds to verify"
+                    "⚠️ <b>Starting...</b>\n"
+                    "Taking longer than expected.\n"
+                    "Send STATUS to verify."
                 )
                 logger.warning("Bot thread alive but bot_running flag not set yet")
             else:
-                self._send_message("❌ Failed to start trading bot - check logs")
+                self._send_message("❌ <b>Start failed</b> - check logs")
                 logger.error("Failed to start trading bot - thread not alive")
                 
         except Exception as e:
@@ -229,15 +237,19 @@ class TelegramBotController:
         """Handle STOP command"""
         try:
             if not self.bot_running:
-                self._send_message("⚠️ Trading bot is already stopped")
+                self._send_message("⚪ <b>Already stopped</b>")
                 return
             
-            self._send_message("🛑 Stopping trading bot...")
+            self._send_message("🛑 <b>Stopping bot...</b>")
             logger.info("Stopping trading bot from Telegram command...")
             
             self._stop_bot()
             
-            self._send_message("✅ Trading bot stopped successfully")
+            self._send_message(
+                "✅ <b>BOT STOPPED</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "Trading engine offline"
+            )
             logger.info("Trading bot stopped successfully")
             
         except Exception as e:
@@ -245,55 +257,81 @@ class TelegramBotController:
             self._send_message(f"❌ Error stopping bot: {e}")
     
     def _handle_status_command(self) -> None:
-        """Handle STATUS command"""
+        """Status report with formatted output."""
         try:
-            lines = ["📊 BOT STATUS REPORT", "=" * 40, ""]
+            from telegram_notifier import format_status_report
             
-            # Bot running state
-            if self.bot_running and self.bot_instance:
-                lines.append("✅ Status: RUNNING")
+            if not self.bot_running or not self.bot_instance:
+                msg = (
+                    "⚪ <b>BOT OFFLINE</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Time: {datetime.utcnow().strftime('%H:%M:%S UTC')}"
+                )
+                self._send_message(msg)
+                return
+            
+            # Get data from running bot
+            try:
+                last_price = self.bot_instance.data_manager.get_last_price()
+                balance_info = self.bot_instance.risk_manager.get_available_balance()
+                rm = self.bot_instance.risk_manager
+                pos = self.bot_instance.strategy.current_position
                 
-                try:
-                    # Get detailed status from running bot
-                    last_price = self.bot_instance.data_manager.get_last_price()
-                    if last_price > 0:
-                        lines.append(f"💹 Current Price: {last_price:.2f}")
+                # Calculate win rate
+                total = rm.total_trades
+                win_rate = (rm.winning_trades / total * 100.0) if total > 0 else 0.0
+                
+                # Position data
+                position_side = None
+                position_qty = None
+                position_entry = None
+                position_upnl = None
+                
+                if pos:
+                    position_side = pos.side
+                    position_qty = pos.quantity
+                    position_entry = pos.entry_price
                     
-                    balance_info = self.bot_instance.risk_manager.get_available_balance()
-                    if balance_info:
-                        lines.append(f"💰 Balance: {balance_info.get('available', 0.0):.2f} USDT")
-                    
-                    rm = self.bot_instance.risk_manager
-                    lines.append(f"📊 Total Trades: {rm.total_trades}")
-                    lines.append(f"📊 Win Rate: {(rm.winning_trades / rm.total_trades * 100.0) if rm.total_trades > 0 else 0:.2f}%")
-                    lines.append(f"📊 Daily P&L: {rm.daily_pnl:.2f} USDT")
-                    
-                    pos = self.bot_instance.strategy.current_position
-                    if pos:
-                        lines.append(f"📍 Position: {pos.side.upper()} {pos.quantity:.6f} BTC @ {pos.entry_price:.2f}")
-                    else:
-                        lines.append("📍 Position: None")
-                    
-                    stats = self.bot_instance.data_manager.stats
-                    last_update = stats.get('last_update')
-                    if last_update:
-                        idle_sec = (datetime.utcnow() - last_update).total_seconds()
-                        lines.append(f"🌐 WebSocket: {idle_sec:.1f}s ago")
-                    
-                except Exception as e:
-                    lines.append(f"⚠️ Error getting details: {e}")
-            else:
-                lines.append("⛔ Status: STOPPED")
-            
-            lines.append(f"⏰ Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
-            lines.append("=" * 40)
-            
-            self._send_message("\n".join(lines))
-            
+                    direction = 1.0 if pos.side == "long" else -1.0
+                    position_upnl = (last_price - pos.entry_price) * direction * pos.quantity
+                
+                msg = format_status_report(
+                    current_price=last_price,
+                    balance=balance_info.get('available', 0.0) if balance_info else 0.0,
+                    total_trades=total,
+                    win_rate=win_rate,
+                    daily_pnl=rm.daily_pnl,
+                    total_pnl=rm.realized_pnl,
+                    position_side=position_side,
+                    position_qty=position_qty,
+                    position_entry=position_entry,
+                    position_upnl=position_upnl,
+                )
+                
+                # Add WebSocket status
+                stats = self.bot_instance.data_manager.stats
+                last_update = stats.get('last_update')
+                if last_update:
+                    idle_sec = (datetime.utcnow() - last_update).total_seconds()
+                    ws_status = f"🟢 {idle_sec:.0f}s" if idle_sec < 10 else f"🟡 {idle_sec:.0f}s"
+                else:
+                    ws_status = "🔴 No data"
+                
+                msg += f"\n\n<b>WebSocket:</b> {ws_status}"
+                
+                self._send_message(msg)
+                
+            except Exception as e:
+                self._send_message(
+                    f"❌ <b>Error getting status</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"{str(e)[:200]}"
+                )
+                
         except Exception as e:
             logger.error(f"Error handling STATUS command: {e}", exc_info=True)
-            self._send_message(f"❌ Error getting status: {e}")
-    
+            self._send_message(f"❌ <b>Status failed:</b> {e}")
+
     def _run_bot(self) -> None:
         """Run the trading bot (called in separate thread)"""
         try:
@@ -333,11 +371,12 @@ class TelegramBotController:
             logger.error(f"Error stopping bot: {e}", exc_info=True)
     
     def _send_message(self, text: str) -> None:
-        """Send message to Telegram"""
+        """Send message to Telegram with HTML formatting."""
         try:
             data = parse.urlencode({
                 "chat_id": self._chat_id,
                 "text": text,
+                "parse_mode": "HTML",  # Enable HTML formatting
                 "disable_web_page_preview": "true",
             }).encode("utf-8")
             

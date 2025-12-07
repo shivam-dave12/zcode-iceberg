@@ -17,7 +17,6 @@ import threading
 from futures_api import FuturesAPI
 import config
 
-logging.basicConfig(level=config.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
 # ============================================================================
@@ -193,7 +192,6 @@ class OrderManager:
                 
                 if elapsed < _MIN_STATUS_CHECK_INTERVAL:
                     wait_time = _MIN_STATUS_CHECK_INTERVAL - elapsed
-                    logger.debug(f"[RATE LIMIT] Waiting {wait_time:.1f}s before status check")
                     time.sleep(wait_time)
                 
                 _LAST_STATUS_CHECK_TIME = time.time()
@@ -202,7 +200,6 @@ class OrderManager:
             # ACTUAL API CALL WITH ERROR HANDLING
             # ========================================
             try:
-                logger.debug(f"[STATUS CHECK #{attempt}] Order: {order_id}")
                 response = self.api.get_order_status(order_id)
                 last_response = response
                 
@@ -284,7 +281,7 @@ class OrderManager:
             return "UNKNOWN"
 
     # ======================================================================
-    # Order placement (unchanged)
+    # Order placement
     # ======================================================================
 
     def place_market_order(
@@ -472,7 +469,7 @@ class OrderManager:
             return None
 
     # ======================================================================
-    # Cancellation (unchanged)
+    # Cancellation
     # ======================================================================
 
     def cancel_order(self, order_id: str) -> bool:

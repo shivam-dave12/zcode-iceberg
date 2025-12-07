@@ -21,7 +21,16 @@ from scipy.stats import norm
 
 import config
 from zscore_excel_logger import ZScoreExcelLogger
-from telegram_notifier import send_telegram_message
+from telegram_notifier import (
+    send_telegram_message,
+    format_entry_message,
+    format_fill_message,
+    format_exit_message,
+    format_position_update,
+    format_tp_adjustment,
+    format_sl_adjustment,
+    format_order_status_unknown,
+)
 from aether_oracle import AetherOracle, OracleInputs, OracleOutputs
 
 logger = logging.getLogger(__name__)
@@ -790,18 +799,36 @@ class ZScoreIcebergHunterStrategy:
             
             self.pending_entry = False
             
-            msg = (
-                f"🎯 {side.upper()} BRACKET ({session})\n"
-                f"Limit Entry: {limit_entry_price:.2f} (current {current_price:.2f})\n"
-                f"Qty: {quantity:.6f}\n"
-                f"TP: {tp_price:.2f} ({tp_roi*100:.1f}%) | SL: {sl_price:.2f} ({sl_roi*100:.1f}%)\n"
-                f"Score: {entry_score:.3f} | Next entry: {session_params['min_signal_gap_sec']}s"
-            )
-            
+            # Send formatted Telegram notification
             try:
+                wall_strength = (
+                    wall_data["bid_wall_strength"] if side == "long" 
+                    else wall_data["ask_wall_strength"]
+                )
+                
+                msg = format_entry_message(
+                    trade_id=self.current_position.trade_id,
+                    side=side,
+                    entry_type="LIMIT",
+                    current_price=current_price,
+                    limit_price=limit_entry_price,
+                    quantity=quantity,
+                    margin=margin_used,
+                    leverage=config.LEVERAGE,
+                    tp_price=tp_price,
+                    tp_roi=tp_roi,
+                    sl_price=sl_price,
+                    sl_roi=sl_roi,
+                    session=session,
+                    entry_score=entry_score,
+                    imbalance=imbalance_data["imbalance"],
+                    z_score=delta_data["z_score"],
+                    wall_strength=wall_strength,
+                    cooldown_sec=session_params['min_signal_gap_sec'],
+                )
                 send_telegram_message(msg)
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"Error sending entry notification: {e}")
             
             logger.info(f"✓ Position bracket created: {self.current_position.trade_id}")
             logger.info(f"  Next entry allowed after {session_params['min_signal_gap_sec']}s cooldown")
@@ -823,13 +850,7 @@ class ZScoreIcebergHunterStrategy:
         now_sec: float
     ) -> None:
         """
-        PRODUCTION-SAFE position management with ROBUST partial fill handling:
-        
-        - Treats UNKNOWN status as "potentially filled" (KEEPS TP/SL)
-        - Treats partial fills as full fills (activates position management)
-        - 120s timeout with final 3-retry status check
-        - Never cancels TP/SL unless 100% certain order is cancelled
-        - Rate-limit safe (2s minimum between status checks)
+        PRODUCTION-SAFE position management with ROBUST partial fill handling.
         """
         pos = self.current_position
         if pos is None:
@@ -907,11 +928,19 @@ class ZScoreIcebergHunterStrategy:
                     pos.main_filled = True
                     pos.timeout_cancelled = False
                     
-                    msg = (
-                        f"⚡ {pos.side.upper()} FILLED (timeout edge-case)\n"
-                        f"Entry: {pos.entry_price:.2f}\nTP/SL ACTIVE"
-                    )
-                    send_telegram_message(msg)
+                    try:
+                        msg = format_fill_message(
+                            trade_id=pos.trade_id,
+                            side=pos.side,
+                            fill_price=pos.entry_price,
+                            quantity=pos.quantity,
+                            tp_price=pos.tp_price,
+                            sl_price=pos.sl_price,
+                        )
+                        send_telegram_message(msg)
+                    except Exception as e:
+                        logger.error(f"Error sending fill notification: {e}")
+                    
                     return  # Proceed to Phase 2 next tick
                 
                 elif final_status_normalized == "UNKNOWN":
@@ -924,13 +953,17 @@ class ZScoreIcebergHunterStrategy:
                     pos.timeout_cancelled = False
                     pos.entry_price = current_price  # Use current price as estimate
                     
-                    msg = (
-                        f"⚠️ {pos.side.upper()} STATUS UNKNOWN\n"
-                        f"API failed to confirm status after timeout.\n"
-                        f"TP/SL PROTECTED (assuming filled @ {pos.entry_price:.2f})\n"
-                        f"⚠️ MANUAL VERIFICATION RECOMMENDED"
-                    )
-                    send_telegram_message(msg)
+                    try:
+                        msg = format_order_status_unknown(
+                            trade_id=pos.trade_id,
+                            side=pos.side,
+                            order_id=pos.main_order_id,
+                            assumed_price=pos.entry_price,
+                        )
+                        send_telegram_message(msg)
+                    except Exception as e:
+                        logger.error(f"Error sending unknown status notification: {e}")
+                    
                     return  # Proceed to Phase 2 (keep TP/SL)
                 
                 elif final_status_normalized == "CANCELLED":
@@ -942,9 +975,11 @@ class ZScoreIcebergHunterStrategy:
                         order_manager.cancel_order(pos.sl_order_id)
                         
                         msg = (
-                            f"⏱️ TIMEOUT {pos.side.upper()}\n"
-                            f"Limit: {pos.entry_price:.2f} → {elapsed_since_place:.1f}s\n"
-                            f"Order cancelled - no fill"
+                            f"⏱️ <b>TIMEOUT</b> #{pos.trade_id}\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"  {pos.side.upper()} @ ${pos.entry_price:.2f}\n"
+                            f"  No fill after {elapsed_since_place:.0f}s\n"
+                            f"  Bracket cancelled"
                         )
                         send_telegram_message(msg)
                     except Exception as e:
@@ -963,7 +998,7 @@ class ZScoreIcebergHunterStrategy:
                     return
 
             # ========================================
-            # EARLY FILL DETECTION (1Hz rate-limited)
+            # EARLY FILL DETECTION (2s rate-limited)
             # ========================================
             if not hasattr(pos, "_last_early_check_time"):
                 pos._last_early_check_time = 0.0
@@ -986,6 +1021,19 @@ class ZScoreIcebergHunterStrategy:
                     
                     pos.main_filled = True
                     logger.info(f"Position activated @ {pos.entry_price:.2f}")
+                    
+                    try:
+                        msg = format_fill_message(
+                            trade_id=pos.trade_id,
+                            side=pos.side,
+                            fill_price=pos.entry_price,
+                            quantity=pos.quantity,
+                            tp_price=pos.tp_price,
+                            sl_price=pos.sl_price,
+                        )
+                        send_telegram_message(msg)
+                    except Exception as e:
+                        logger.error(f"Error sending fill notification: {e}")
 
             return  # Continue waiting for fill...
 
@@ -1493,6 +1541,8 @@ class ZScoreIcebergHunterStrategy:
         price_movement = pos.entry_price * half_tp_roi
         new_sl_price = pos.entry_price + (price_movement * direction)
 
+        old_sl = pos.sl_price
+
         order_manager.cancel_order(pos.sl_order_id)
         tp_side = "SELL" if pos.side == "long" else "BUY"
 
@@ -1507,12 +1557,26 @@ class ZScoreIcebergHunterStrategy:
             pos.sl_price = new_sl_price
             pos.tp_reduced = True
             logger.info(f"✓ Moved SL to half TP: {new_sl_price:.2f}")
-
+            
+            try:
+                msg = format_sl_adjustment(
+                    trade_id=pos.trade_id,
+                    old_sl=old_sl,
+                    new_sl=new_sl_price,
+                    reason="Half TP reached - securing profits",
+                )
+                send_telegram_message(msg)
+            except Exception as e:
+                logger.error(f"Error sending SL adjustment notification: {e}")
+                
     def _adjust_tp_order(self, order_manager, current_price: float, new_tp_roi: float) -> None:
         """Adjust TP order to new ROI."""
         pos = self.current_position
         if pos is None:
             return
+
+        old_tp_price = pos.tp_price
+        old_tp_roi = pos.tp_roi
 
         direction = 1.0 if pos.side == "long" else -1.0
         price_movement = pos.entry_price * new_tp_roi
@@ -1532,6 +1596,27 @@ class ZScoreIcebergHunterStrategy:
             pos.tp_price = new_tp_price
             pos.tp_roi = new_tp_roi
             logger.info(f"✓ Adjusted TP to: {new_tp_price:.2f} ({new_tp_roi*100:.2f}%)")
+            
+            try:
+                # Determine reason based on adjustment count
+                if pos.tp_adjustment_count == 0:
+                    reason = "T+10min adjustment"
+                elif pos.tp_adjustment_count == 1:
+                    reason = "T+15min tightening"
+                else:
+                    reason = "Dynamic adjustment"
+                
+                msg = format_tp_adjustment(
+                    trade_id=pos.trade_id,
+                    old_tp=old_tp_price,
+                    new_tp=new_tp_price,
+                    old_roi=old_tp_roi,
+                    new_roi=new_tp_roi,
+                    reason=reason,
+                )
+                send_telegram_message(msg)
+            except Exception as e:
+                logger.error(f"Error sending TP adjustment notification: {e}")                
 
     def _check_bracket_exits(
         self,
@@ -1602,18 +1687,23 @@ class ZScoreIcebergHunterStrategy:
         logger.info(f"  Hold Time: {(now_sec - pos.entry_time_sec)/60.0:.1f} min")
         logger.info("=" * 100 + "\n")
 
-        msg = (
-            f"🛑 EXIT {pos.side.upper()} | {reason}\n"
-            f"Session: {pos.entry_session}\n"
-            f"Entry: {pos.entry_price:.2f} → Exit: {exit_price:.2f}\n"
-            f"P&L: {pnl:.2f} USDT ({roi*100:.2f}%)\n"
-            f"Hold: {(now_sec - pos.entry_time_sec)/60.0:.1f}min"
-        )
-
         try:
+            msg = format_exit_message(
+                trade_id=pos.trade_id,
+                side=pos.side,
+                entry_price=pos.entry_price,
+                exit_price=exit_price,
+                quantity=pos.quantity,
+                margin=pos.margin_used,
+                pnl=pnl,
+                roi=roi,
+                hold_min=(now_sec - pos.entry_time_sec) / 60.0,
+                exit_reason=reason,
+                session=pos.entry_session,
+            )
             send_telegram_message(msg)
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Error sending exit notification: {e}")
 
         # Log to Excel if available
         if self.excel_logger:

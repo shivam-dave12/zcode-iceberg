@@ -290,37 +290,48 @@ class ZScoreIcebergBot:
         self._last_report_sec = now
         
         try:
+            from telegram_notifier import format_status_report
+            
             last_price = self.data_manager.get_last_price()
             balance_info = self.risk_manager.get_available_balance()
             pos = self.strategy.current_position
+            rm = self.risk_manager
             
-            lines = [
-                "📊 Z-Score Bot Report",
-                datetime.utcnow().strftime("%H:%M:%S UTC"),
-                "",
-            ]
+            # Calculate win rate
+            total = rm.total_trades
+            win_rate = (rm.winning_trades / total * 100.0) if total > 0 else 0.0
             
-            if last_price > 0:
-                lines.append(f"Price: {last_price:.2f}")
-            
-            if balance_info:
-                lines.append(f"Balance: {balance_info.get('available', 0.0):.2f} USDT")
+            # Position data
+            position_side = None
+            position_qty = None
+            position_entry = None
+            position_upnl = None
             
             if pos:
-                dur_min = (now - pos.entry_time_sec) / 60.0
+                position_side = pos.side
+                position_qty = pos.quantity
+                position_entry = pos.entry_price
+                
                 direction = 1.0 if pos.side == "long" else -1.0
-                upnl = (last_price - pos.entry_price) * direction * pos.quantity
-                lines.append(
-                    f"Position: {pos.side.upper()} {pos.quantity:.3f} @ {pos.entry_price:.2f}\n"
-                    f"uPnL: {upnl:.2f} ({upnl/pos.margin_used*100:.1f}%) | {dur_min:.1f}min"
-                )
+                position_upnl = (last_price - pos.entry_price) * direction * pos.quantity
             
-            lines.append(f"\nTotal Trades: {self.risk_manager.total_trades}")
-            lines.append(f"Total P&L: {self.risk_manager.realized_pnl:.2f} USDT")
+            msg = format_status_report(
+                current_price=last_price,
+                balance=balance_info.get('available', 0.0) if balance_info else 0.0,
+                total_trades=total,
+                win_rate=win_rate,
+                daily_pnl=rm.daily_pnl,
+                total_pnl=rm.realized_pnl,
+                position_side=position_side,
+                position_qty=position_qty,
+                position_entry=position_entry,
+                position_upnl=position_upnl,
+            )
             
-            send_telegram_message("\n".join(lines))
-        except Exception:
-            logger.exception("Failed to send Telegram report")
+            send_telegram_message(msg)
+            
+        except Exception as e:
+            logger.error(f"Failed to send Telegram report: {e}")
 
 
 if __name__ == "__main__":
