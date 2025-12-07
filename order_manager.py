@@ -457,6 +457,27 @@ class OrderManager:
             "last_order_time": self.last_order_time,
         }
 
+    def get_order_status_safe(self, order_id: str) -> str:
+        """
+        Safe wrapper for get_order_status that never raises exceptions.
+        Returns: "FILLED", "CANCELLED", or "UNKNOWN"
+        """
+        try:
+            response = self.get_order_status(order_id)
+            if response is None:
+                return "UNKNOWN"
+            
+            status = str(response.get("status", "UNKNOWN")).upper()
+            
+            if status in ("EXECUTED", "FILLED", "PARTIALLY_FILLED", "PARTIALLY_EXECUTED"):
+                return "FILLED"
+            elif status in ("CANCELLED", "REJECTED", "EXPIRED"):
+                return "CANCELLED"
+            else:
+                return "UNKNOWN"
+        except Exception:
+            return "UNKNOWN"
+
 
 if __name__ == "__main__":
     om = OrderManager()
