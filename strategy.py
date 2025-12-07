@@ -149,7 +149,7 @@ class ZScoreIcebergHunterStrategy:
         elif in_asia:
             return "ASIA", True
         else:
-            return "OFF_SESSION", False  # FIXED: Explicit fallback instead of "UNKNOWN"
+            return "OFF_SESSION", False
 
     def _get_session_parameters(self, session: str, is_major_session: bool) -> Dict:
         """
@@ -171,7 +171,9 @@ class ZScoreIcebergHunterStrategy:
             session_type = "OFF-PEAK (Conservative)"
         
         logger.debug(f"Session: {session_type} | Params: {params}")
-        return params   
+        return params
+
+    # ... (rest of the methods remain unchanged until _exit_position)
 
     def _exit_position(
         self,
@@ -404,48 +406,67 @@ class ZScoreIcebergHunterStrategy:
     # TP/SL CALCULATION WITH SESSION PARAMETERS
     # ======================================================================
 
-    def _calculate_tp_sl_prices(self, entry_price: float, side: str, margin_used: float, quantity: float, session: str) -> Tuple[float, float, float, float]:
-            """
-            FIXED: Fetch fresh session for TP/SL calc to avoid stale "UNKNOWN"
-            """
-            # FIXED: Fresh fetch here if session is invalid
-            if session == "UNKNOWN":
-                session, is_major = self._get_current_session()
-                logger.warning(f"Stale session 'UNKNOWN' detected - refreshed to '{session}'")
+    def _calculate_tp_sl_prices(
+        self,
+        entry_price: float,
+        margin_used: float,
+        quantity: float,
+        side: str,
+        session_params: Dict,
+    ) -> Tuple[float, float, float, float]:
+        """
+        Calculate TP/SL using SESSION-BASED ROI targets.
+        Returns: (tp_price, sl_price, tp_roi, sl_roi)
+        """
+        try:
+            # Use session-specific TP/SL targets
+            tp_roi_target = session_params["tp_roi_target"]
+            sl_roi_max = session_params["sl_roi_max"]
             
-            session_params = self._get_session_parameters(session, is_major_session=False)  # is_major not used here, but consistent
-            tp_roi = session_params["tp_roi_target"]
-            sl_roi = session_params["sl_roi_max"]
-            
-            logger.info(f"[TP/SL CALCULATION] Using session-based parameters")
-            logger.info(f"Session: {session}")
-            logger.info(f"Entry Price: {entry_price:.2f}")
-            logger.info(f"Margin Used: {margin_used:.2f} USDT")
-            logger.info(f"Quantity: {quantity:.6f} BTC")
-            logger.info(f"Side: {side.upper()}")
-            logger.info(f"Desired TP ROI: {tp_roi*100:.2f}%")
-            logger.info(f"Desired SL ROI: {sl_roi*100:.2f}%")
-            
-            # Price movement needed for ROI (leverage-adjusted)
-            tp_movement = (margin_used * tp_roi) / (quantity * config.LEVERAGE)
-            sl_movement = (margin_used * sl_roi) / (quantity * config.LEVERAGE)
-            
-            logger.info(f"TP Price Movement: {tp_movement:.2f} USDT")
-            logger.info(f"SL Price Movement: {sl_movement:.2f} USDT")
-            
-            if side == "long":
-                tp_price = entry_price + tp_movement
-                sl_price = entry_price - sl_movement
-            else:  # short
-                tp_price = entry_price - tp_movement
-                sl_price = entry_price + sl_movement
-            
-            logger.info(f"✓ TP Price: {tp_price:.2f}")
-            logger.info(f"✓ SL Price: {sl_price:.2f}")
             logger.info("=" * 80)
-            
-            return tp_price, sl_price, tp_roi, sl_roi
-            
+            logger.info("[TP/SL CALCULATION] Using session-based parameters")
+            logger.info(f"  Session: {session_params.get('session_name', 'UNKNOWN')}")
+            logger.info(f"  Entry Price: {entry_price:.2f}")
+            logger.info(f"  Margin Used: {margin_used:.2f} USDT")
+            logger.info(f"  Quantity: {quantity:.6f} BTC")
+            logger.info(f"  Side: {side.upper()}")
+            logger.info(f"  Desired TP ROI: {tp_roi_target*100:.2f}%")
+            logger.info(f"  Desired SL ROI: {sl_roi_max*100:.2f}%")
+
+            if entry_price <= 0 or margin_used <= 0 or quantity <= 0:
+                raise ValueError("Invalid input: prices/margin/quantity must be positive")
+
+            # Calculate price movements
+            tp_price_movement = (margin_used * tp_roi_target) / quantity
+            sl_price_movement = (margin_used * sl_roi_max) / quantity
+
+            logger.info(f"  TP Price Movement: {tp_price_movement:.2f} USDT")
+            logger.info(f"  SL Price Movement: {sl_price_movement:.2f} USDT")
+
+            if side == "long":
+                tp_price = entry_price + tp_price_movement
+                sl_price = entry_price - sl_price_movement
+            else:
+                tp_price = entry_price - tp_price_movement
+                sl_price = entry_price + sl_price_movement
+
+            if tp_price <= 0 or sl_price <= 0:
+                raise ValueError("Invalid TP/SL: prices must be positive")
+
+            logger.info(f"  ✓ TP Price: {tp_price:.2f}")
+            logger.info(f"  ✓ SL Price: {sl_price:.2f}")
+            logger.info("=" * 80)
+
+            return tp_price, sl_price, tp_roi_target, sl_roi_max
+
+        except Exception as e:
+            logger.error(f"Error calculating TP/SL: {e}")
+            # Fallback to safe defaults
+            if side == "long":
+                return entry_price * 1.01, entry_price * 0.99, 0.01, 0.01
+            else:
+                return entry_price * 0.99, entry_price * 1.01, 0.01, 0.01
+
     # ======================================================================
     # MAIN TICK HANDLER
     # ======================================================================
