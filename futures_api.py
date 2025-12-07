@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Any
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from urllib.parse import urlparse, urlencode
 from dotenv import load_dotenv
+import logging
 
 load_dotenv()
 
