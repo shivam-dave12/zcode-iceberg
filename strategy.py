@@ -176,130 +176,6 @@ class ZScoreIcebergHunterStrategy:
         logger.debug(f"Session: {session_type} | Params: {params}")
         return params
 
-    def _exit_position(
-        self,
-        order_manager,
-        risk_manager,
-        exit_price: float,
-        reason: str,
-        now_sec: float,
-    ) -> None:
-        """Exit position and cleanup - FIXED: Skip manual cancels on TP/SL hit; check position before market close."""
-        pos = self.current_position
-        if pos is None:
-            return
-
-        # FIXED: Check TP/SL status before attempting cancel - exchange auto-cancels on trigger
-        tp_status = order_manager.get_order_status_safe(pos.tp_order_id)
-        sl_status = order_manager.get_order_status_safe(pos.sl_order_id)
-        
-        if tp_status != "EXECUTED" and tp_status != "FILLED":
-            order_manager.cancel_order(pos.tp_order_id)
-        else:
-            logger.info(f"TP order {pos.tp_order_id} already EXECUTED/FILLED - skipping cancel")
-        
-        if sl_status != "EXECUTED" and sl_status != "FILLED":
-            order_manager.cancel_order(pos.sl_order_id)
-        else:
-            logger.info(f"SL order {pos.sl_order_id} already EXECUTED/FILLED - skipping cancel")
-
-        # FIXED: Check if position still open before market close (e.g., SL may have auto-closed)
-        positions_resp = order_manager.api.get_positions(symbol=config.SYMBOL, exchange=config.EXCHANGE)
-        position_open = False
-        if positions_resp and not positions_resp.get("error"):
-            data = positions_resp.get("data", [])
-            if isinstance(data, list):
-                for p in data:
-                    if p.get("symbol") == config.SYMBOL:
-                        qty = float(p.get("quantity", 0))
-                        if abs(qty) > 0:
-                            position_open = True
-                            break
-        
-        if position_open:
-            logger.info("Position still open - placing market close order")
-            exit_side = "SELL" if pos.side == "long" else "BUY"
-            exit_order = order_manager.place_market_order(
-                side=exit_side,
-                quantity=pos.quantity,
-                reduce_only=True,
-            )
-
-            if exit_order:
-                try:
-                    filled = order_manager.wait_for_fill(exit_order.get("order_id", ""), timeout_sec=3.0)
-                    exit_price = order_manager.extract_fill_price(filled)
-                except Exception as e:
-                    logger.warning(f"Market close failed: {e} - using provided exit_price")
-        else:
-            logger.info("Position already closed (e.g., by SL) - skipping market order")
-
-        direction = 1.0 if pos.side == "long" else -1.0
-        pnl = (exit_price - pos.entry_price) * direction * pos.quantity
-        roi = pnl / pos.margin_used if pos.margin_used > 0 else 0.0
-
-        risk_manager.update_trade_stats(pnl)
-
-        logger.info("\n" + "=" * 100)
-        logger.info(f"[POSITION CLOSED] {pos.trade_id} | {reason}")
-        logger.info("=" * 100)
-        logger.info(f"  Side: {pos.side.upper()}")
-        logger.info(f"  Entry Session: {pos.entry_session}")
-        logger.info(f"  Entry: {pos.entry_price:.2f} | Exit: {exit_price:.2f}")
-        logger.info(f"  Quantity: {pos.quantity:.6f} BTC")
-        logger.info(f"  P&L: {pnl:.2f} USDT ({roi*100:.2f}%)")
-        logger.info(f"  Hold Time: {(now_sec - pos.entry_time_sec)/60.0:.1f} min")
-        logger.info("=" * 100 + "\n")
-
-        try:
-            msg = format_exit_message(
-                trade_id=pos.trade_id,
-                side=pos.side,
-                entry_price=pos.entry_price,
-                exit_price=exit_price,
-                quantity=pos.quantity,
-                margin=pos.margin_used,
-                pnl=pnl,
-                roi=roi,
-                hold_min=(now_sec - pos.entry_time_sec) / 60.0,
-                exit_reason=reason,
-                session=pos.entry_session,
-            )
-            send_telegram_message(msg)
-        except Exception as e:
-            logger.error(f"Error sending exit notification: {e}")
-
-        # Log to Excel if available
-        if self.excel_logger:
-            try:
-                self.excel_logger.log_trade(
-                    trade_id=pos.trade_id,
-                    entry_time=datetime.fromtimestamp(pos.entry_time_sec).strftime("%Y-%m-%d %H:%M:%S"),
-                    exit_time=datetime.fromtimestamp(now_sec).strftime("%Y-%m-%d %H:%M:%S"),
-                    duration_minutes=(now_sec - pos.entry_time_sec) / 60.0,
-                    side=pos.side,
-                    entry_price=pos.entry_price,
-                    exit_price=exit_price,
-                    quantity=pos.quantity,
-                    margin_used=pos.margin_used,
-                    leverage=config.LEVERAGE,
-                    tp_price=pos.tp_price,
-                    sl_price=pos.sl_price,
-                    entry_imbalance=pos.entry_imbalance,
-                    entry_z_score=pos.entry_z_score,
-                    entry_wall_volume=pos.entry_wall_volume,
-                    exit_reason=reason,
-                    pnl_usdt=pnl,
-                    entry_htf_trend=pos.entry_htf_trend,
-                )
-            except Exception as e:
-                logger.error(f"Error logging to Excel: {e}")
-
-        self.last_exit_time_min = now_sec / 60.0
-        self.current_position = None
-        self.pending_entry = False
-
-
     def _determine_volatility_with_gates(
         self, 
         data_manager, 
@@ -1771,48 +1647,86 @@ class ZScoreIcebergHunterStrategy:
             self._exit_position(order_manager, risk_manager, current_price, "SL_HIT", now_sec)
 
     def _exit_position(
-            self,
-            order_manager,
-            risk_manager,
-            exit_price: float,
-            reason: str,
-            now_sec: float,
-        ) -> None:
-            """Exit position and cleanup - FIXED: Skip manual cancels on TP/SL hit; check position before market close."""
-            pos = self.current_position
-            if pos is None:
-                return
+        self,
+        order_manager,
+        risk_manager,
+        exit_price: float,
+        reason: str,
+        now_sec: float,
+    ) -> None:
+        """
+        Exit position with SMART TP/SL cleanup.
+        
+        KEY FIX: Exchange auto-cancels TP/SL when triggered.
+        Only cancel if we're SURE they're still active.
+        """
+        pos = self.current_position
+        if pos is None:
+            return
 
-            # FIXED: Check TP/SL status before attempting cancel - exchange auto-cancels on trigger
-            tp_status = order_manager.get_order_status_safe(pos.tp_order_id)
-            sl_status = order_manager.get_order_status_safe(pos.sl_order_id)
-            
-            if tp_status != "EXECUTED" and tp_status != "FILLED":
-                order_manager.cancel_order(pos.tp_order_id)
-            else:
-                logger.info(f"TP order {pos.tp_order_id} already EXECUTED/FILLED - skipping cancel")
-            
-            if sl_status != "EXECUTED" and sl_status != "FILLED":
+        # ========================================
+        # SMART TP/SL CLEANUP LOGIC
+        # ========================================
+        
+        # If exit reason is TP_HIT or SL_HIT, the triggered order is already cancelled by exchange
+        # We should ONLY try to cancel the OTHER order
+        if reason == "TP_HIT":
+            logger.info("TP triggered - TP auto-cancelled by exchange, cancelling SL only")
+            try:
                 order_manager.cancel_order(pos.sl_order_id)
-            else:
-                logger.info(f"SL order {pos.sl_order_id} already EXECUTED/FILLED - skipping cancel")
-
-            # FIXED: Check if position still open before market close (e.g., SL may have auto-closed)
-            positions_resp = order_manager.api.get_positions(symbol=config.SYMBOL, exchange=config.EXCHANGE)
-            position_open = False
-            if positions_resp and not positions_resp.get("error"):
-                data = positions_resp.get("data", [])
-                if isinstance(data, list):
-                    for p in data:
-                        if p.get("symbol") == config.SYMBOL:
-                            qty = float(p.get("quantity", 0))
-                            if abs(qty) > 0:
-                                position_open = True
-                                break
+            except Exception as e:
+                logger.debug(f"SL cancel failed (may already be cancelled): {e}")
+        
+        elif reason == "SL_HIT":
+            logger.info("SL triggered - SL auto-cancelled by exchange, cancelling TP only")
+            try:
+                order_manager.cancel_order(pos.tp_order_id)
+            except Exception as e:
+                logger.debug(f"TP cancel failed (may already be cancelled): {e}")
+        
+        else:
+            # Manual exit (timeout, market condition, etc.) - cancel both
+            logger.info(f"Manual exit ({reason}) - cancelling both TP and SL")
             
-            if position_open:
-                logger.info("Position still open - placing market close order")
-                exit_side = "SELL" if pos.side == "long" else "BUY"
+            # Try TP cancellation (ignore errors - may already be triggered/cancelled)
+            try:
+                order_manager.cancel_order(pos.tp_order_id)
+            except Exception as e:
+                logger.debug(f"TP cancel failed: {e}")
+            
+            # Try SL cancellation (ignore errors - may already be triggered/cancelled)  
+            try:
+                order_manager.cancel_order(pos.sl_order_id)
+            except Exception as e:
+                logger.debug(f"SL cancel failed: {e}")
+
+        # ========================================
+        # CHECK IF POSITION STILL OPEN
+        # ========================================
+        positions_resp = order_manager.api.get_positions(
+            symbol=config.SYMBOL, 
+            exchange=config.EXCHANGE
+        )
+        
+        position_open = False
+        if positions_resp and not positions_resp.get("error"):
+            data = positions_resp.get("data", [])
+            if isinstance(data, list):
+                for p in data:
+                    if p.get("symbol") == config.SYMBOL:
+                        qty = float(p.get("quantity", 0))
+                        if abs(qty) > 0:
+                            position_open = True
+                            break
+        
+        # ========================================
+        # MARKET CLOSE IF NEEDED
+        # ========================================
+        if position_open:
+            logger.info("Position still open - placing market close order")
+            exit_side = "SELL" if pos.side == "long" else "BUY"
+            
+            try:
                 exit_order = order_manager.place_market_order(
                     side=exit_side,
                     quantity=pos.quantity,
@@ -1821,78 +1735,89 @@ class ZScoreIcebergHunterStrategy:
 
                 if exit_order:
                     try:
-                        filled = order_manager.wait_for_fill(exit_order.get("order_id", ""), timeout_sec=3.0)
+                        filled = order_manager.wait_for_fill(
+                            exit_order.get("order_id", ""), 
+                            timeout_sec=3.0
+                        )
                         exit_price = order_manager.extract_fill_price(filled)
                     except Exception as e:
-                        logger.warning(f"Market close failed: {e} - using provided exit_price")
-            else:
-                logger.info("Position already closed (e.g., by SL) - skipping market order")
+                        logger.warning(f"Market close fill check failed: {e}")
+            except Exception as e:
+                logger.error(f"Market close failed: {e}")
+        else:
+            logger.info("Position already closed (TP/SL triggered) - no market order needed")
 
-            direction = 1.0 if pos.side == "long" else -1.0
-            pnl = (exit_price - pos.entry_price) * direction * pos.quantity
-            roi = pnl / pos.margin_used if pos.margin_used > 0 else 0.0
+        # ========================================
+        # P&L CALCULATION & LOGGING
+        # ========================================
+        direction = 1.0 if pos.side == "long" else -1.0
+        pnl = (exit_price - pos.entry_price) * direction * pos.quantity
+        roi = pnl / pos.margin_used if pos.margin_used > 0 else 0.0
 
-            risk_manager.update_trade_stats(pnl)
+        risk_manager.update_trade_stats(pnl)
 
-            logger.info("\n" + "=" * 100)
-            logger.info(f"[POSITION CLOSED] {pos.trade_id} | {reason}")
-            logger.info("=" * 100)
-            logger.info(f"  Side: {pos.side.upper()}")
-            logger.info(f"  Entry Session: {pos.entry_session}")
-            logger.info(f"  Entry: {pos.entry_price:.2f} | Exit: {exit_price:.2f}")
-            logger.info(f"  Quantity: {pos.quantity:.6f} BTC")
-            logger.info(f"  P&L: {pnl:.2f} USDT ({roi*100:.2f}%)")
-            logger.info(f"  Hold Time: {(now_sec - pos.entry_time_sec)/60.0:.1f} min")
-            logger.info("=" * 100 + "\n")
+        logger.info("\n" + "=" * 100)
+        logger.info(f"[POSITION CLOSED] {pos.trade_id} | {reason}")
+        logger.info("=" * 100)
+        logger.info(f"  Side: {pos.side.upper()}")
+        logger.info(f"  Entry Session: {pos.entry_session}")
+        logger.info(f"  Entry: {pos.entry_price:.2f} | Exit: {exit_price:.2f}")
+        logger.info(f"  Quantity: {pos.quantity:.6f} BTC")
+        logger.info(f"  P&L: {pnl:.2f} USDT ({roi*100:.2f}%)")
+        logger.info(f"  Hold Time: {(now_sec - pos.entry_time_sec)/60.0:.1f} min")
+        logger.info("=" * 100 + "\n")
 
+        # Telegram notification
+        try:
+            from telegram_notifier import format_exit_message, send_telegram_message
+            msg = format_exit_message(
+                trade_id=pos.trade_id,
+                side=pos.side,
+                entry_price=pos.entry_price,
+                exit_price=exit_price,
+                quantity=pos.quantity,
+                margin=pos.margin_used,
+                pnl=pnl,
+                roi=roi,
+                hold_min=(now_sec - pos.entry_time_sec) / 60.0,
+                exit_reason=reason,
+                session=pos.entry_session,
+            )
+            send_telegram_message(msg)
+        except Exception as e:
+            logger.error(f"Error sending exit notification: {e}")
+
+        # Excel logging
+        if self.excel_logger:
             try:
-                msg = format_exit_message(
+                from datetime import datetime
+                self.excel_logger.log_trade(
                     trade_id=pos.trade_id,
+                    entry_time=datetime.fromtimestamp(pos.entry_time_sec).strftime("%Y-%m-%d %H:%M:%S"),
+                    exit_time=datetime.fromtimestamp(now_sec).strftime("%Y-%m-%d %H:%M:%S"),
+                    duration_minutes=(now_sec - pos.entry_time_sec) / 60.0,
                     side=pos.side,
                     entry_price=pos.entry_price,
                     exit_price=exit_price,
                     quantity=pos.quantity,
-                    margin=pos.margin_used,
-                    pnl=pnl,
-                    roi=roi,
-                    hold_min=(now_sec - pos.entry_time_sec) / 60.0,
+                    margin_used=pos.margin_used,
+                    leverage=config.LEVERAGE,
+                    tp_price=pos.tp_price,
+                    sl_price=pos.sl_price,
+                    entry_imbalance=pos.entry_imbalance,
+                    entry_z_score=pos.entry_z_score,
+                    entry_wall_volume=pos.entry_wall_volume,
                     exit_reason=reason,
-                    session=pos.entry_session,
+                    pnl_usdt=pnl,
+                    entry_htf_trend=pos.entry_htf_trend,
                 )
-                send_telegram_message(msg)
             except Exception as e:
-                logger.error(f"Error sending exit notification: {e}")
+                logger.error(f"Error logging to Excel: {e}")
 
-            # Log to Excel if available
-            if self.excel_logger:
-                try:
-                    self.excel_logger.log_trade(
-                        trade_id=pos.trade_id,
-                        entry_time=datetime.fromtimestamp(pos.entry_time_sec).strftime("%Y-%m-%d %H:%M:%S"),
-                        exit_time=datetime.fromtimestamp(now_sec).strftime("%Y-%m-%d %H:%M:%S"),
-                        duration_minutes=(now_sec - pos.entry_time_sec) / 60.0,
-                        side=pos.side,
-                        entry_price=pos.entry_price,
-                        exit_price=exit_price,
-                        quantity=pos.quantity,
-                        margin_used=pos.margin_used,
-                        leverage=config.LEVERAGE,
-                        tp_price=pos.tp_price,
-                        sl_price=pos.sl_price,
-                        entry_imbalance=pos.entry_imbalance,
-                        entry_z_score=pos.entry_z_score,
-                        entry_wall_volume=pos.entry_wall_volume,
-                        exit_reason=reason,
-                        pnl_usdt=pnl,
-                        entry_htf_trend=pos.entry_htf_trend,
-                    )
-                except Exception as e:
-                    logger.error(f"Error logging to Excel: {e}")
-
-            self.last_exit_time_min = now_sec / 60.0
-            self.current_position = None
-            self.pending_entry = False
-            
+        self.last_exit_time_min = now_sec / 60.0
+        self.current_position = None
+        self.pending_entry = False
+                
     def _clean_orphaned_orders(self, order_manager, symbol: str = "BTCUSDT") -> bool:
         """
         Cancel ALL open orders for symbol ONLY if no filled position exists.
