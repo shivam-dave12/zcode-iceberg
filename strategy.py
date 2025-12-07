@@ -404,7 +404,7 @@ class ZScoreIcebergHunterStrategy:
     # TP/SL CALCULATION WITH SESSION PARAMETERS
     # ======================================================================
 
-    def _calculate_tp_sl(self, entry_price: float, side: str, margin_used: float, quantity: float, session: str) -> Tuple[float, float, float, float]:
+    def _calculate_tp_sl_prices(self, entry_price: float, side: str, margin_used: float, quantity: float, session: str) -> Tuple[float, float, float, float]:
             """
             FIXED: Fetch fresh session for TP/SL calc to avoid stale "UNKNOWN"
             """
