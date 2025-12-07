@@ -894,7 +894,7 @@ class ZScoreIcebergHunterStrategy:
                 quantity=quantity,
                 entry_price=limit_entry_price,
                 entry_time_sec=now_sec,
-                entry_session=session
+                entry_session=session,
                 entry_wall_volume=(
                     wall_data["bid_vol_zone"] if side == "long" else wall_data["ask_vol_zone"]
                 ),
