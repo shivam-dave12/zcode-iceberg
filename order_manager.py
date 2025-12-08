@@ -514,7 +514,7 @@ class OrderManager:
         try:
             # Cancel existing TP once, if provided
             if existing_tp_order_id:
-                self.wait_for_rate_limit()
+                self._wait_for_rate_limit()
                 logger.info(f"Cancelling TP order {existing_tp_order_id}")
                 cancel_resp = self.api.cancel_order(
                     order_id=existing_tp_order_id,
