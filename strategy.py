@@ -1802,41 +1802,43 @@ class ZScoreIcebergHunterStrategy:
         pos = self.current_position
         if pos is None:
             return
-
+        
         # ========================================
         # SMART TP/SL CLEANUP LOGIC
         # ========================================
         # If exit reason is TP_HIT or SL_HIT, the triggered order is already cancelled by exchange
         # We should ONLY try to cancel the OTHER order
+        
         if reason == "TP_HIT" or reason == "TP_PARTIAL":
             logger.info("TP triggered/partial - TP auto-cancelled by exchange, cancelling SL only")
             try:
                 order_manager.cancel_order(pos.sl_order_id)
             except Exception as e:
                 logger.debug(f"SL cancel failed (may already be cancelled): {e}")
-
+        
         elif reason == "SL_HIT":
             logger.info("SL triggered - SL auto-cancelled by exchange, cancelling TP only")
             try:
                 order_manager.cancel_order(pos.tp_order_id)
             except Exception as e:
                 logger.debug(f"TP cancel failed (may already be cancelled): {e}")
-
+        
         else:
             # Manual exit (timeout, market condition, etc.) - cancel both
             logger.info(f"Manual exit ({reason}) - cancelling both TP and SL")
+            
             # Try TP cancellation (ignore errors - may already be triggered/cancelled)
             try:
                 order_manager.cancel_order(pos.tp_order_id)
             except Exception as e:
                 logger.debug(f"TP cancel failed: {e}")
-
+            
             # Try SL cancellation (ignore errors - may already be triggered/cancelled)
             try:
                 order_manager.cancel_order(pos.sl_order_id)
             except Exception as e:
                 logger.debug(f"SL cancel failed: {e}")
-
+        
         # ========================================
         # CHECK IF POSITION STILL OPEN
         # ========================================
@@ -1844,6 +1846,7 @@ class ZScoreIcebergHunterStrategy:
             symbol=config.SYMBOL,
             exchange=config.EXCHANGE
         )
+        
         position_open = False
         if positions_resp and not positions_resp.get("error"):
             data = positions_resp.get("data", [])
@@ -1854,19 +1857,21 @@ class ZScoreIcebergHunterStrategy:
                         if abs(qty) > 0:
                             position_open = True
                             break
-
+        
         # ========================================
         # MARKET CLOSE IF NEEDED
         # ========================================
         if position_open:
             logger.info("Position still open - placing market close order")
             exit_side = "SELL" if pos.side == "long" else "BUY"
+            
             try:
                 exit_order = order_manager.place_market_order(
                     side=exit_side,
                     quantity=pos.quantity,
                     reduce_only=True,
                 )
+                
                 if exit_order:
                     try:
                         filled = order_manager.wait_for_fill(
@@ -1880,16 +1885,16 @@ class ZScoreIcebergHunterStrategy:
                 logger.error(f"Market close failed: {e}")
         else:
             logger.info("Position already closed (TP/SL triggered) - no market order needed")
-
+        
         # ========================================
         # P&L CALCULATION & LOGGING
         # ========================================
         direction = 1.0 if pos.side == "long" else -1.0
         pnl = (exit_price - pos.entry_price) * direction * pos.quantity
         roi = pnl / pos.margin_used if pos.margin_used > 0 else 0.0
-
+        
         risk_manager.update_trade_stats(pnl)
-
+        
         logger.info("\n" + "=" * 100)
         logger.info(f"[POSITION CLOSED] {pos.trade_id} | {reason}")
         logger.info("=" * 100)
@@ -1900,7 +1905,7 @@ class ZScoreIcebergHunterStrategy:
         logger.info(f"  P&L: {pnl:.2f} USDT ({roi*100:.2f}%)")
         logger.info(f"  Hold Time: {(now_sec - pos.entry_time_sec)/60.0:.1f} min")
         logger.info("=" * 100 + "\n")
-
+        
         # Telegram notification
         try:
             from telegram_notifier import format_exit_message, send_telegram_message
@@ -1920,7 +1925,7 @@ class ZScoreIcebergHunterStrategy:
             send_telegram_message(msg)
         except Exception as e:
             logger.error(f"Error sending exit notification: {e}")
-
+        
         # Excel logging
         if self.excel_logger:
             try:
@@ -1936,4 +1941,54 @@ class ZScoreIcebergHunterStrategy:
                     quantity=pos.quantity,
                     margin_used=pos.margin_used,
                     leverage=config.LEVERAGE,
-                    tp_price
+                    tp_price=pos.tp_price,
+                    sl_price=pos.sl_price,
+                    entry_imbalance=pos.entry_imbalance,
+                    entry_z_score=pos.entry_z_score,
+                    entry_wall_volume=pos.entry_wall_volume,
+                    exit_reason=reason,
+                    pnl_usdt=pnl,
+                    entry_htf_trend=pos.entry_htf_trend,
+                )
+            except Exception as e:
+                logger.error(f"Error logging to Excel: {e}")
+        
+        self.last_exit_time_min = now_sec / 60.0
+        self.current_position = None
+        self.pending_entry = False
+
+    def _clean_orphaned_orders(self, order_manager, symbol: str = "BTCUSDT") -> bool:
+        """
+        Cancel ALL open orders for symbol ONLY if no filled position exists.
+        Returns True if cleanup was performed, False if skipped.
+        """
+        try:
+            # Check if there's an active position
+            positions_resp = order_manager.api.get_positions(symbol=symbol, exchange=config.EXCHANGE)
+            if positions_resp and not positions_resp.get("error"):
+                data = positions_resp.get("data", [])
+                if isinstance(data, list):
+                    for pos in data:
+                        if pos.get("symbol") == symbol:
+                            qty = float(pos.get("quantity", 0))
+                            if abs(qty) > 0:
+                                logger.warning(
+                                    f"⚠️ Active position detected ({qty:.6f} BTC) - "
+                                    f"SKIPPING orphaned order cleanup"
+                                )
+                                return False
+            
+            # No active position - safe to clean up
+            logger.info(f"🧹 No active position - cleaning up orphaned orders for {symbol}")
+            result = order_manager.api.cancel_all_orders(symbol=symbol, exchange=config.EXCHANGE)
+            
+            if result and not result.get("error"):
+                logger.info(f"✓ All orphaned orders cancelled for {symbol}")
+                return True
+            else:
+                logger.debug(f"Cancel all response: {result}")
+                return False
+        
+        except Exception as e:
+            logger.error(f"Error cleaning orphaned orders: {e}")
+            return False
