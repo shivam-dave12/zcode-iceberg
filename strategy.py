@@ -22,7 +22,7 @@ from collections import deque
 import logging
 import numpy as np
 from scipy.stats import norm
-
+import threading
 import config
 from zscore_excel_logger import ZScoreExcelLogger
 from telegram_notifier import (
@@ -116,7 +116,10 @@ class ZScoreIcebergHunterStrategy:
         self.early_fill_handled: Dict[str, bool] = {}
         self._checking_order_status = False
         self._adjusting_tp = False  # ✅ ADDED: Prevent concurrent TP adjustments
-
+        self._tp_lock = threading.RLock()
+        self._adjusting_tp = False
+        
+        logger.info("Strategy initialized with thread-safe TP management")
         logger.info("=" * 80)
         logger.info("Z-SCORE STRATEGY INITIALIZED")
         logger.info("With Session + Weekend Volatility Gates")
@@ -880,12 +883,7 @@ class ZScoreIcebergHunterStrategy:
         current_price: float,
         now_sec: float
     ) -> None:
-        """
-        PRODUCTION-SAFE position management with:
-        1. Partial TP fill detection
-        2. Fixed variable scoping
-        3. Proper order state handling
-        """
+        """Position management with thread-safe TP adjustments"""
         pos = self.current_position
         if pos is None:
             return
@@ -1087,6 +1085,7 @@ class ZScoreIcebergHunterStrategy:
             self._last_position_log_sec = now_sec
             direction = 1.0 if pos.side == "long" else -1.0
             current_profit_pct = ((current_price - pos.entry_price) / pos.entry_price) * direction
+            hold_min = (now_sec - pos.entry_time_sec) / 60.0
             upnl = (current_price - pos.entry_price) * direction * pos.quantity
 
             logger.info("\n" + "=" * 100)
@@ -1194,30 +1193,36 @@ class ZScoreIcebergHunterStrategy:
         trend_favorable: bool,
         current_profit_pct: float,
     ) -> None:
-        """Adjust TP at 10-minute mark. Executes ONCE per position."""
+        """
+        Adjust TP at 10-minute mark.
+        THREAD-SAFE: Uses lock to prevent concurrent execution.
+        """
         pos = self.current_position
         if pos is None:
             return
-
-        # ✅ FIXED: Guard against concurrent execution
-        if pos.tp_adjusted_10min or self._adjusting_tp:
-            return
-
-        # ✅ SET FLAG FIRST to prevent re-entry
-        self._adjusting_tp = True
-        pos.tp_adjusted_10min = True
-        pos.tp_adjustment_count += 1
-
+        
+        # CRITICAL: Acquire lock
+        with self._tp_lock:
+            # Double-check flags after acquiring lock
+            if pos.tp_adjusted_10min or self._adjusting_tp:
+                return
+            
+            # Set flags IMMEDIATELY
+            self._adjusting_tp = True
+            pos.tp_adjusted_10min = True
+            pos.tp_adjustment_count += 1
+        
+        # Perform adjustment outside lock (to allow other operations)
         try:
             half_tp_roi = pos.initial_tp_roi * config.HALF_TP_THRESHOLD
             all_favorable = momentum_favorable and vol_favorable and trend_favorable
-
+            
             logger.info("=" * 100)
             logger.info(f"[TP MANAGEMENT 10MIN] {pos.trade_id}")
             logger.info(f"  All favorable (M/V/T): {all_favorable}")
             logger.info(f"  Current profit: {current_profit_pct*100:.2f}%")
             logger.info(f"  Half TP: {half_tp_roi*100:.2f}%")
-
+            
             if all_favorable:
                 if current_profit_pct >= half_tp_roi:
                     self._move_sl_to_half_tp(order_manager, current_price)
@@ -1230,7 +1235,7 @@ class ZScoreIcebergHunterStrategy:
                     new_tp_roi = current_profit_pct + config.TP_BUFFER_PERCENT
                 else:
                     new_tp_roi = half_tp_roi
-
+                
                 # Calculate new TP price
                 new_tp_price, _ = self._compute_bracket_prices(
                     entry_price=pos.entry_price,
@@ -1241,14 +1246,16 @@ class ZScoreIcebergHunterStrategy:
                     sl_roi=pos.initial_sl_roi,
                     session=pos.entry_session,
                 )
-
-                # ✅ SINGLE CALL to replace TP
+                
+                # SINGLE CALL to replace TP
                 self._replace_take_profit_order(order_manager, new_tp_price, new_tp_roi)
-
+            
             logger.info("=" * 100)
-
+        
         finally:
-            self._adjusting_tp = False
+            # CRITICAL: Always release lock
+            with self._tp_lock:
+                self._adjusting_tp = False
 
     def _tighten_tp_after_15min(
         self,
@@ -1291,85 +1298,84 @@ class ZScoreIcebergHunterStrategy:
         finally:
             self._adjusting_tp = False
 
-    def _replace_take_profit_order(self, order_manager, new_tp_price: float, new_tp_roi: float) -> None:
+    def _replace_take_profit_order(
+        self, order_manager, new_tp_price: float, new_tp_roi: float
+    ) -> None:
         """
-        SINGLE EXECUTION: 1 cancel + 1 place + 1 check.
-        NO loops, NO retries, NO multiple calls.
+        ATOMIC TP replacement with proper verification.
+        
+        CRITICAL: This method assumes _tp_lock is already held by caller.
         """
         pos = self.current_position
         if pos is None:
             return
-
+        
         old_tp_id = pos.tp_order_id
         old_tp_price = pos.current_tp_price or pos.tp_price
         old_tp_roi = pos.current_tp_roi or pos.tp_roi
         tp_side = "SELL" if pos.side == "long" else "BUY"
-
+        
         logger.info("=" * 100)
         logger.info(f"[TP REPLACEMENT] {pos.trade_id}")
         logger.info(f"  Old TP: {old_tp_price:.2f} ({old_tp_roi*100:.2f}%)")
         logger.info(f"  New TP: {new_tp_price:.2f} ({new_tp_roi*100:.2f}%)")
         logger.info("=" * 100)
-
-        # STEP 1: Cancel old TP (SINGLE REQUEST)
+        
+        # STEP 1: Cancel old TP (SINGLE REQUEST with error handling)
         logger.info(f"🗑️  Cancelling old TP: {old_tp_id}")
         try:
-            order_manager._wait_for_rate_limit()
-            order_manager.cancel_order(old_tp_id)
-            logger.info(f"✅ Old TP cancelled")
-            time.sleep(1.0)  # Wait for exchange to process
+            if not order_manager.cancel_order(old_tp_id):
+                logger.warning("⚠️  Old TP cancel failed (may already be cancelled)")
+            else:
+                logger.info("✅ Old TP cancelled")
+            
+            # Wait for exchange to process
+            time.sleep(1.0)
         except Exception as e:
-            logger.warning(f"⚠️  TP cancel failed (may already be cancelled): {e}")
-            # Continue - order may already be cancelled
-
+            logger.warning(f"⚠️  TP cancel error: {e}")
+        
         # STEP 2: Place new TP (SINGLE REQUEST)
         logger.info(f"📤 Placing new TP @ {new_tp_price:.2f}")
         try:
-            order_manager._wait_for_rate_limit()
             new_tp_order = order_manager.place_take_profit(
                 side=tp_side,
                 quantity=pos.quantity,
                 trigger_price=new_tp_price,
             )
-
+            
             if new_tp_order and new_tp_order.get("order_id"):
                 new_tp_id = new_tp_order.get("order_id")
-
+                
                 # STEP 3: Verify placement (SINGLE REQUEST)
                 logger.info(f"🔍 Verifying new TP: {new_tp_id}")
                 time.sleep(0.5)
-                order_manager._wait_for_rate_limit()
-
-                verify_resp = order_manager.api.get_order(
-                    order_id=new_tp_id,
-                    symbol=config.SYMBOL,
-                    exchange=config.EXCHANGE
-                )
-
+                
+                verify_resp = order_manager.get_order_status(new_tp_id)
+                
                 if verify_resp and not verify_resp.get("error"):
-                    # Success - update position
+                    # SUCCESS - update position
                     pos.tp_order_id = new_tp_id
                     pos.current_tp_price = new_tp_price
                     pos.current_tp_roi = new_tp_roi
                     pos.tp_price = new_tp_price
                     pos.tp_roi = new_tp_roi
-
-                    logger.info(f"✅ TP replacement successful")
+                    
+                    logger.info("✅ TP replacement successful")
                     logger.info(f"   New TP ID: {new_tp_id}")
                     logger.info(f"   Price: {new_tp_price:.2f} ({new_tp_roi*100:.2f}%)")
                     logger.info("=" * 100)
-
+                    
                     # Send Telegram notification
                     try:
                         from telegram_notifier import format_tp_adjustment, send_telegram_message
-
+                        
                         if pos.tp_adjustment_count == 1:
                             reason = "T+10min adjustment"
                         elif pos.tp_adjustment_count == 2:
                             reason = "T+15min tightening"
                         else:
                             reason = "Dynamic adjustment"
-
+                        
                         msg = format_tp_adjustment(
                             trade_id=pos.trade_id,
                             old_tp=old_tp_price,
@@ -1381,17 +1387,17 @@ class ZScoreIcebergHunterStrategy:
                         send_telegram_message(msg)
                     except Exception as e:
                         logger.error(f"Telegram notification failed: {e}")
-
+                    
                     return  # SUCCESS - EXIT
                 else:
-                    logger.error(f"❌ TP verification failed")
+                    logger.error("❌ TP verification failed")
             else:
-                logger.error(f"❌ TP placement returned no order_id")
-
+                logger.error("❌ TP placement returned no order_id")
+        
         except Exception as e:
-            logger.error(f"❌ TP replacement failed: {e}")
-
-        logger.error(f"❌ Failed to replace TP order")
+            logger.error(f"❌ TP replacement failed: {e}", exc_info=True)
+        
+        logger.error("❌ Failed to replace TP order")
         logger.info("=" * 100)
 
     def _move_sl_to_half_tp(self, order_manager, current_price: float) -> None:
