@@ -433,28 +433,24 @@ class OrderManager:
     def cancel_all_orders(self) -> bool:
         """Cancel all open orders for the symbol."""
         try:
-            # CRITICAL: Wait before API call
-            self._wait_for_rate_limit()
-            
+            # CRITICAL: Wait before API call...
+            self.wait_for_rate_limit()
             logger.info(f"Cancelling all orders for {config.SYMBOL}")
-            
             response = self.api.cancel_all_orders(
                 exchange=config.EXCHANGE,
                 symbol=config.SYMBOL,
             )
-            
-            if "data" in response or not response.get("error"):
-                logger.info("✓ All orders cancelled")
+            if response.get("data") is not None or not response.get("error"):
+                logger.info("All orders cancelled")
                 self.active_orders.clear()
                 return True
             else:
-                logger.error(f"✗ Cancel all failed: {response}")
+                logger.error(f"Cancel all failed: {response}")
                 return False
-        
         except Exception as e:
             logger.error(f"Error cancelling all orders: {e}")
             return False
-    
+   
     def get_open_orders(self) -> list:
         """Get all open orders."""
         try:
@@ -501,3 +497,65 @@ class OrderManager:
             "success_rate": (successful / total_orders) * 100 if total_orders > 0 else 0,
             "last_order_time": self.last_order_time,
         }
+
+    def replace_take_profit(
+        self,
+        existing_tp_order_id: Optional[str],
+        side: str,
+        quantity: float,
+        new_trigger_price: float,
+    ) -> Optional[Dict]:
+        """
+        Atomically replace a take-profit order:
+        - If we know the existing TP order id, attempt a single cancel.
+        - Then place a new TP.
+        - No loops – higher-level strategy must not spam this method.
+        """
+        try:
+            # Cancel existing TP once, if provided
+            if existing_tp_order_id:
+                self.wait_for_rate_limit()
+                logger.info(f"Cancelling TP order {existing_tp_order_id}")
+                cancel_resp = self.api.cancel_order(
+                    order_id=existing_tp_order_id,
+                    exchange=config.EXCHANGE,
+                )
+                # If already cancelled or not cancellable, just log and continue
+                if cancel_resp.get("error"):
+                    logger.warning(f"TP cancel non-fatal: {cancel_resp}")
+                else:
+                    logger.info(f"TP order cancelled {existing_tp_order_id}")
+
+            # Place new TP
+            self.wait_for_rate_limit()
+            logger.info(f"Placing TAKE PROFIT {side} {new_trigger_price:,.2f}")
+            resp = self.api.place_order(
+                symbol=config.SYMBOL,
+                side=side.upper(),
+                order_type="TAKE_PROFIT_MARKET",
+                quantity=quantity,
+                trigger_price=new_trigger_price,
+                exchange=config.EXCHANGE,
+                reduce_only=True,
+            )
+            data = resp.get("data")
+            if data and "orderId" in data:
+                new_id = data["orderId"]
+                logger.info(f"Take profit order placed {new_id}")
+                self.active_orders[new_id] = {
+                    "orderId": order_id,
+                    "symbol": config.SYMBOL,
+                    "side": side,
+                    "type": "TAKE_PROFIT",
+                    "quantity": quantity,
+                    "trigger_price": new_trigger_price,
+                    "status": data.get("status", "UNKNOWN"),
+                    "timestamp": datetime.now().isoformat(),
+                }
+                return data
+            else:
+                logger.error(f"Take profit order failed: {resp}")
+                return None
+        except Exception as e:
+            logger.error(f"Error replacing take profit: {e}", exc_info=True)
+            return None

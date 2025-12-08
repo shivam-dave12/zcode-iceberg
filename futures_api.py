@@ -223,23 +223,27 @@ class FuturesAPI:
         
         return self._make_request("DELETE", endpoint, payload=payload)
     
-    def cancel_all_orders(self, exchange: str = "EXCHANGE_2", symbol: str = None) -> Dict:
+    def cancel_all_orders(self, exchange: str = "EXCHANGE2", symbol: str = None) -> Dict:
         """
-        Cancel all open orders (optionally filtered by symbol).
-        
+        Cancel all open orders optionally filtered by symbol.
+
         Args:
             exchange: Exchange identifier
             symbol: Optional filter by symbol
-            
+
         Returns:
             Cancellation response or error dict
         """
         endpoint = "/trade/api/v2/futures/cancel_all"
-        params = {"exchange": exchange}
+        payload = {
+            "exchange": exchange
+        }
         if symbol:
-            params["symbol"] = symbol
-        
-        return self._make_request("POST", endpoint, params=params)
+            payload["symbol"] = symbol
+
+        # IMPORTANT: POST with JSON body, NOT params
+        return self.make_request("POST", endpoint, payload=payload)
+
     
     # ============ ADDITIONAL ENDPOINTS (unchanged from original) ============
     
