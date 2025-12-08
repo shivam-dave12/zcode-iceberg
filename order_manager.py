@@ -231,8 +231,8 @@ class OrderManager:
                 reduce_only=reduce_only,
             )
             
-            if "data" in response and "orderId" in response["data"]:
-                order_id = response["data"]["orderId"]
+            if "data" in response and "order_id" in response["data"]:
+                order_id = response["data"]["order_id"]
                 order_details = response["data"]
                 
                 self.active_orders[order_id] = {
@@ -288,8 +288,8 @@ class OrderManager:
                 reduce_only=reduce_only,
             )
             
-            if "data" in response and "orderId" in response["data"]:
-                order_id = response["data"]["orderId"]
+            if "data" in response and "order_id" in response["data"]:
+                order_id = response["data"]["order_id"]
                 order_details = response["data"]
                 
                 self.active_orders[order_id] = {
@@ -336,8 +336,8 @@ class OrderManager:
                 reduce_only=True,
             )
             
-            if "data" in response and "orderId" in response["data"]:
-                order_id = response["data"]["orderId"]
+            if "data" in response and "order_id" in response["data"]:
+                order_id = response["data"]["order_id"]
                 logger.info(f"✓ Stop loss order placed: {order_id}")
                 
                 self.active_orders[order_id] = {
@@ -380,8 +380,8 @@ class OrderManager:
                 reduce_only=True,
             )
             
-            if "data" in response and "orderId" in response["data"]:
-                order_id = response["data"]["orderId"]
+            if "data" in response and "order_id" in response["data"]:
+                order_id = response["data"]["order_id"]
                 logger.info(f"✓ Take profit order placed: {order_id}")
                 
                 self.active_orders[order_id] = {
@@ -539,11 +539,11 @@ class OrderManager:
                 reduce_only=True,
             )
             data = resp.get("data")
-            if data and "orderId" in data:
-                new_id = data["orderId"]
+            if data and "order_id" in data:
+                new_id = data["order_id"]
                 logger.info(f"Take profit order placed {new_id}")
                 self.active_orders[new_id] = {
-                    "orderId": new_id,
+                    "order_id": new_id,
                     "symbol": config.SYMBOL,
                     "side": side,
                     "type": "TAKE_PROFIT",
