@@ -527,7 +527,7 @@ class OrderManager:
                     logger.info(f"TP order cancelled {existing_tp_order_id}")
 
             # Place new TP
-            self.wait_for_rate_limit()
+            self._wait_for_rate_limit()
             logger.info(f"Placing TAKE PROFIT {side} {new_trigger_price:,.2f}")
             resp = self.api.place_order(
                 symbol=config.SYMBOL,
