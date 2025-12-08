@@ -41,9 +41,9 @@ WEEKEND_PARAMS = {
 
 # Major Sessions (Standard)
 MAJOR_SESSION_PARAMS = {
-    "z_threshold": 0.70,
-    "imbalance_threshold": 0.45,
-    "entry_score_threshold": 0.65,
+    "z_threshold": 2.1,
+    "imbalance_threshold": 0.65,
+    "entry_score_threshold": 0.85,
     "wall_multiplier": 4.2,
     "min_signal_gap_sec": 60.0,   # 1 minute
     "tp_roi_target": 0.12,        # 12%
@@ -52,9 +52,9 @@ MAJOR_SESSION_PARAMS = {
 
 # Overlap Sessions (Aggressive)
 OVERLAP_SESSION_PARAMS = {
-    "z_threshold": 0.65,
-    "imbalance_threshold": 0.42,
-    "entry_score_threshold": 0.63,
+    "z_threshold": 2.5,
+    "imbalance_threshold": 0.65,
+    "entry_score_threshold": 0.65,
     "wall_multiplier": 4.0,
     "min_signal_gap_sec": 45.0,   # 45 seconds
     "tp_roi_target": 0.10,        # 10%
