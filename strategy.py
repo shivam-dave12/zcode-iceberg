@@ -735,7 +735,7 @@ class ZScoreIcebergHunterStrategy:
                 self.pending_entry = False
                 return
             
-            main_order_id = main_order.get("orderId", "")
+            main_order_id = main_order.get("order_id", "")
             logger.info(f"✓ Limit order placed: {main_order_id}")
             
             # Place TP and SL immediately
@@ -759,8 +759,8 @@ class ZScoreIcebergHunterStrategy:
                 self.pending_entry = False
                 return
             
-            logger.info(f"✓ TP order placed: {tp_order.get('orderId', '')}")
-            logger.info(f"✓ SL order placed: {sl_order.get('orderId', '')}")
+            logger.info(f"✓ TP order placed: {tp_order.get('order_id', '')}")
+            logger.info(f"✓ SL order placed: {sl_order.get('order_id', '')}")
             
             # Create position object
             self.trade_seq += 1
@@ -787,8 +787,8 @@ class ZScoreIcebergHunterStrategy:
                 tp_price=tp_price,
                 sl_price=sl_price,
                 margin_used=margin_used,
-                tp_order_id=tp_order.get("orderId", ""),
-                sl_order_id=sl_order.get("orderId", ""),
+                tp_order_id=tp_order.get("order_id", ""),
+                sl_order_id=sl_order.get("order_id", ""),
                 main_order_id=main_order_id,
                 main_filled=False,
                 tp_reduced=False,
@@ -1315,7 +1315,7 @@ class ZScoreIcebergHunterStrategy:
                 new_trigger_price=new_tp_price,
             )
             if resp:
-                pos.tp_order_id = resp.get("orderId", pos.tp_order_id)
+                pos.tp_order_id = resp.get("order_id", pos.tp_order_id)
                 pos.current_tp_price = new_tp_price
                 pos.current_tp_roi = new_tp_roi
                 pos.tp_price = new_tp_price
@@ -1338,7 +1338,7 @@ class ZScoreIcebergHunterStrategy:
                 )
                 
                 if new_tp_order:
-                    pos.tp_order_id = new_tp_order.get("orderId", "")
+                    pos.tp_order_id = new_tp_order.get("order_id", "")
                     pos.current_tp_price = new_tp_price
                     pos.current_tp_roi = new_tp_roi
                     pos.tp_price = new_tp_price
@@ -1396,7 +1396,7 @@ class ZScoreIcebergHunterStrategy:
         )
         
         if new_sl_order:
-            pos.sl_order_id = new_sl_order.get("orderId", "")
+            pos.sl_order_id = new_sl_order.get("order_id", "")
             pos.sl_price = new_sl_price
             pos.tp_reduced = True
             logger.info(f"✓ Moved SL to half TP: {new_sl_price:.2f}")
@@ -1856,7 +1856,7 @@ class ZScoreIcebergHunterStrategy:
                 if exit_order:
                     try:
                         filled = order_manager.wait_for_fill(
-                            exit_order.get("orderId", ""),
+                            exit_order.get("order_id", ""),
                             timeout_sec=3.0
                         )
                         exit_price = order_manager.extract_fill_price(filled)
