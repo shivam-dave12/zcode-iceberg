@@ -231,8 +231,8 @@ class OrderManager:
                 reduce_only=reduce_only,
             )
             
-            if "data" in response and "order_id" in response["data"]:
-                order_id = response["data"]["order_id"]
+            if "data" in response and "orderId" in response["data"]:
+                order_id = response["data"]["orderId"]
                 order_details = response["data"]
                 
                 self.active_orders[order_id] = {
@@ -288,8 +288,8 @@ class OrderManager:
                 reduce_only=reduce_only,
             )
             
-            if "data" in response and "order_id" in response["data"]:
-                order_id = response["data"]["order_id"]
+            if "data" in response and "orderId" in response["data"]:
+                order_id = response["data"]["orderId"]
                 order_details = response["data"]
                 
                 self.active_orders[order_id] = {
@@ -336,8 +336,8 @@ class OrderManager:
                 reduce_only=True,
             )
             
-            if "data" in response and "order_id" in response["data"]:
-                order_id = response["data"]["order_id"]
+            if "data" in response and "orderId" in response["data"]:
+                order_id = response["data"]["orderId"]
                 logger.info(f"✓ Stop loss order placed: {order_id}")
                 
                 self.active_orders[order_id] = {
@@ -380,8 +380,8 @@ class OrderManager:
                 reduce_only=True,
             )
             
-            if "data" in response and "order_id" in response["data"]:
-                order_id = response["data"]["order_id"]
+            if "data" in response and "orderId" in response["data"]:
+                order_id = response["data"]["orderId"]
                 logger.info(f"✓ Take profit order placed: {order_id}")
                 
                 self.active_orders[order_id] = {
@@ -434,7 +434,7 @@ class OrderManager:
         """Cancel all open orders for the symbol."""
         try:
             # CRITICAL: Wait before API call...
-            self.wait_for_rate_limit()
+            self._wait_for_rate_limit()
             logger.info(f"Cancelling all orders for {config.SYMBOL}")
             response = self.api.cancel_all_orders(
                 exchange=config.EXCHANGE,
@@ -543,7 +543,7 @@ class OrderManager:
                 new_id = data["orderId"]
                 logger.info(f"Take profit order placed {new_id}")
                 self.active_orders[new_id] = {
-                    "orderId": order_id,
+                    "orderId": new_id,
                     "symbol": config.SYMBOL,
                     "side": side,
                     "type": "TAKE_PROFIT",

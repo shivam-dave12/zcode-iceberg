@@ -242,7 +242,7 @@ class FuturesAPI:
             payload["symbol"] = symbol
 
         # IMPORTANT: POST with JSON body, NOT params
-        return self.make_request("POST", endpoint, payload=payload)
+        return self._make_request("POST", endpoint, payload=payload)
 
     
     # ============ ADDITIONAL ENDPOINTS (unchanged from original) ============
