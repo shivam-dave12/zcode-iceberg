@@ -1174,6 +1174,12 @@ class ZScoreIcebergHunterStrategy:
         if pos is None:
             return
         
+        # ✅ SET FLAG IMMEDIATELY TO PREVENT RACE CONDITION
+        if pos.tp_adjusted_10min:
+            return  # Already adjusted, skip
+        pos.tp_adjusted_10min = True
+        pos.tp_adjustment_count += 1
+            
         half_tp_roi = pos.initial_tp_roi * config.HALF_TP_THRESHOLD
         all_favorable = momentum_favorable and vol_favorable and trend_favorable
         
@@ -1213,10 +1219,6 @@ class ZScoreIcebergHunterStrategy:
         
         logger.info("=" * 100)
         
-        # Mark as adjusted
-        pos.tp_adjusted_10min = True
-        pos.tp_adjustment_count += 1
-
     def _tighten_tp_after_15min(
         self,
         order_manager,
@@ -1232,6 +1234,13 @@ class ZScoreIcebergHunterStrategy:
         pos = self.current_position
         if pos is None:
             return
+        
+        # ✅ SET FLAG IMMEDIATELY
+        if pos.tp_tightened_15min:
+            return
+        
+        pos.tp_tightened_15min = True
+        pos.tp_adjustment_count += 1
         
         new_tp_roi = current_profit_pct + config.TP_BUFFER_PERCENT
         
@@ -1250,9 +1259,6 @@ class ZScoreIcebergHunterStrategy:
         self._replace_take_profit_order(order_manager, new_tp_price, new_tp_roi)
         logger.info(f"[TP MANAGEMENT 15MIN] Final tightening TP to {new_tp_roi*100:.2f}%")
         
-        # Mark as tightened
-        pos.tp_tightened_15min = True
-        pos.tp_adjustment_count += 1
 
     def _replace_take_profit_order(
         self,
