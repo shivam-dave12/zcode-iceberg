@@ -1193,69 +1193,67 @@ class ZScoreIcebergHunterStrategy:
         trend_favorable: bool,
         current_profit_pct: float,
     ) -> None:
-        """
-        FIX: Smart TP adjustment at 10 minutes.
-        - Checks if current P&L > new TP → skip TP change, tighten SL to breakeven+fees
-        - Only adjusts TP if current P&L < new TP target
-        """
+        """Smart TP adjustment at 10 minutes"""
         pos = self.current_position
         if pos is None:
             return
-
-        pos.tp_adjusted_10min = True
-        pos.tp_adjustment_count += 1
-
-        half_tp_roi = pos.initial_tp_roi * config.HALF_TP_THRESHOLD
-        all_favorable = momentum_favorable and vol_favorable and trend_favorable
-
-        logger.info("=" * 100)
-        logger.info(f"[TP MANAGEMENT 10MIN] {pos.trade_id}")
-        logger.info(f"  All favorable (M/V/T): {all_favorable}")
-        logger.info(f"  Current profit: {current_profit_pct*100:.2f}%")
-        logger.info(f"  Half TP target: {half_tp_roi*100:.2f}%")
-
-        if all_favorable:
-            if current_profit_pct >= half_tp_roi:
-                self._move_sl_to_half_tp(order_manager, current_price)
-                logger.info("  → Moved SL to half TP, waiting 5min more")
-            else:
-                logger.info("  → Waiting 5min more")
-        else:
-            # Determine new TP ROI
-            if current_profit_pct >= half_tp_roi:
-                new_tp_roi = current_profit_pct + config.TP_BUFFER_PERCENT
-            else:
-                new_tp_roi = half_tp_roi
-
-            # ✅ CRITICAL CHECK: Is current profit already above new TP?
-            if current_profit_pct >= new_tp_roi:
-                logger.warning(f"  ⚠️  Current P&L ({current_profit_pct*100:.2f}%) already ABOVE new TP ({new_tp_roi*100:.2f}%)")
-                logger.info(f"  → Skipping TP adjustment, tightening SL to breakeven+fees")
-                self._tighten_sl_to_breakeven(order_manager, current_price)
-                logger.info("=" * 100)
-                return
-
-            # Calculate new TP price
-            new_tp_price, _ = self._compute_bracket_prices(
-                entry_price=pos.entry_price,
-                margin_used=pos.margin_used,
-                quantity=pos.quantity,
-                side=pos.side,
-                tp_roi=new_tp_roi,
-                sl_roi=pos.initial_sl_roi,
-                session=pos.entry_session,
-            )
-
-            # SINGLE CALL to replace TP
-            self._replace_take_profit_order(order_manager, new_tp_price, new_tp_roi)
-
-        logger.info("=" * 100)
-
         
-        finally:
-            # CRITICAL: Always release lock
-            with self._tp_lock:
+        with self._tp_lock:
+            if self._adjusting_tp:
+                logger.warning("⚠️ TP adjustment already in progress, skipping 10min adjust")
+                return
+            
+            self._adjusting_tp = True
+            
+            try:
+                pos.tp_adjusted_10min = True
+                pos.tp_adjustment_count += 1
+
+                half_tp_roi = pos.initial_tp_roi * config.HALF_TP_THRESHOLD
+                all_favorable = momentum_favorable and vol_favorable and trend_favorable
+
+                logger.info("=" * 100)
+                logger.info(f"[TP MANAGEMENT 10MIN] {pos.trade_id}")
+                logger.info(f"  All favorable (M/V/T): {all_favorable}")
+                logger.info(f"  Current profit: {current_profit_pct*100:.2f}%")
+                logger.info(f"  Half TP target: {half_tp_roi*100:.2f}%")
+
+                if all_favorable:
+                    if current_profit_pct >= half_tp_roi:
+                        self._move_sl_to_half_tp(order_manager, current_price)
+                        logger.info("  → Moved SL to half TP, waiting 5min more")
+                    else:
+                        logger.info("  → Waiting 5min more")
+                else:
+                    if current_profit_pct >= half_tp_roi:
+                        new_tp_roi = current_profit_pct + config.TP_BUFFER_PERCENT
+                    else:
+                        new_tp_roi = half_tp_roi
+
+                    if current_profit_pct >= new_tp_roi:
+                        logger.warning(f"  ⚠️ Current P&L ({current_profit_pct*100:.2f}%) already ABOVE new TP ({new_tp_roi*100:.2f}%)")
+                        logger.info(f"  → Skipping TP adjustment, tightening SL to breakeven+fees")
+                        self._tighten_sl_to_breakeven(order_manager, current_price)
+                        logger.info("=" * 100)
+                        return
+
+                    new_tp_price, _ = self._compute_bracket_prices(
+                        entry_price=pos.entry_price,
+                        margin_used=pos.margin_used,
+                        quantity=pos.quantity,
+                        side=pos.side,
+                        tp_roi=new_tp_roi,
+                        sl_roi=pos.initial_sl_roi,
+                        session=pos.entry_session,
+                    )
+
+                    self._replace_take_profit_order(order_manager, new_tp_price, new_tp_roi)
+
+                logger.info("=" * 100)
+            
+            finally:
                 self._adjusting_tp = False
+
 
     def _tighten_tp_after_15min(
         self,
@@ -1263,45 +1261,46 @@ class ZScoreIcebergHunterStrategy:
         current_price: float,
         current_profit_pct: float,
     ) -> None:
-        """
-        FIX: Smart TP tightening at 15 minutes.
-        - Checks if current P&L > new TP → skip, tighten SL instead
-        """
+        """Smart TP tightening at 15 minutes"""
         pos = self.current_position
         if pos is None:
             return
 
-        pos.tp_tightened_15min = True
-        pos.tp_adjustment_count += 1
+        with self._tp_lock:
+            if self._adjusting_tp:
+                logger.warning("⚠️ TP adjustment already in progress, skipping 15min tighten")
+                return
+            
+            self._adjusting_tp = True
+            
+            try:
+                pos.tp_tightened_15min = True
+                pos.tp_adjustment_count += 1
 
-        new_tp_roi = current_profit_pct + config.TP_BUFFER_PERCENT
+                new_tp_roi = current_profit_pct + config.TP_BUFFER_PERCENT
 
-        logger.info(f"[TP MANAGEMENT 15MIN] Target TP: {new_tp_roi*100:.2f}%")
+                logger.info(f"[TP MANAGEMENT 15MIN] Target TP: {new_tp_roi*100:.2f}%")
 
-        # ✅ CRITICAL CHECK: Is current profit already above new TP?
-        if current_profit_pct >= new_tp_roi:
-            logger.warning(f"  ⚠️  Current P&L ({current_profit_pct*100:.2f}%) already ABOVE new TP ({new_tp_roi*100:.2f}%)")
-            logger.info(f"  → Skipping TP adjustment, tightening SL to breakeven+fees")
-            self._tighten_sl_to_breakeven(order_manager, current_price)
-            return
+                if current_profit_pct >= new_tp_roi:
+                    logger.warning(f"  ⚠️ Current P&L ({current_profit_pct*100:.2f}%) already ABOVE new TP ({new_tp_roi*100:.2f}%)")
+                    logger.info(f"  → Skipping TP adjustment, tightening SL to breakeven+fees")
+                    self._tighten_sl_to_breakeven(order_manager, current_price)
+                    return
 
-        # Calculate new TP price
-        new_tp_price, _ = self._compute_bracket_prices(
-            entry_price=pos.entry_price,
-            margin_used=pos.margin_used,
-            quantity=pos.quantity,
-            side=pos.side,
-            tp_roi=new_tp_roi,
-            sl_roi=pos.initial_sl_roi,
-            session=pos.entry_session,
-        )
+                new_tp_price, _ = self._compute_bracket_prices(
+                    entry_price=pos.entry_price,
+                    margin_used=pos.margin_used,
+                    quantity=pos.quantity,
+                    side=pos.side,
+                    tp_roi=new_tp_roi,
+                    sl_roi=pos.initial_sl_roi,
+                    session=pos.entry_session,
+                )
 
-        # SINGLE CALL to replace TP
-        self._replace_take_profit_order(order_manager, new_tp_price, new_tp_roi)
-
-
-        finally:
-            self._adjusting_tp = False
+                self._replace_take_profit_order(order_manager, new_tp_price, new_tp_roi)
+            
+            finally:
+                self._adjusting_tp = False
 
     def _replace_take_profit_order(
         self, order_manager, new_tp_price: float, new_tp_roi: float
