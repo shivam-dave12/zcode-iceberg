@@ -1046,7 +1046,7 @@ class ZScoreIcebergHunterStrategy:
                 tp_status_resp = order_manager.get_order_status(pos.tp_order_id)
                 if tp_status_resp:
                     tp_status = str(tp_status_resp.get("status", "")).upper()
-                    if tp_status in ("PENDING", "NEW", "OPEN", "ACCEPTED"):
+                    if tp_status in ("PENDING", "RAISED"):
                         tp_placed = True
                         logger.info(f"  ✓ TP order verified: {pos.tp_order_id} (status: {tp_status})")
                     else:
@@ -1063,7 +1063,7 @@ class ZScoreIcebergHunterStrategy:
                 sl_status_resp = order_manager.get_order_status(pos.sl_order_id)
                 if sl_status_resp:
                     sl_status = str(sl_status_resp.get("status", "")).upper()
-                    if sl_status in ("PENDING", "NEW", "OPEN", "ACCEPTED"):
+                    if sl_status in ("PENDING", "RAISED"):
                         sl_placed = True
                         logger.info(f"  ✓ SL order verified: {pos.sl_order_id} (status: {sl_status})")
                     else:
