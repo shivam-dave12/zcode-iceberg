@@ -1,3 +1,22 @@
+#!/usr/bin/env python3
+"""
+CoinSwitch Futures Trading WebSocket Plugin
+Real-time market data streaming for futures markets
+INDUSTRY-GRADE with robust reconnection + subscription tracking
+"""
+
+import socketio
+import time
+import json
+import logging
+from typing import Callable, Dict, Optional, List
+from threading import Event, RLock
+from datetime import datetime
+import config
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 class FuturesWebSocket:
     """CoinSwitch Futures Trading WebSocket Client with ROBUST reconnection"""
     
@@ -23,21 +42,26 @@ class FuturesWebSocket:
         self.stop_event = Event()
         
         # Callback storage
-        self.orderbook_callbacks = []
-        self.candlestick_callbacks = []
-        self.trades_callbacks = []
-        self.ticker_callbacks = []
-
-        # ✅ NEW: Track active subscriptions for reconnection
+        self.orderbook_callbacks: List[Callable] = []
+        self.candlestick_callbacks: List[Callable] = []
+        self.trades_callbacks: List[Callable] = []
+        self.ticker_callbacks: List[Callable] = []
+        
+        # ✅ Track active subscriptions for reconnection
         self.active_subscriptions = {
             'orderbook': [],
             'candlestick': [],
             'trades': [],
             'ticker': []
-        }        
+        }
+        
+        # Thread safety
+        self.callbacks_lock = RLock()
+        
         self.message_count = 0
         self.reconnect_attempts = 0
         self.last_disconnect_time = 0
+        self.last_message_time = None
         
         self._setup_handlers()
 
@@ -48,6 +72,7 @@ class FuturesWebSocket:
         def connect():
             self.is_connected = True
             self.reconnect_attempts = 0  # Reset on successful connect
+            self.last_message_time = datetime.now()
             print("✓ Connected to futures market")
             logger.info(f"WebSocket connected to {self.NAMESPACE}")
 
@@ -70,6 +95,8 @@ class FuturesWebSocket:
         # Orderbook handler
         @self.sio.on(self.EVENT_ORDERBOOK, namespace=self.NAMESPACE)
         def on_orderbook(data):
+            self.last_message_time = datetime.now()
+            self.message_count += 1
             if isinstance(data, dict) and ("bids" in data or "b" in data):
                 formatted = {
                     "b": data.get("bids", data.get("b", [])),
@@ -86,6 +113,8 @@ class FuturesWebSocket:
         # Trades handler
         @self.sio.on(self.EVENT_TRADES, namespace=self.NAMESPACE)
         def on_trades(data):
+            self.last_message_time = datetime.now()
+            self.message_count += 1
             if isinstance(data, dict) and "p" in data:
                 formatted = {
                     "p": data.get("p"),
@@ -103,6 +132,8 @@ class FuturesWebSocket:
         # Candlestick handler
         @self.sio.on(self.EVENT_CANDLESTICK, namespace=self.NAMESPACE)
         def on_candlestick(data):
+            self.last_message_time = datetime.now()
+            self.message_count += 1
             if isinstance(data, dict) and "c" in data:
                 for callback in self.candlestick_callbacks:
                     try:
@@ -190,7 +221,6 @@ class FuturesWebSocket:
         except Exception as e:
             logger.error(f"Error during re-subscription: {e}")
 
-
     def connect(self, timeout: int = 30) -> bool:
         """Connect to WebSocket server"""
         try:
@@ -222,77 +252,74 @@ class FuturesWebSocket:
             print(f"✗ Disconnect error: {e}")
 
     def is_healthy(self, timeout_seconds: int = 30) -> bool:
-        """
-        Check if connection is healthy (receiving data).
-        Returns False if no messages received in timeout period.
-        """
+        """Check if connection is healthy (receiving data)."""
         if not self.is_connected:
             return False
-        
-        if self._last_message_time is None:
+        if self.last_message_time is None:
             return True  # Just connected, no messages yet
-        
-        time_since_last = datetime.now() - self._last_message_time
-        return time_since_last.total_seconds() < timeout_seconds
+        time_since_last = (datetime.now() - self.last_message_time).total_seconds()
+        return time_since_last <= timeout_seconds
 
-    def subscribe_orderbook(self, pair: str, callback: Callable = None):
+    def subscribe_orderbook(self, pair: str, callback: Optional[Callable] = None):
         """Subscribe to order book updates (thread-safe)"""
         subscribe_data = {"event": "subscribe", "pair": pair}
         
-        if callback:
-            if callback not in self.orderbook_callbacks:
+        with self.callbacks_lock:
+            if callback and callback not in self.orderbook_callbacks:
                 self.orderbook_callbacks.append(callback)
         
-        # ✅ Track subscription
-        if pair not in self.active_subscriptions['orderbook']:
-            self.active_subscriptions['orderbook'].append(pair)
+            # Track subscription
+            if pair not in self.active_subscriptions['orderbook']:
+                self.active_subscriptions['orderbook'].append(pair)
         
         logger.info(f"Subscribing to orderbook: {pair}")
         self.sio.emit(self.EVENT_ORDERBOOK, subscribe_data, namespace=self.NAMESPACE)
         print(f"✓ Subscribed to orderbook: {pair}")
 
-    def subscribe_candlestick(self, pair: str, interval: int = 5, callback: Callable = None):
+    def subscribe_candlestick(self, pair: str, interval: int = 5, callback: Optional[Callable] = None):
         """Subscribe to candlestick updates (thread-safe)"""
         pair_with_interval = f"{pair}{interval}"
         subscribe_data = {"event": "subscribe", "pair": pair_with_interval}
         
-        if callback:
-            if callback not in self.candlestick_callbacks:
+        with self.callbacks_lock:
+            if callback and callback not in self.candlestick_callbacks:
                 self.candlestick_callbacks.append(callback)
-        
-        # ✅ Track subscription
-        if pair_with_interval not in self.active_subscriptions['candlestick']:
-            self.active_subscriptions['candlestick'].append(pair_with_interval)
+            
+            # Track subscription
+            if pair_with_interval not in self.active_subscriptions['candlestick']:
+                self.active_subscriptions['candlestick'].append(pair_with_interval)
         
         logger.info(f"Subscribing to candlestick: {pair_with_interval}")
         self.sio.emit(self.EVENT_CANDLESTICK, subscribe_data, namespace=self.NAMESPACE)
         print(f"✓ Subscribed to candlestick: {pair_with_interval}")
 
-    def subscribe_trades(self, pair: str, callback: Callable = None):
+    def subscribe_trades(self, pair: str, callback: Optional[Callable] = None):
         """Subscribe to trade updates (thread-safe)"""
         subscribe_data = {"event": "subscribe", "pair": pair}
         
-        if callback:
-            if callback not in self.trades_callbacks:
+        with self.callbacks_lock:
+            if callback and callback not in self.trades_callbacks:
                 self.trades_callbacks.append(callback)
-        
-        # ✅ Track subscription
-        if pair not in self.active_subscriptions['trades']:
-            self.active_subscriptions['trades'].append(pair)
+            
+            # Track subscription
+            if pair not in self.active_subscriptions['trades']:
+                self.active_subscriptions['trades'].append(pair)
         
         logger.info(f"Subscribing to trades: {pair}")
         self.sio.emit(self.EVENT_TRADES, subscribe_data, namespace=self.NAMESPACE)
         print(f"✓ Subscribed to trades: {pair}")
 
-
-    def subscribe_ticker(self, pair: str, callback: Callable = None):
+    def subscribe_ticker(self, pair: str, callback: Optional[Callable] = None):
         """Subscribe to ticker updates (thread-safe)"""
-        subscribe_data = {'event': 'subscribe', 'pair': pair}
+        subscribe_data = {"event": "subscribe", "pair": pair}
         
-        if callback:
-            with self._callbacks_lock:
-                if callback not in self.ticker_callbacks:
-                    self.ticker_callbacks.append(callback)
+        with self.callbacks_lock:
+            if callback and callback not in self.ticker_callbacks:
+                self.ticker_callbacks.append(callback)
+            
+            # Track subscription
+            if pair not in self.active_subscriptions['ticker']:
+                self.active_subscriptions['ticker'].append(pair)
         
         logger.info(f"Subscribing to ticker: {pair}")
         self.sio.emit(self.EVENT_TICKER, subscribe_data, namespace=self.NAMESPACE)
@@ -303,5 +330,5 @@ class FuturesWebSocket:
         try:
             self.sio.wait()
         except KeyboardInterrupt:
-            print("\n✓ Shutting down...")
+            print("Shutting down...")
             self.disconnect()
