@@ -973,14 +973,19 @@ class ZScoreDataManager:
         Compute higher timeframe (e.g. 5-minute) trend using an LSTM over
         native 5m closes with 3-state classification (UP/DOWN/RANGE) +
         hysteresis. Hysteresis confirmations reduced to 1 for faster flips.
+        
+        THREAD-SAFE: Creates snapshot copy to prevent deque mutation errors.
         """
-        if not self._htf_5m_closes:
+        # CRITICAL FIX: Create immutable snapshot to prevent race conditions
+        htf_snapshot = list(self._htf_5m_closes)
+        
+        if not htf_snapshot:
             return self._last_htf_trend
 
         # Train once on warm data
         if not self._htf_lstm_trained:
             try:
-                closes = [p for (_, p) in self._htf_5m_closes]
+                closes = [p for (_, p) in htf_snapshot]
                 (
                     self._htf_lstm,
                     self._htf_norm_mean,
@@ -1034,7 +1039,7 @@ class ZScoreDataManager:
         base_prob = 0.6
         prob_threshold = max(0.4, base_prob / max(1.0, vol_factor))
 
-        closes = [p for (_, p) in self._htf_5m_closes]
+        closes = [p for (_, p) in htf_snapshot]
         raw_signal = self._lstm_predict_trend(
             model=self._htf_lstm,
             closes=closes,
@@ -1066,6 +1071,8 @@ class ZScoreDataManager:
 
         return self._last_htf_trend
 
+
+
     # ======================================================================
     # 1-minute (LTF) Trend Filter using 1m LSTM + hysteresis
     # with volume-weighted responsiveness (mirrors HTF logic)
@@ -1077,14 +1084,19 @@ class ZScoreDataManager:
         same 3-state classification + hysteresis. Volume-weighted responsiveness
         is applied: when recent trade volume spikes, probability threshold is
         lowered slightly to flip faster without changing the model itself.
+        
+        THREAD-SAFE: Creates snapshot copy to prevent deque mutation errors.
         """
-        if not self._ltf_1m_closes:
+        # CRITICAL FIX: Create immutable snapshot to prevent race conditions
+        ltf_snapshot = list(self._ltf_1m_closes)
+        
+        if not ltf_snapshot:
             return self._last_ltf_trend
 
         # Train once on warm data
         if not self._ltf_lstm_trained:
             try:
-                closes = [p for (_, p) in self._ltf_1m_closes]
+                closes = [p for (_, p) in ltf_snapshot]
                 (
                     self._ltf_lstm,
                     self._ltf_norm_mean,
@@ -1138,7 +1150,7 @@ class ZScoreDataManager:
         base_prob = 0.6
         prob_threshold = max(0.4, base_prob / max(1.0, vol_factor))
 
-        closes = [p for (_, p) in self._ltf_1m_closes]
+        closes = [p for (_, p) in ltf_snapshot]
         raw_signal = self._lstm_predict_trend(
             model=self._ltf_lstm,
             closes=closes,
@@ -1280,33 +1292,41 @@ class ZScoreDataManager:
         """
         Break of Structure on 15m closes.
         1 = bullish HH, -1 = bearish LL, 0 = neutral.
+        
+        THREAD-SAFE: Creates snapshot copy to prevent deque mutation errors.
         """
-        closes = list(self._bos_15m_closes)
-        if len(closes) < 3:
+        # CRITICAL FIX: Create immutable snapshot to prevent race conditions
+        bos_snapshot = list(self._bos_15m_closes)
+        
+        if len(bos_snapshot) < 3:
             return 0
 
-        last3 = [p for _, p in closes[-3:]]
+        last3 = [p for _, p in bos_snapshot[-3:]]
         if last3[2] > last3[1] > last3[0]:
             return 1
         if last3[2] < last3[1] < last3[0]:
             return -1
         return 0
 
+
     def get_lstm_prediction(self, timeframe: str = "1m") -> float:
         """
         LSTM proxy: normalized momentum in [-1, 1] over chosen TF.
         AetherOracle treats this as directional model score.
+        
+        THREAD-SAFE: Creates snapshot copy to prevent deque mutation errors.
         """
+        # CRITICAL FIX: Create immutable snapshot to prevent race conditions
         if timeframe == "1m":
-            buf = self._ltf_1m_closes
+            buf_snapshot = list(self._ltf_1m_closes)
         elif timeframe == "5m":
-            buf = self._htf_5m_closes
+            buf_snapshot = list(self._htf_5m_closes)
         elif timeframe == "15m":
-            buf = self._bos_15m_closes
+            buf_snapshot = list(self._bos_15m_closes)
         else:
             return 0.0
 
-        closes = [p for _, p in list(buf)[-20:]]
+        closes = [p for _, p in buf_snapshot[-20:]]
         if len(closes) < 10:
             return 0.0
 
