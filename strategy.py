@@ -1194,91 +1194,46 @@ class ZScoreIcebergHunterStrategy:
         current_profit_pct: float,
     ) -> None:
         """
-        Adjust TP at 10-minute mark.
-        THREAD-SAFE: Uses lock to prevent concurrent execution.
+        FIX: Smart TP adjustment at 10 minutes.
+        - Checks if current P&L > new TP → skip TP change, tighten SL to breakeven+fees
+        - Only adjusts TP if current P&L < new TP target
         """
         pos = self.current_position
         if pos is None:
             return
-        
-        # CRITICAL: Acquire lock
-        with self._tp_lock:
-            # Double-check flags after acquiring lock
-            if pos.tp_adjusted_10min or self._adjusting_tp:
-                return
-            
-            # Set flags IMMEDIATELY
-            self._adjusting_tp = True
-            pos.tp_adjusted_10min = True
-            pos.tp_adjustment_count += 1
-        
-        # Perform adjustment outside lock (to allow other operations)
-        try:
-            half_tp_roi = pos.initial_tp_roi * config.HALF_TP_THRESHOLD
-            all_favorable = momentum_favorable and vol_favorable and trend_favorable
-            
-            logger.info("=" * 100)
-            logger.info(f"[TP MANAGEMENT 10MIN] {pos.trade_id}")
-            logger.info(f"  All favorable (M/V/T): {all_favorable}")
-            logger.info(f"  Current profit: {current_profit_pct*100:.2f}%")
-            logger.info(f"  Half TP: {half_tp_roi*100:.2f}%")
-            
-            if all_favorable:
-                if current_profit_pct >= half_tp_roi:
-                    self._move_sl_to_half_tp(order_manager, current_price)
-                    logger.info("  → Moved SL to half TP, waiting 5min more")
-                else:
-                    logger.info("  → Waiting 5min more")
-            else:
-                # Determine new TP ROI
-                if current_profit_pct >= half_tp_roi:
-                    new_tp_roi = current_profit_pct + config.TP_BUFFER_PERCENT
-                else:
-                    new_tp_roi = half_tp_roi
-                
-                # Calculate new TP price
-                new_tp_price, _ = self._compute_bracket_prices(
-                    entry_price=pos.entry_price,
-                    margin_used=pos.margin_used,
-                    quantity=pos.quantity,
-                    side=pos.side,
-                    tp_roi=new_tp_roi,
-                    sl_roi=pos.initial_sl_roi,
-                    session=pos.entry_session,
-                )
-                
-                # SINGLE CALL to replace TP
-                self._replace_take_profit_order(order_manager, new_tp_price, new_tp_roi)
-            
-            logger.info("=" * 100)
-        
-        finally:
-            # CRITICAL: Always release lock
-            with self._tp_lock:
-                self._adjusting_tp = False
 
-    def _tighten_tp_after_15min(
-        self,
-        order_manager,
-        current_price: float,
-        current_profit_pct: float,
-    ) -> None:
-        """Tighten TP at 15-minute mark. Executes ONCE per position."""
-        pos = self.current_position
-        if pos is None:
-            return
-
-        # ✅ FIXED: Guard against concurrent execution
-        if pos.tp_tightened_15min or self._adjusting_tp:
-            return
-
-        # ✅ SET FLAG FIRST
-        self._adjusting_tp = True
-        pos.tp_tightened_15min = True
+        pos.tp_adjusted_10min = True
         pos.tp_adjustment_count += 1
 
-        try:
-            new_tp_roi = current_profit_pct + config.TP_BUFFER_PERCENT
+        half_tp_roi = pos.initial_tp_roi * config.HALF_TP_THRESHOLD
+        all_favorable = momentum_favorable and vol_favorable and trend_favorable
+
+        logger.info("=" * 100)
+        logger.info(f"[TP MANAGEMENT 10MIN] {pos.trade_id}")
+        logger.info(f"  All favorable (M/V/T): {all_favorable}")
+        logger.info(f"  Current profit: {current_profit_pct*100:.2f}%")
+        logger.info(f"  Half TP target: {half_tp_roi*100:.2f}%")
+
+        if all_favorable:
+            if current_profit_pct >= half_tp_roi:
+                self._move_sl_to_half_tp(order_manager, current_price)
+                logger.info("  → Moved SL to half TP, waiting 5min more")
+            else:
+                logger.info("  → Waiting 5min more")
+        else:
+            # Determine new TP ROI
+            if current_profit_pct >= half_tp_roi:
+                new_tp_roi = current_profit_pct + config.TP_BUFFER_PERCENT
+            else:
+                new_tp_roi = half_tp_roi
+
+            # ✅ CRITICAL CHECK: Is current profit already above new TP?
+            if current_profit_pct >= new_tp_roi:
+                logger.warning(f"  ⚠️  Current P&L ({current_profit_pct*100:.2f}%) already ABOVE new TP ({new_tp_roi*100:.2f}%)")
+                logger.info(f"  → Skipping TP adjustment, tightening SL to breakeven+fees")
+                self._tighten_sl_to_breakeven(order_manager, current_price)
+                logger.info("=" * 100)
+                return
 
             # Calculate new TP price
             new_tp_price, _ = self._compute_bracket_prices(
@@ -1291,9 +1246,59 @@ class ZScoreIcebergHunterStrategy:
                 session=pos.entry_session,
             )
 
-            # ✅ SINGLE CALL to replace TP
+            # SINGLE CALL to replace TP
             self._replace_take_profit_order(order_manager, new_tp_price, new_tp_roi)
-            logger.info(f"[TP MANAGEMENT 15MIN] Final tightening to {new_tp_roi*100:.2f}%")
+
+        logger.info("=" * 100)
+
+        
+        finally:
+            # CRITICAL: Always release lock
+            with self._tp_lock:
+                self._adjusting_tp = False
+
+    def _tighten_tp_after_15min(
+        self,
+        order_manager,
+        current_price: float,
+        current_profit_pct: float,
+    ) -> None:
+        """
+        FIX: Smart TP tightening at 15 minutes.
+        - Checks if current P&L > new TP → skip, tighten SL instead
+        """
+        pos = self.current_position
+        if pos is None:
+            return
+
+        pos.tp_tightened_15min = True
+        pos.tp_adjustment_count += 1
+
+        new_tp_roi = current_profit_pct + config.TP_BUFFER_PERCENT
+
+        logger.info(f"[TP MANAGEMENT 15MIN] Target TP: {new_tp_roi*100:.2f}%")
+
+        # ✅ CRITICAL CHECK: Is current profit already above new TP?
+        if current_profit_pct >= new_tp_roi:
+            logger.warning(f"  ⚠️  Current P&L ({current_profit_pct*100:.2f}%) already ABOVE new TP ({new_tp_roi*100:.2f}%)")
+            logger.info(f"  → Skipping TP adjustment, tightening SL to breakeven+fees")
+            self._tighten_sl_to_breakeven(order_manager, current_price)
+            return
+
+        # Calculate new TP price
+        new_tp_price, _ = self._compute_bracket_prices(
+            entry_price=pos.entry_price,
+            margin_used=pos.margin_used,
+            quantity=pos.quantity,
+            side=pos.side,
+            tp_roi=new_tp_roi,
+            sl_roi=pos.initial_sl_roi,
+            session=pos.entry_session,
+        )
+
+        # SINGLE CALL to replace TP
+        self._replace_take_profit_order(order_manager, new_tp_price, new_tp_roi)
+
 
         finally:
             self._adjusting_tp = False
@@ -1401,20 +1406,138 @@ class ZScoreIcebergHunterStrategy:
         logger.info("=" * 100)
 
     def _move_sl_to_half_tp(self, order_manager, current_price: float) -> None:
-        """Move SL to half TP price."""
+        """
+        Move SL to half TP price OR breakeven+fees, whichever is better.
+        ATOMIC: Only executes ONCE per position with single-fire guard.
+        """
         pos = self.current_position
         if pos is None or pos.tp_reduced:
             return
+        
+        # ✅ CRITICAL: Set flag IMMEDIATELY to prevent re-entry
+        pos.tp_reduced = True
 
         half_tp_roi = pos.initial_tp_roi * config.HALF_TP_THRESHOLD
         direction = 1.0 if pos.side == "long" else -1.0
+        
+        # Calculate half TP price
         price_movement = pos.entry_price * half_tp_roi
-        new_sl_price = pos.entry_price + (price_movement * direction)
+        half_tp_sl_price = pos.entry_price + (price_movement * direction)
+        
+        # Calculate breakeven + fees price
+        TAKER_FEE = 0.0006  # 0.06%
+        GST = 1.18
+        ROUND_TRIP_FEE = (TAKER_FEE * GST) * 2
+        fee_buffer_price = pos.entry_price * ROUND_TRIP_FEE
+        breakeven_sl_price = pos.entry_price + (fee_buffer_price * direction)
+        
+        # Use the better of the two (further from entry in profit direction)
+        if pos.side == "long":
+            new_sl_price = max(half_tp_sl_price, breakeven_sl_price)
+        else:
+            new_sl_price = min(half_tp_sl_price, breakeven_sl_price)
+        
+        old_sl = pos.sl_price
+
+        logger.info("=" * 100)
+        logger.info(f"[SL ADJUSTMENT] Half TP with fee protection")
+        logger.info(f"  Half TP SL: {half_tp_sl_price:.2f}")
+        logger.info(f"  Breakeven+Fees SL: {breakeven_sl_price:.2f}")
+        logger.info(f"  Final SL (best): {new_sl_price:.2f}")
+        logger.info(f"  Old SL: {old_sl:.2f}")
+
+        # ✅ SINGLE API CALL: Use replace instead of cancel+place
+        tp_side = "SELL" if pos.side == "long" else "BUY"
+        
+        try:
+            # Check if replace_stop_loss method exists (more efficient)
+            if hasattr(order_manager, 'replace_stop_loss'):
+                new_sl_order = order_manager.replace_stop_loss(
+                    existing_order_id=pos.sl_order_id,
+                    side=tp_side,
+                    quantity=pos.quantity,
+                    new_trigger_price=new_sl_price,
+                )
+                logger.info(f"✓ SL replaced in single API call")
+            else:
+                # Fallback: Cancel + Place (2 API calls)
+                logger.info("  Cancel old SL...")
+                order_manager.cancel_order(pos.sl_order_id)
+                time.sleep(0.3)  # Small delay for exchange processing
+                
+                logger.info("  Place new SL...")
+                new_sl_order = order_manager.place_stop_loss(
+                    side=tp_side,
+                    quantity=pos.quantity,
+                    trigger_price=new_sl_price,
+                )
+            
+            if new_sl_order:
+                pos.sl_order_id = new_sl_order.get("order_id", "")
+                pos.sl_price = new_sl_price
+                logger.info(f"✓ SL moved to half TP (fee-protected): {new_sl_price:.2f}")
+                logger.info("=" * 100)
+
+                try:
+                    from telegram_notifier import format_sl_adjustment, send_telegram_message
+                    msg = format_sl_adjustment(
+                        trade_id=pos.trade_id,
+                        old_sl=old_sl,
+                        new_sl=new_sl_price,
+                        reason=f"Half TP reached ({half_tp_roi*100:.2f}%) - fees covered",
+                    )
+                    send_telegram_message(msg)
+                except Exception as e:
+                    logger.error(f"Telegram notification failed: {e}")
+            else:
+                logger.error("Failed to place new SL - rolling back flag")
+                pos.tp_reduced = False  # Rollback if failed
+                
+        except Exception as e:
+            logger.error(f"SL adjustment failed: {e}")
+            pos.tp_reduced = False  # Rollback on error
+
+
+    # ======================================================================
+    # HELPER METHODS (existing implementations)
+    # ======================================================================
+
+    def _tighten_sl_to_breakeven(self, order_manager, current_price: float) -> None:
+        """
+        Tighten SL to breakeven + fees.
+        Fees: Maker 0.024%, Taker 0.06%, GST 18%
+        Total worst-case: (0.06% * 1.18) * 2 = 0.1416% per round trip
+        """
+        pos = self.current_position
+        if pos is None:
+            return
+
+        # Calculate fees (worst case: taker fee with GST, both entry and exit)
+        TAKER_FEE = 0.0006  # 0.06%
+        GST = 1.18
+        ROUND_TRIP_FEE = (TAKER_FEE * GST) * 2  # Entry + Exit
+        
+        # Breakeven = entry price + fee buffer
+        direction = 1.0 if pos.side == "long" else -1.0
+        fee_buffer_price = pos.entry_price * ROUND_TRIP_FEE
+        new_sl_price = pos.entry_price + (fee_buffer_price * direction)
 
         old_sl = pos.sl_price
 
-        order_manager.cancel_order(pos.sl_order_id)
+        logger.info(f"[SL TIGHTENING] Breakeven + Fees")
+        logger.info(f"  Old SL: {old_sl:.2f}")
+        logger.info(f"  Entry: {pos.entry_price:.2f}")
+        logger.info(f"  Fee Buffer: {ROUND_TRIP_FEE*100:.4f}% = ${fee_buffer_price:.2f}")
+        logger.info(f"  New SL (Breakeven+Fees): {new_sl_price:.2f}")
 
+        # Cancel old SL
+        try:
+            order_manager.cancel_order(pos.sl_order_id)
+            time.sleep(0.5)
+        except Exception as e:
+            logger.warning(f"Old SL cancel failed: {e}")
+
+        # Place new SL
         tp_side = "SELL" if pos.side == "long" else "BUY"
         new_sl_order = order_manager.place_stop_loss(
             side=tp_side,
@@ -1425,23 +1548,19 @@ class ZScoreIcebergHunterStrategy:
         if new_sl_order:
             pos.sl_order_id = new_sl_order.get("order_id", "")
             pos.sl_price = new_sl_price
-            pos.tp_reduced = True
-            logger.info(f"✓ Moved SL to half TP: {new_sl_price:.2f}")
+            logger.info(f"✓ SL tightened to breakeven+fees: {new_sl_price:.2f}")
 
             try:
+                from telegram_notifier import format_sl_adjustment, send_telegram_message
                 msg = format_sl_adjustment(
                     trade_id=pos.trade_id,
                     old_sl=old_sl,
                     new_sl=new_sl_price,
-                    reason="Half TP reached - securing profits",
+                    reason=f"Breakeven protection (fees covered: {ROUND_TRIP_FEE*100:.4f}%)",
                 )
                 send_telegram_message(msg)
             except Exception as e:
-                logger.error(f"Error sending SL adjustment notification: {e}")
-
-    # ======================================================================
-    # HELPER METHODS (existing implementations)
-    # ======================================================================
+                logger.error(f"Telegram notification failed: {e}")
 
     def _get_regime_params(self, data_manager, current_price: float) -> Dict:
         """Get dynamic params based on vol regime."""
