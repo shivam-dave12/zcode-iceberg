@@ -883,18 +883,25 @@ class ZScoreIcebergHunterStrategy:
         current_price: float,
         now_sec: float
     ) -> None:
-        """Position management with thread-safe TP adjustments"""
+        """
+        ✅ FIXED: Position management with proper rate limiting and SL adjustment
+        
+        Flow:
+        1. Wait for limit fill (with timeout handling)
+        2. T+10min: Check if profit > half TP, adjust TP and SL
+        3. T+15min: Tighten TP to current profit + buffer
+        """
         pos = self.current_position
         if pos is None:
             return
-
+        
         # ========================================
         # PHASE 1: Wait for Limit Fill (120s timeout)
         # ========================================
         if not pos.main_filled:
             elapsed_since_place = now_sec - pos.limit_order_placed_time
-
-            # ✅ FIXED: Single-fire timeout handler with guard
+            
+            # Single-fire timeout handler
             if (
                 elapsed_since_place > config.LIMIT_ORDER_WAIT_TIMEOUT_SEC
                 and not pos.timeout_cancelled
@@ -903,21 +910,24 @@ class ZScoreIcebergHunterStrategy:
                 logger.warning(
                     f"⏱️ LIMIT TIMEOUT {elapsed_since_place:.1f}s → SINGLE-FIRE HANDLER"
                 )
-
-                # ✅ Guard against concurrent checks
+                
                 if self._checking_order_status:
-                    logger.warning("⚠️  Status check already in progress, skipping")
+                    logger.warning("⚠️ Status check already in progress, skipping")
                     return
-
+                
                 self._checking_order_status = True
-
+                
                 try:
-                    # Safety check: verify NO position exists via API
+                    # ✅ FIX: Single position check with rate limiting
                     try:
+                        from order_manager import GlobalRateLimiter
+                        GlobalRateLimiter.wait()
+                        
                         positions_resp = order_manager.api.get_positions(
                             symbol=config.SYMBOL,
                             exchange=config.EXCHANGE,
                         )
+                        
                         if positions_resp and not positions_resp.get("error"):
                             data = positions_resp.get("data", [])
                             if isinstance(data, list):
@@ -937,11 +947,11 @@ class ZScoreIcebergHunterStrategy:
                                             return
                     except Exception as e:
                         logger.debug(f"Position check error: {e}")
-
-                    # Final status check
+                    
+                    # Final status check with rate limiting
                     final_status_normalized = order_manager.get_order_status_safe(pos.main_order_id)
                     logger.info(f"📊 Final status check result: {final_status_normalized}")
-
+                    
                     if final_status_normalized == "FILLED":
                         logger.info("✅ ORDER FILLED (confirmed) - Activating position management")
                         try:
@@ -953,10 +963,10 @@ class ZScoreIcebergHunterStrategy:
                         except Exception as e:
                             logger.warning(f"Could not extract fill price: {e}")
                             pos.entry_price = current_price
-
+                        
                         pos.main_filled = True
                         pos.timeout_cancelled = False
-
+                        
                         try:
                             from telegram_notifier import format_fill_message, send_telegram_message
                             msg = format_fill_message(
@@ -970,9 +980,8 @@ class ZScoreIcebergHunterStrategy:
                             send_telegram_message(msg)
                         except Exception as e:
                             logger.error(f"Error sending fill notification: {e}")
-
                         return
-
+                    
                     elif final_status_normalized == "UNKNOWN":
                         logger.warning(
                             "⚠️ ORDER STATUS UNKNOWN (API failed) - Treating as POTENTIALLY FILLED\n"
@@ -981,7 +990,7 @@ class ZScoreIcebergHunterStrategy:
                         pos.main_filled = True
                         pos.timeout_cancelled = False
                         pos.entry_price = current_price
-
+                        
                         try:
                             from telegram_notifier import format_order_status_unknown, send_telegram_message
                             msg = format_order_status_unknown(
@@ -993,16 +1002,15 @@ class ZScoreIcebergHunterStrategy:
                             send_telegram_message(msg)
                         except Exception as e:
                             logger.error(f"Error sending unknown status notification: {e}")
-
                         return
-
+                    
                     elif final_status_normalized == "CANCELLED":
                         logger.info("🧹 Order confirmed CANCELLED - cleaning up bracket")
                         try:
                             time.sleep(0.3)
                             order_manager.cancel_order(pos.tp_order_id)
                             order_manager.cancel_order(pos.sl_order_id)
-
+                            
                             msg = (
                                 f"⏱️ TIMEOUT #{pos.trade_id}\n"
                                 f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1014,37 +1022,34 @@ class ZScoreIcebergHunterStrategy:
                             send_telegram_message(msg)
                         except Exception as e:
                             logger.error(f"Error cancelling TP/SL: {e}")
-
+                        
                         self.current_position = None
                         self.pending_entry = False
                         self.last_entry_time_sec = now_sec
                         return
-
                     else:
                         logger.error(f"Unexpected status: {final_status_normalized}")
                         pos.main_filled = True
                         pos.entry_price = current_price
                         return
-
+                
                 finally:
                     self._checking_order_status = False
-
-            # FIX ISSUE 2: Early fill detection with guard
+            
+            # ✅ FIX: Early fill detection with proper rate limiting
             if not hasattr(pos, "_last_early_check_time"):
                 pos._last_early_check_time = 0.0
-
-            if now_sec - pos._last_early_check_time >= 2.0:
+            
+            if now_sec - pos._last_early_check_time >= config.EARLY_FILL_CHECK_INTERVAL_SEC:
                 pos._last_early_check_time = now_sec
-
-                # Only check if not already handled
+                
                 if not self.early_fill_handled.get(pos.main_order_id, False):
                     status_normalized = order_manager.get_order_status_safe(pos.main_order_id)
-
+                    
                     if status_normalized == "FILLED":
-                        # Mark as handled to prevent duplicate logging
                         self.early_fill_handled[pos.main_order_id] = True
                         logger.info(f"✅ EARLY FILL detected: {pos.main_order_id}")
-
+                        
                         try:
                             full_status = order_manager.get_order_status(pos.main_order_id)
                             if full_status:
@@ -1053,10 +1058,10 @@ class ZScoreIcebergHunterStrategy:
                                 pos.entry_price = current_price
                         except Exception:
                             pos.entry_price = current_price
-
+                        
                         pos.main_filled = True
                         logger.info(f"Position activated @ {pos.entry_price:.2f}")
-
+                        
                         try:
                             from telegram_notifier import format_fill_message, send_telegram_message
                             msg = format_fill_message(
@@ -1070,24 +1075,23 @@ class ZScoreIcebergHunterStrategy:
                             send_telegram_message(msg)
                         except Exception as e:
                             logger.error(f"Error sending fill notification: {e}")
-
+            
             return  # Continue waiting for fill
-
+        
         # ========================================
         # PHASE 2: FILLED POSITION MANAGEMENT
         # ========================================
         hold_min = (now_sec - pos.entry_time_sec) / 60.0
-
+        direction = 1.0 if pos.side == "long" else -1.0
+        current_profit_pct = ((current_price - pos.entry_price) / pos.entry_price) * direction
+        
         # ========================================
         # Periodic Position Status Logging (60s)
         # ========================================
         if now_sec - self._last_position_log_sec >= self.POSITION_LOG_INTERVAL_SEC:
             self._last_position_log_sec = now_sec
-            direction = 1.0 if pos.side == "long" else -1.0
-            current_profit_pct = ((current_price - pos.entry_price) / pos.entry_price) * direction
-            hold_min = (now_sec - pos.entry_time_sec) / 60.0
             upnl = (current_price - pos.entry_price) * direction * pos.quantity
-
+            
             logger.info("\n" + "=" * 100)
             logger.info(f"[POSITION STATUS] {pos.trade_id}")
             logger.info("=" * 100)
@@ -1101,28 +1105,27 @@ class ZScoreIcebergHunterStrategy:
             logger.info(f"  Unrealized P&L: {upnl:.2f} USDT ({current_profit_pct*100:.2f}%)")
             logger.info(f"  TP Adjustments: {pos.tp_adjustment_count}")
             logger.info("=" * 100 + "\n")
-
+        
         # ========================================
-        # Bracket Exit Check (10s interval) - TP/SL hits
-        # CRITICAL FIX: Check for PARTIAL fills too
+        # ✅ FIX: Bracket Exit Check (30s interval with rate limiting)
         # ========================================
-        if now_sec - getattr(self, '_last_bracket_check_sec', 0) >= self.ORDER_STATUS_CHECK_INTERVAL_SEC:
+        if not hasattr(self, '_last_bracket_check_sec'):
+            self._last_bracket_check_sec = 0
+        
+        if now_sec - self._last_bracket_check_sec >= config.ORDER_STATUS_CHECK_INTERVAL_SEC:
             self._last_bracket_check_sec = now_sec
-
+            
             # Check TP status
             tp_status_resp = order_manager.get_order_status(pos.tp_order_id)
             if tp_status_resp:
                 tp_status = str(tp_status_resp.get("status", "")).upper()
-
-                # CRITICAL FIX: Handle PARTIALLY_EXECUTED as TP hit
+                
                 if tp_status in ("EXECUTED", "FILLED", "PARTIALLY_EXECUTED", "PARTIALLY_FILLED"):
                     logger.info(f"TP triggered (status: {tp_status})")
-
-                    # For partial fills, exit at current price
                     exit_reason = "TP_PARTIAL" if "PARTIAL" in tp_status else "TP_HIT"
                     self._exit_position(order_manager, risk_manager, current_price, exit_reason, now_sec)
                     return
-
+            
             # Check SL status
             sl_status_resp = order_manager.get_order_status(pos.sl_order_id)
             if sl_status_resp:
@@ -1131,25 +1134,20 @@ class ZScoreIcebergHunterStrategy:
                     logger.info(f"SL triggered (status: {sl_status})")
                     self._exit_position(order_manager, risk_manager, current_price, "SL_HIT", now_sec)
                     return
-
+        
         # ========================================
-        # CRITICAL FIX: Initialize momentum variables BEFORE use
+        # Market Conditions Check (5s interval)
         # ========================================
-        direction = 1.0 if pos.side == "long" else -1.0
-        current_profit_pct = ((current_price - pos.entry_price) / pos.entry_price) * direction
-
-        # Initialize with safe defaults
         momentum_favorable = False
         vol_favorable = True
         trend_favorable = False
-
-        # Update market conditions check (5s interval)
+        
         if now_sec - pos.last_momentum_check_sec >= config.POSITION_CHECK_INTERVAL_SEC:
             pos.last_momentum_check_sec = now_sec
             momentum_favorable, vol_favorable, trend_favorable = self._check_market_conditions(
                 data_manager, pos.side, current_price
             )
-
+        
         # Momentum logging (30s)
         if now_sec - pos.last_momentum_log_sec >= config.MOMENTUM_LOG_INTERVAL_SEC:
             pos.last_momentum_log_sec = now_sec
@@ -1157,23 +1155,21 @@ class ZScoreIcebergHunterStrategy:
                 f"[MOMENTUM] {pos.trade_id} | Hold={hold_min:.1f}m | P&L={current_profit_pct*100:.2f}% | "
                 f"M={momentum_favorable} V={vol_favorable} T={trend_favorable}"
             )
-
+        
         # ========================================
-        # FIX ISSUE 3 & 4: SESSION-BASED TP MANAGEMENT TIMELINE
+        # ✅ FIXED: SESSION-BASED TP/SL MANAGEMENT TIMELINE
         # ========================================
-
-        # T+10min: Half-TP Logic (SINGLE execution)
-        if (hold_min >= config.FIRST_TP_WAIT_MINUTES and
-            not pos.tp_adjusted_10min):
-            self._adjust_tp_after_10min(
+        
+        # T+10min: Half-TP and Breakeven SL Logic
+        if (hold_min >= config.FIRST_TP_WAIT_MINUTES and not pos.tp_adjusted_10min):
+            self._adjust_tp_and_sl_after_10min(
                 data_manager, order_manager, current_price, now_sec,
                 momentum_favorable, vol_favorable, trend_favorable,
                 current_profit_pct
             )
-
-        # T+15min: Final TP Tightening (SINGLE execution)
-        elif (hold_min >= (config.FIRST_TP_WAIT_MINUTES + config.SECOND_TP_WAIT_MINUTES) and
-              not pos.tp_tightened_15min):
+        
+        # T+15min: Final TP Tightening
+        elif (hold_min >= (config.FIRST_TP_WAIT_MINUTES + config.SECOND_TP_WAIT_MINUTES) and not pos.tp_tightened_15min):
             self._tighten_tp_after_15min(
                 order_manager, current_price, current_profit_pct
             )
@@ -1182,7 +1178,7 @@ class ZScoreIcebergHunterStrategy:
     # FIX ISSUE 3 & 4: INDUSTRIAL-GRADE TP MANAGEMENT
     # ======================================================================
 
-    def _adjust_tp_after_10min(
+    def _adjust_tp_and_sl_after_10min(
         self,
         data_manager,
         order_manager,
@@ -1193,66 +1189,372 @@ class ZScoreIcebergHunterStrategy:
         trend_favorable: bool,
         current_profit_pct: float,
     ) -> None:
-        """Smart TP adjustment at 10 minutes"""
+        """
+        ✅ FIXED: Smart TP and SL adjustment at T+10 minutes with safety checks
+        """
         pos = self.current_position
         if pos is None:
             return
         
+        # Store data manager reference for price safety checks
+        self._data_manager_ref = data_manager
+        
         with self._tp_lock:
             if self._adjusting_tp:
-                logger.warning("⚠️ TP adjustment already in progress, skipping 10min adjust")
+                logger.warning("⚠️ TP/SL adjustment already in progress, skipping 10min adjust")
                 return
             
             self._adjusting_tp = True
             
             try:
                 pos.tp_adjusted_10min = True
-                pos.tp_adjustment_count += 1
-
+                
                 half_tp_roi = pos.initial_tp_roi * config.HALF_TP_THRESHOLD
                 all_favorable = momentum_favorable and vol_favorable and trend_favorable
-
+                
                 logger.info("=" * 100)
-                logger.info(f"[TP MANAGEMENT 10MIN] {pos.trade_id}")
+                logger.info(f"[TP/SL MANAGEMENT 10MIN] {pos.trade_id}")
                 logger.info(f"  All favorable (M/V/T): {all_favorable}")
                 logger.info(f"  Current profit: {current_profit_pct*100:.2f}%")
                 logger.info(f"  Half TP target: {half_tp_roi*100:.2f}%")
-
-                if all_favorable:
-                    if current_profit_pct >= half_tp_roi:
-                        self._move_sl_to_half_tp(order_manager, current_price)
-                        logger.info("  → Moved SL to half TP, waiting 5min more")
-                    else:
-                        logger.info("  → Waiting 5min more")
-                else:
-                    if current_profit_pct >= half_tp_roi:
-                        new_tp_roi = current_profit_pct + config.TP_BUFFER_PERCENT
-                    else:
-                        new_tp_roi = half_tp_roi
-
-                    if current_profit_pct >= new_tp_roi:
-                        logger.warning(f"  ⚠️ Current P&L ({current_profit_pct*100:.2f}%) already ABOVE new TP ({new_tp_roi*100:.2f}%)")
-                        logger.info(f"  → Skipping TP adjustment, tightening SL to breakeven+fees")
-                        self._tighten_sl_to_breakeven(order_manager, current_price)
+                
+                # Check if profit exceeds half TP
+                if current_profit_pct >= half_tp_roi:
+                    logger.info(f"  ✓ Profit exceeds half TP threshold")
+                    
+                    if all_favorable:
+                        # Scenario A: Keep original TP, move SL to breakeven
+                        logger.info("  → Strategy: All favorable - keeping original TP, moving SL to breakeven")
+                        
+                        success = self._move_sl_to_breakeven(order_manager, current_price, pos.entry_price)
+                        
+                        if success:
+                            logger.info("  ✅ T+10min adjustment complete (SL to breakeven)")
+                        else:
+                            logger.error("  ❌ SL adjustment failed - keeping original bracket")
+                        
                         logger.info("=" * 100)
-                        return
-
+                    else:
+                        # Scenario B: Reduce TP to half, move SL to breakeven
+                        logger.info("  → Strategy: Not all favorable - reducing TP to half, moving SL to breakeven")
+                        
+                        new_tp_price, new_sl_price = self._compute_bracket_prices(
+                            entry_price=pos.entry_price,
+                            margin_used=pos.margin_used,
+                            quantity=pos.quantity,
+                            side=pos.side,
+                            tp_roi=half_tp_roi,
+                            sl_roi=config.BREAKEVEN_FEE_BUFFER_PCT,
+                            session=pos.entry_session,
+                        )
+                        
+                        # Replace both TP and SL
+                        tp_success = self._replace_take_profit_order(order_manager, new_tp_price, half_tp_roi)
+                        sl_success = self._replace_stop_loss_order(order_manager, new_sl_price, config.BREAKEVEN_FEE_BUFFER_PCT)
+                        
+                        if tp_success and sl_success:
+                            logger.info(f"  ✅ TP reduced to {half_tp_roi*100:.2f}%, SL to breakeven")
+                            pos.tp_adjustment_count += 1
+                        elif tp_success:
+                            logger.warning(f"  ⚠️ TP adjusted but SL adjustment failed")
+                            pos.tp_adjustment_count += 1
+                        elif sl_success:
+                            logger.warning(f"  ⚠️ SL adjusted but TP adjustment failed")
+                        else:
+                            logger.error(f"  ❌ Both TP and SL adjustments failed - keeping original bracket")
+                        
+                        logger.info("=" * 100)
+                else:
+                    # Scenario C: Reduce TP to half, keep SL unchanged
+                    logger.info(f"  → Strategy: Profit below half TP - reducing TP only")
+                    
                     new_tp_price, _ = self._compute_bracket_prices(
                         entry_price=pos.entry_price,
                         margin_used=pos.margin_used,
                         quantity=pos.quantity,
                         side=pos.side,
-                        tp_roi=new_tp_roi,
+                        tp_roi=half_tp_roi,
                         sl_roi=pos.initial_sl_roi,
                         session=pos.entry_session,
                     )
-
-                    self._replace_take_profit_order(order_manager, new_tp_price, new_tp_roi)
-
-                logger.info("=" * 100)
+                    
+                    success = self._replace_take_profit_order(order_manager, new_tp_price, half_tp_roi)
+                    
+                    if success:
+                        logger.info(f"  ✅ TP reduced to {half_tp_roi*100:.2f}%, SL unchanged")
+                        pos.tp_adjustment_count += 1
+                    else:
+                        logger.error(f"  ❌ TP adjustment failed - keeping original bracket")
+                    
+                    logger.info("=" * 100)
             
             finally:
                 self._adjusting_tp = False
+
+
+    def _move_sl_to_breakeven(
+        self,
+        order_manager,
+        current_price: float,
+        entry_price: float
+    ) -> bool:
+        """
+        ✅ FIXED: Move SL to breakeven with safety checks
+        Returns True if successful, False otherwise
+        """
+        pos = self.current_position
+        if pos is None:
+            return False
+        
+        try:
+            logger.info("=" * 80)
+            logger.info(f"[SL TO BREAKEVEN] {pos.trade_id}")
+            logger.info(f"  Entry Price: {entry_price:.2f}")
+            logger.info(f"  Breakeven Fee Buffer: {config.BREAKEVEN_FEE_BUFFER_PCT*100:.4f}%")
+            
+            # Calculate breakeven SL using same methodology
+            _, new_sl_price = self._compute_bracket_prices(
+                entry_price=entry_price,
+                margin_used=pos.margin_used,
+                quantity=pos.quantity,
+                side=pos.side,
+                tp_roi=pos.current_tp_roi,
+                sl_roi=config.BREAKEVEN_FEE_BUFFER_PCT,
+                session=pos.entry_session,
+            )
+            
+            success = self._replace_stop_loss_order(order_manager, new_sl_price, config.BREAKEVEN_FEE_BUFFER_PCT)
+            
+            if success:
+                logger.info(f"  ✓ SL moved to breakeven: {new_sl_price:.2f}")
+            else:
+                logger.error(f"  ✗ Failed to move SL to breakeven")
+            
+            logger.info("=" * 80)
+            return success
+            
+        except Exception as e:
+            logger.error(f"Error moving SL to breakeven: {e}", exc_info=True)
+            return False
+
+    def _replace_stop_loss_order(
+        self,
+        order_manager,
+        new_sl_price: float,
+        new_sl_roi: float
+    ) -> bool:
+        """
+        ✅ FIXED: Atomically replace SL with PRICE SAFETY CHECK
+        
+        Flow:
+        1. Check if new SL price is safe (far enough from current price)
+        2. If UNSAFE → Abort and keep existing SL
+        3. If SAFE → Cancel old SL (1 API call)
+        4. Place new SL (1 API call)
+        5. Verify placement (1 API call)
+        
+        Total: 3 API calls (with rate limiting)
+        """
+        pos = self.current_position
+        if pos is None:
+            logger.error("No active position for SL replacement")
+            return False
+        
+        try:
+            old_sl_id = pos.sl_order_id
+            old_sl_price = pos.sl_price
+            old_sl_roi = pos.sl_roi
+            
+            # ========================================
+            # STEP 1: PRICE SAFETY CHECK (NO API CALL)
+            # ========================================
+            current_price = pos.entry_price  # Use cached price
+            try:
+                # Get real-time price from data manager
+                if hasattr(self, '_data_manager_ref'):
+                    current_price = self._data_manager_ref.get_last_price()
+            except:
+                pass
+            
+            # Calculate distance from current price to new SL
+            if pos.side == "long":
+                distance = current_price - new_sl_price
+            else:
+                distance = new_sl_price - current_price
+            
+            logger.info("")
+            logger.info("=" * 80)
+            logger.info(f"[SL REPLACEMENT SAFETY CHECK] {pos.trade_id}")
+            logger.info(f"  Current Price: {current_price:.2f}")
+            logger.info(f"  Old SL: {old_sl_price:.2f} ({old_sl_roi*100:.2f}%)")
+            logger.info(f"  New SL: {new_sl_price:.2f} ({new_sl_roi*100:.2f}%)")
+            logger.info(f"  Distance: {distance:.2f} USDT ({distance/config.TICK_SIZE:.1f} ticks)")
+            logger.info(f"  Required: {config.MIN_SL_DISTANCE_PRICE:.2f} USDT ({config.MIN_SL_DISTANCE_TICKS} ticks)")
+            
+            # Safety check: New SL must be far enough from current price
+            if distance < config.MIN_SL_DISTANCE_PRICE:
+                logger.error(f"  ❌ UNSAFE: New SL too close to current price!")
+                logger.error(f"     Distance {distance:.2f} < Required {config.MIN_SL_DISTANCE_PRICE:.2f}")
+                logger.error(f"     ABORTING SL replacement to prevent order rejection")
+                logger.error(f"     Keeping existing SL @ {old_sl_price:.2f}")
+                logger.info("=" * 80)
+                return False
+            
+            logger.info(f"  ✓ SAFE: Distance check passed ({distance:.2f} >= {config.MIN_SL_DISTANCE_PRICE:.2f})")
+            
+            # Check if new SL is better than old SL (tighter stop = better protection)
+            sl_improvement = (new_sl_price - old_sl_price) if pos.side == "long" else (old_sl_price - new_sl_price)
+            if sl_improvement > 0:
+                logger.info(f"  ✓ IMPROVEMENT: SL tightened by {sl_improvement:.2f} USDT (better protection)")
+            else:
+                logger.warning(f"  ⚠️ WARNING: New SL is looser by {abs(sl_improvement):.2f} USDT")
+            
+            logger.info("")
+            logger.info(f"[SL REPLACEMENT] {pos.trade_id}")
+            logger.info(f"  Old SL: {old_sl_price:.2f} ({old_sl_roi*100:.2f}%)")
+            logger.info(f"  New SL: {new_sl_price:.2f} ({new_sl_roi*100:.2f}%)")
+            logger.info("")
+            
+            # ========================================
+            # STEP 2: CANCEL OLD SL (1 API CALL)
+            # ========================================
+            logger.info(f"  [1/3] Cancelling old SL: {old_sl_id}")
+            
+            from order_manager import GlobalRateLimiter
+            GlobalRateLimiter.wait()  # Rate limit protection
+            
+            cancel_resp = order_manager.api.cancel_order(
+                order_id=old_sl_id,
+                exchange=config.EXCHANGE,
+            )
+            
+            if cancel_resp.get("error"):
+                error_msg = str(cancel_resp.get("message", "Unknown error"))
+                
+                # Check if already cancelled/executed
+                if "cannot be cancelled" in error_msg.lower() or "CANCELLED" in error_msg:
+                    logger.warning(f"  ⚠️ Old SL already cancelled or executed: {error_msg}")
+                elif "not found" in error_msg.lower():
+                    logger.warning(f"  ⚠️ Old SL not found (may have triggered): {error_msg}")
+                else:
+                    logger.error(f"  ❌ SL cancel failed: {error_msg}")
+                    logger.error(f"     ABORTING to keep existing SL protection")
+                    logger.info("=" * 80)
+                    return False
+            else:
+                logger.info(f"  ✓ Old SL cancelled successfully")
+            
+            time.sleep(1.0)  # Wait for cancellation to propagate
+            
+            # ========================================
+            # STEP 3: PLACE NEW SL (1 API CALL)
+            # ========================================
+            logger.info(f"  [2/3] Placing new SL: {new_sl_price:.2f}")
+            
+            GlobalRateLimiter.wait()  # Rate limit protection
+            
+            sl_side = "SELL" if pos.side == "long" else "BUY"
+            new_sl_order = order_manager.place_stop_loss(
+                side=sl_side,
+                quantity=pos.quantity,
+                trigger_price=new_sl_price,
+            )
+            
+            if not new_sl_order or "order_id" not in new_sl_order:
+                logger.error(f"  ❌ SL placement failed: {new_sl_order}")
+                logger.error(f"     ⚠️ CRITICAL: Position now has NO SL protection!")
+                logger.error(f"     Attempting to restore old SL...")
+                
+                # Emergency: Try to restore old SL
+                try:
+                    GlobalRateLimiter.wait()
+                    restore_sl = order_manager.place_stop_loss(
+                        side=sl_side,
+                        quantity=pos.quantity,
+                        trigger_price=old_sl_price,
+                    )
+                    if restore_sl and "order_id" in restore_sl:
+                        logger.info(f"     ✓ Old SL restored: {restore_sl['order_id']}")
+                        pos.sl_order_id = restore_sl["order_id"]
+                    else:
+                        logger.error(f"     ❌ Could not restore old SL!")
+                except Exception as restore_err:
+                    logger.error(f"     ❌ Restore failed: {restore_err}")
+                
+                logger.info("=" * 80)
+                return False
+            
+            new_sl_id = new_sl_order["order_id"]
+            logger.info(f"  ✓ New SL placed: {new_sl_id}")
+            
+            # ========================================
+            # STEP 4: VERIFY PLACEMENT (1 API CALL)
+            # ========================================
+            logger.info(f"  [3/3] Verifying new SL: {new_sl_id}")
+            
+            time.sleep(2.0)  # Wait for order to register
+            GlobalRateLimiter.wait()  # Rate limit protection
+            
+            verify_resp = order_manager.get_order_status(new_sl_id)
+            
+            if not verify_resp:
+                logger.error(f"  ❌ Could not verify new SL {new_sl_id}")
+                logger.error(f"     Status check failed - manual verification required")
+                logger.info("=" * 80)
+                return False
+            
+            verify_status = str(verify_resp.get("status", "")).upper()
+            
+            if verify_status in ("CANCELLED", "REJECTED", "EXPIRED"):
+                logger.error(f"  ❌ New SL rejected with status: {verify_status}")
+                logger.error(f"     ⚠️ Position may have NO SL protection!")
+                logger.info("=" * 80)
+                return False
+            
+            if verify_status in ("PENDING", "NEW", "OPEN"):
+                logger.info(f"  ✓ SL replacement verified (status: {verify_status})")
+            else:
+                logger.warning(f"  ⚠️ Unexpected SL status: {verify_status}")
+            
+            logger.info("")
+            logger.info(f"  ✅ SL REPLACEMENT SUCCESSFUL")
+            logger.info(f"     New SL ID: {new_sl_id}")
+            logger.info(f"     Price: {new_sl_price:.2f} ({new_sl_roi*100:.2f}%)")
+            logger.info("=" * 80)
+            
+            # ========================================
+            # STEP 5: UPDATE POSITION TRACKING
+            # ========================================
+            pos.sl_order_id = new_sl_id
+            pos.sl_price = new_sl_price
+            pos.sl_roi = new_sl_roi
+            
+            # ========================================
+            # STEP 6: SEND TELEGRAM NOTIFICATION
+            # ========================================
+            try:
+                from telegram_notifier import send_telegram_message
+                is_breakeven = abs(new_sl_roi) < 0.005  # Within 0.5% = breakeven
+                
+                msg = (
+                    f"{'🛡️ SL TO BREAKEVEN' if is_breakeven else '📊 SL ADJUSTED'} #{pos.trade_id}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"  {pos.side.upper()} @ ${pos.entry_price:.2f}\n"
+                    f"  Old SL: ${old_sl_price:.2f} ({old_sl_roi*100:.2f}%)\n"
+                    f"  New SL: ${new_sl_price:.2f} ({new_sl_roi*100:.2f}%)\n"
+                    f"  Distance: {distance:.2f} USDT ({distance/config.TICK_SIZE:.1f} ticks)\n"
+                    f"  Status: ✅ ACTIVE"
+                )
+                send_telegram_message(msg)
+            except Exception as e:
+                logger.error(f"Error sending SL adjustment notification: {e}")
+            
+            return True
+        
+        except Exception as e:
+            logger.error(f"❌ Error replacing SL order: {e}", exc_info=True)
+            logger.error(f"   ⚠️ Position protection status UNKNOWN - manual check required")
+            return False
 
 
     def _tighten_tp_after_15min(
@@ -1303,106 +1605,224 @@ class ZScoreIcebergHunterStrategy:
                 self._adjusting_tp = False
 
     def _replace_take_profit_order(
-        self, order_manager, new_tp_price: float, new_tp_roi: float
-    ) -> None:
+        self,
+        order_manager,
+        new_tp_price: float,
+        new_tp_roi: float
+    ) -> bool:
         """
-        ATOMIC TP replacement with proper verification.
+        ✅ FIXED: Atomically replace TP with PRICE SAFETY CHECK
         
-        CRITICAL: This method assumes _tp_lock is already held by caller.
+        Flow:
+        1. Check if new TP price is safe (far enough from current price)
+        2. If UNSAFE → Abort and keep existing TP
+        3. If SAFE → Cancel old TP (1 API call)
+        4. Place new TP (1 API call)
+        5. Verify placement (1 API call)
+        
+        Total: 3 API calls (with rate limiting)
         """
         pos = self.current_position
         if pos is None:
-            return
+            logger.error("No active position for TP replacement")
+            return False
         
-        old_tp_id = pos.tp_order_id
-        old_tp_price = pos.current_tp_price or pos.tp_price
-        old_tp_roi = pos.current_tp_roi or pos.tp_roi
-        tp_side = "SELL" if pos.side == "long" else "BUY"
-        
-        logger.info("=" * 100)
-        logger.info(f"[TP REPLACEMENT] {pos.trade_id}")
-        logger.info(f"  Old TP: {old_tp_price:.2f} ({old_tp_roi*100:.2f}%)")
-        logger.info(f"  New TP: {new_tp_price:.2f} ({new_tp_roi*100:.2f}%)")
-        logger.info("=" * 100)
-        
-        # STEP 1: Cancel old TP (SINGLE REQUEST with error handling)
-        logger.info(f"🗑️  Cancelling old TP: {old_tp_id}")
         try:
-            if not order_manager.cancel_order(old_tp_id):
-                logger.warning("⚠️  Old TP cancel failed (may already be cancelled)")
-            else:
-                logger.info("✅ Old TP cancelled")
+            old_tp_id = pos.tp_order_id
+            old_tp_price = pos.tp_price
+            old_tp_roi = pos.tp_roi
             
-            # Wait for exchange to process
-            time.sleep(1.0)
-        except Exception as e:
-            logger.warning(f"⚠️  TP cancel error: {e}")
-        
-        # STEP 2: Place new TP (SINGLE REQUEST)
-        logger.info(f"📤 Placing new TP @ {new_tp_price:.2f}")
-        try:
+            # ========================================
+            # STEP 1: PRICE SAFETY CHECK (NO API CALL)
+            # ========================================
+            current_price = pos.entry_price  # Use cached price from data stream
+            try:
+                # Get real-time price from data manager
+                import data_manager
+                if hasattr(self, '_data_manager_ref'):
+                    current_price = self._data_manager_ref.get_last_price()
+            except:
+                pass
+            
+            # Calculate distance from current price to new TP
+            if pos.side == "long":
+                distance = new_tp_price - current_price
+            else:
+                distance = current_price - new_tp_price
+            
+            logger.info("")
+            logger.info("=" * 80)
+            logger.info(f"[TP REPLACEMENT SAFETY CHECK] {pos.trade_id}")
+            logger.info(f"  Current Price: {current_price:.2f}")
+            logger.info(f"  Old TP: {old_tp_price:.2f} ({old_tp_roi*100:.2f}%)")
+            logger.info(f"  New TP: {new_tp_price:.2f} ({new_tp_roi*100:.2f}%)")
+            logger.info(f"  Distance: {distance:.2f} USDT ({distance/config.TICK_SIZE:.1f} ticks)")
+            logger.info(f"  Required: {config.MIN_TP_DISTANCE_PRICE:.2f} USDT ({config.MIN_TP_DISTANCE_TICKS} ticks)")
+            
+            # Safety check: New TP must be far enough from current price
+            if distance < config.MIN_TP_DISTANCE_PRICE:
+                logger.error(f"  ❌ UNSAFE: New TP too close to current price!")
+                logger.error(f"     Distance {distance:.2f} < Required {config.MIN_TP_DISTANCE_PRICE:.2f}")
+                logger.error(f"     ABORTING TP replacement to prevent order rejection")
+                logger.error(f"     Keeping existing TP @ {old_tp_price:.2f}")
+                logger.info("=" * 80)
+                return False
+            
+            logger.info(f"  ✓ SAFE: Distance check passed ({distance:.2f} >= {config.MIN_TP_DISTANCE_PRICE:.2f})")
+            
+            # Check if new TP is better than old TP (for LONG: lower is better, SHORT: higher is better)
+            tp_improvement = (old_tp_price - new_tp_price) if pos.side == "long" else (new_tp_price - old_tp_price)
+            if tp_improvement <= 0:
+                logger.warning(f"  ⚠️ WARNING: New TP is not an improvement")
+                logger.warning(f"     Old TP better by {abs(tp_improvement):.2f} USDT")
+                logger.warning(f"     Proceeding anyway (tightening strategy)")
+            
+            logger.info("")
+            logger.info(f"[TP REPLACEMENT] {pos.trade_id}")
+            logger.info(f"  Old TP: {old_tp_price:.2f} ({old_tp_roi*100:.2f}%)")
+            logger.info(f"  New TP: {new_tp_price:.2f} ({new_tp_roi*100:.2f}%)")
+            logger.info("")
+            
+            # ========================================
+            # STEP 2: CANCEL OLD TP (1 API CALL)
+            # ========================================
+            logger.info(f"  [1/3] Cancelling old TP: {old_tp_id}")
+            
+            from order_manager import GlobalRateLimiter
+            GlobalRateLimiter.wait()  # Rate limit protection
+            
+            cancel_resp = order_manager.api.cancel_order(
+                order_id=old_tp_id,
+                exchange=config.EXCHANGE,
+            )
+            
+            if cancel_resp.get("error"):
+                error_msg = str(cancel_resp.get("message", "Unknown error"))
+                
+                # Check if already cancelled/executed
+                if "cannot be cancelled" in error_msg.lower() or "CANCELLED" in error_msg:
+                    logger.warning(f"  ⚠️ Old TP already cancelled or executed: {error_msg}")
+                elif "not found" in error_msg.lower():
+                    logger.warning(f"  ⚠️ Old TP not found (may have triggered): {error_msg}")
+                else:
+                    logger.error(f"  ❌ TP cancel failed: {error_msg}")
+                    logger.error(f"     ABORTING to keep existing TP protection")
+                    logger.info("=" * 80)
+                    return False
+            else:
+                logger.info(f"  ✓ Old TP cancelled successfully")
+            
+            time.sleep(1.0)  # Wait for cancellation to propagate
+            
+            # ========================================
+            # STEP 3: PLACE NEW TP (1 API CALL)
+            # ========================================
+            logger.info(f"  [2/3] Placing new TP: {new_tp_price:.2f}")
+            
+            GlobalRateLimiter.wait()  # Rate limit protection
+            
+            tp_side = "SELL" if pos.side == "long" else "BUY"
             new_tp_order = order_manager.place_take_profit(
                 side=tp_side,
                 quantity=pos.quantity,
                 trigger_price=new_tp_price,
             )
             
-            if new_tp_order and new_tp_order.get("order_id"):
-                new_tp_id = new_tp_order.get("order_id")
+            if not new_tp_order or "order_id" not in new_tp_order:
+                logger.error(f"  ❌ TP placement failed: {new_tp_order}")
+                logger.error(f"     ⚠️ CRITICAL: Position now has NO TP protection!")
+                logger.error(f"     Attempting to restore old TP...")
                 
-                # STEP 3: Verify placement (SINGLE REQUEST)
-                logger.info(f"🔍 Verifying new TP: {new_tp_id}")
-                time.sleep(0.5)
+                # Emergency: Try to restore old TP
+                try:
+                    GlobalRateLimiter.wait()
+                    restore_tp = order_manager.place_take_profit(
+                        side=tp_side,
+                        quantity=pos.quantity,
+                        trigger_price=old_tp_price,
+                    )
+                    if restore_tp and "order_id" in restore_tp:
+                        logger.info(f"     ✓ Old TP restored: {restore_tp['order_id']}")
+                        pos.tp_order_id = restore_tp["order_id"]
+                    else:
+                        logger.error(f"     ❌ Could not restore old TP!")
+                except Exception as restore_err:
+                    logger.error(f"     ❌ Restore failed: {restore_err}")
                 
-                verify_resp = order_manager.get_order_status(new_tp_id)
-                
-                if verify_resp and not verify_resp.get("error"):
-                    # SUCCESS - update position
-                    pos.tp_order_id = new_tp_id
-                    pos.current_tp_price = new_tp_price
-                    pos.current_tp_roi = new_tp_roi
-                    pos.tp_price = new_tp_price
-                    pos.tp_roi = new_tp_roi
-                    
-                    logger.info("✅ TP replacement successful")
-                    logger.info(f"   New TP ID: {new_tp_id}")
-                    logger.info(f"   Price: {new_tp_price:.2f} ({new_tp_roi*100:.2f}%)")
-                    logger.info("=" * 100)
-                    
-                    # Send Telegram notification
-                    try:
-                        from telegram_notifier import format_tp_adjustment, send_telegram_message
-                        
-                        if pos.tp_adjustment_count == 1:
-                            reason = "T+10min adjustment"
-                        elif pos.tp_adjustment_count == 2:
-                            reason = "T+15min tightening"
-                        else:
-                            reason = "Dynamic adjustment"
-                        
-                        msg = format_tp_adjustment(
-                            trade_id=pos.trade_id,
-                            old_tp=old_tp_price,
-                            new_tp=new_tp_price,
-                            old_roi=old_tp_roi,
-                            new_roi=new_tp_roi,
-                            reason=reason,
-                        )
-                        send_telegram_message(msg)
-                    except Exception as e:
-                        logger.error(f"Telegram notification failed: {e}")
-                    
-                    return  # SUCCESS - EXIT
-                else:
-                    logger.error("❌ TP verification failed")
+                logger.info("=" * 80)
+                return False
+            
+            new_tp_id = new_tp_order["order_id"]
+            logger.info(f"  ✓ New TP placed: {new_tp_id}")
+            
+            # ========================================
+            # STEP 4: VERIFY PLACEMENT (1 API CALL)
+            # ========================================
+            logger.info(f"  [3/3] Verifying new TP: {new_tp_id}")
+            
+            time.sleep(2.0)  # Wait for order to register
+            GlobalRateLimiter.wait()  # Rate limit protection
+            
+            verify_resp = order_manager.get_order_status(new_tp_id)
+            
+            if not verify_resp:
+                logger.error(f"  ❌ Could not verify new TP {new_tp_id}")
+                logger.error(f"     Status check failed - manual verification required")
+                logger.info("=" * 80)
+                return False
+            
+            verify_status = str(verify_resp.get("status", "")).upper()
+            
+            if verify_status in ("CANCELLED", "REJECTED", "EXPIRED"):
+                logger.error(f"  ❌ New TP rejected with status: {verify_status}")
+                logger.error(f"     ⚠️ Position may have NO TP protection!")
+                logger.info("=" * 80)
+                return False
+            
+            if verify_status in ("PENDING", "NEW", "OPEN"):
+                logger.info(f"  ✓ TP replacement verified (status: {verify_status})")
             else:
-                logger.error("❌ TP placement returned no order_id")
+                logger.warning(f"  ⚠️ Unexpected TP status: {verify_status}")
+            
+            logger.info("")
+            logger.info(f"  ✅ TP REPLACEMENT SUCCESSFUL")
+            logger.info(f"     New TP ID: {new_tp_id}")
+            logger.info(f"     Price: {new_tp_price:.2f} ({new_tp_roi*100:.2f}%)")
+            logger.info("=" * 80)
+            
+            # ========================================
+            # STEP 5: UPDATE POSITION TRACKING
+            # ========================================
+            pos.tp_order_id = new_tp_id
+            pos.tp_price = new_tp_price
+            pos.tp_roi = new_tp_roi
+            pos.current_tp_roi = new_tp_roi
+            
+            # ========================================
+            # STEP 6: SEND TELEGRAM NOTIFICATION
+            # ========================================
+            try:
+                from telegram_notifier import send_telegram_message
+                msg = (
+                    f"🎯 TP ADJUSTED #{pos.trade_id}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"  {pos.side.upper()} @ ${pos.entry_price:.2f}\n"
+                    f"  Old TP: ${old_tp_price:.2f} ({old_tp_roi*100:.2f}%)\n"
+                    f"  New TP: ${new_tp_price:.2f} ({new_tp_roi*100:.2f}%)\n"
+                    f"  Distance: {distance:.2f} USDT ({distance/config.TICK_SIZE:.1f} ticks)\n"
+                    f"  Status: ✅ ACTIVE"
+                )
+                send_telegram_message(msg)
+            except Exception as e:
+                logger.error(f"Error sending TP adjustment notification: {e}")
+            
+            return True
         
         except Exception as e:
-            logger.error(f"❌ TP replacement failed: {e}", exc_info=True)
-        
-        logger.error("❌ Failed to replace TP order")
-        logger.info("=" * 100)
+            logger.error(f"❌ Error replacing TP order: {e}", exc_info=True)
+            logger.error(f"   ⚠️ Position protection status UNKNOWN - manual check required")
+            return False
+
 
     def _move_sl_to_half_tp(self, order_manager, current_price: float) -> None:
         """
@@ -1501,65 +1921,21 @@ class ZScoreIcebergHunterStrategy:
     # HELPER METHODS (existing implementations)
     # ======================================================================
 
-    def _tighten_sl_to_breakeven(self, order_manager, current_price: float) -> None:
+    def _tighten_sl_to_breakeven(
+        self,
+        order_manager,
+        current_price: float
+    ) -> None:
         """
-        Tighten SL to breakeven + fees.
-        Fees: Maker 0.024%, Taker 0.06%, GST 18%
-        Total worst-case: (0.06% * 1.18) * 2 = 0.1416% per round trip
+        ✅ FIXED: Tighten SL to breakeven using proper calculation
         """
         pos = self.current_position
         if pos is None:
             return
-
-        # Calculate fees (worst case: taker fee with GST, both entry and exit)
-        TAKER_FEE = 0.0006  # 0.06%
-        GST = 1.18
-        ROUND_TRIP_FEE = (TAKER_FEE * GST) * 2  # Entry + Exit
         
-        # Breakeven = entry price + fee buffer
-        direction = 1.0 if pos.side == "long" else -1.0
-        fee_buffer_price = pos.entry_price * ROUND_TRIP_FEE
-        new_sl_price = pos.entry_price + (fee_buffer_price * direction)
-
-        old_sl = pos.sl_price
-
-        logger.info(f"[SL TIGHTENING] Breakeven + Fees")
-        logger.info(f"  Old SL: {old_sl:.2f}")
-        logger.info(f"  Entry: {pos.entry_price:.2f}")
-        logger.info(f"  Fee Buffer: {ROUND_TRIP_FEE*100:.4f}% = ${fee_buffer_price:.2f}")
-        logger.info(f"  New SL (Breakeven+Fees): {new_sl_price:.2f}")
-
-        # Cancel old SL
-        try:
-            order_manager.cancel_order(pos.sl_order_id)
-            time.sleep(0.5)
-        except Exception as e:
-            logger.warning(f"Old SL cancel failed: {e}")
-
-        # Place new SL
-        tp_side = "SELL" if pos.side == "long" else "BUY"
-        new_sl_order = order_manager.place_stop_loss(
-            side=tp_side,
-            quantity=pos.quantity,
-            trigger_price=new_sl_price,
-        )
-
-        if new_sl_order:
-            pos.sl_order_id = new_sl_order.get("order_id", "")
-            pos.sl_price = new_sl_price
-            logger.info(f"✓ SL tightened to breakeven+fees: {new_sl_price:.2f}")
-
-            try:
-                from telegram_notifier import format_sl_adjustment, send_telegram_message
-                msg = format_sl_adjustment(
-                    trade_id=pos.trade_id,
-                    old_sl=old_sl,
-                    new_sl=new_sl_price,
-                    reason=f"Breakeven protection (fees covered: {ROUND_TRIP_FEE*100:.4f}%)",
-                )
-                send_telegram_message(msg)
-            except Exception as e:
-                logger.error(f"Telegram notification failed: {e}")
+        logger.info(f"[SL TIGHTENING] Moving SL to breakeven + fees")
+        
+        self._move_sl_to_breakeven(order_manager, current_price, pos.entry_price)
 
     def _get_regime_params(self, data_manager, current_price: float) -> Dict:
         """Get dynamic params based on vol regime."""

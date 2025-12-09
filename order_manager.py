@@ -78,7 +78,7 @@ class OrderManager:
         self.last_order_time = current_time
         return True
     
-    def get_order_status(self, order_id: str, retry_count: int = 2) -> Optional[Dict]:
+    def get_order_status(self, order_id: str, retry_count: int = 1) -> Optional[Dict]:
         """
         Get order status with exponential backoff.
         Returns None on failure after all retries.

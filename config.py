@@ -190,6 +190,38 @@ LOG_POSITION_INTERVAL_SEC = 60.0
 TELEGRAM_REPORT_INTERVAL_SEC = 900.0
 BALANCE_CACHE_TTL_SEC = 300.0
 
+# ========================================
+# ORDER STATUS CHECK INTERVALS (RATE LIMIT PROTECTION)
+# ========================================
+ORDER_STATUS_CHECK_INTERVAL_SEC = 30.0  # Check TP/SL status every 30s (was 10s)
+POSITION_STATUS_CHECK_INTERVAL_SEC = 60.0  # Check position via API every 60s
+EARLY_FILL_CHECK_INTERVAL_SEC = 5.0  # Check for early fill every 5s
+
+# ========================================
+# BREAKEVEN FEE CALCULATION
+# ========================================
+MAKER_FEE_PCT = 0.00024  # 0.024%
+TAKER_FEE_PCT = 0.0006   # 0.06%
+GST_ON_FEES_PCT = 0.18   # 18% GST on trading fees
+
+# Add to your existing config.py
+
+# ========================================
+# TP/SL REPLACEMENT SAFETY BUFFERS
+# ========================================
+MIN_TP_DISTANCE_TICKS = 10  # Minimum 10 ticks away from current price
+MIN_SL_DISTANCE_TICKS = 10  # Minimum 10 ticks away from current price
+TICK_SIZE = 0.10  # BTC/USDT tick size
+
+# Calculate minimum distance in price
+MIN_TP_DISTANCE_PRICE = MIN_TP_DISTANCE_TICKS * TICK_SIZE  # $1.00
+MIN_SL_DISTANCE_PRICE = MIN_SL_DISTANCE_TICKS * TICK_SIZE  # $1.00
+
+
+# Breakeven buffer = entry fee + exit fee (assuming taker on both sides for safety)
+BREAKEVEN_FEE_BUFFER_PCT = (TAKER_FEE_PCT * 2) * (1 + GST_ON_FEES_PCT)  # ~0.14%
+
+
 if __name__ == "__main__":
     print("=" * 80)
     print("Z-SCORE ICEBERG HUNTER CONFIG LOADED")
