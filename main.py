@@ -1,6 +1,8 @@
 """
 Z-SCORE IMBALANCE ICEBERG HUNTER - Main Execution
+
 EVENT-DRIVEN with reduced API spam and comprehensive logging
+✅ FIXED: WebSocket reconnection with position state preservation
 """
 
 import time
@@ -8,6 +10,7 @@ import signal
 import sys
 import logging
 from datetime import datetime
+
 from futures_api import FuturesAPI
 from futures_websocket import FuturesWebSocket
 import config
@@ -18,7 +21,6 @@ from strategy import ZScoreIcebergHunterStrategy
 from zscore_excel_logger import ZScoreExcelLogger
 import telegram_config
 from telegram_notifier import send_telegram_message, install_global_telegram_log_handler
-
 
 logging.basicConfig(
     level=config.LOG_LEVEL,
@@ -34,15 +36,18 @@ logging.basicConfig(
 install_global_telegram_log_handler(level=logging.WARNING, throttle_seconds=5.0)
 logger = logging.getLogger(__name__)
 
+
 def _handle_uncaught_exception(exc_type, exc_value, exc_traceback) -> None:
     if issubclass(exc_type, KeyboardInterrupt):
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
         return
     logger.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
 
+
 sys.excepthook = _handle_uncaught_exception
 
 WS_IDLE_RESTART_SEC = 20.0
+
 
 class ZScoreIcebergBot:
     """Main bot - Event-Driven with minimal API calls"""
@@ -57,6 +62,7 @@ class ZScoreIcebergBot:
             api_key=config.COINSWITCH_API_KEY,
             secret_key=config.COINSWITCH_SECRET_KEY,
         )
+        
         self.data_manager = ZScoreDataManager()
         self.order_manager = OrderManager()
         self.risk_manager = RiskManager()
@@ -68,6 +74,7 @@ class ZScoreIcebergBot:
             self.excel_logger = None
         
         self.strategy = ZScoreIcebergHunterStrategy(excel_logger=self.excel_logger)
+        
         self.running = False
         self._last_stream_check_sec: float = 0.0
         self._last_report_sec: float = 0.0
@@ -106,7 +113,8 @@ class ZScoreIcebergBot:
         if self.data_manager.ws:
             self.data_manager.ws.orderbook_callbacks.append(on_book_update)
             self.data_manager.ws.trades_callbacks.append(on_trade_update)
-            logger.info("✓ Strategy callbacks registered")
+        
+        logger.info("✓ Strategy callbacks registered")
 
     def _trigger_strategy_update(self) -> None:
         """Trigger strategy update (throttled to 50ms)."""
@@ -186,7 +194,7 @@ class ZScoreIcebergBot:
             
             self.running = True
             self._run_main_loop()
-        
+            
         except Exception as e:
             logger.error(f"Error starting bot: {e}", exc_info=True)
             self.stop()
@@ -208,13 +216,13 @@ class ZScoreIcebergBot:
                 
                 # Minimal sleep
                 time.sleep(0.1)
-            
+                
             except Exception as e:
                 logger.error(f"Error in main loop: {e}", exc_info=True)
                 time.sleep(1.0)
 
     def _check_stream_health(self) -> None:
-        """Monitor WebSocket health."""
+        """✅ FIXED: Monitor WebSocket health with proper reconnection handling"""
         now_sec = time.time()
         if now_sec - self._last_stream_check_sec < 1.0:
             return
@@ -227,40 +235,79 @@ class ZScoreIcebergBot:
                 return
             
             idle_sec = (datetime.utcnow() - last_update).total_seconds()
+            
             if idle_sec <= WS_IDLE_RESTART_SEC:
                 return
             
             logger.warning("=" * 80)
-            logger.warning(f"WebSocket stale ({idle_sec:.1f}s) - restarting")
+            logger.warning(f"WebSocket stale ({idle_sec:.1f}s) - reconnecting")
+            
+            # ✅ CRITICAL: Save position state before reconnection
+            has_position = self.strategy.current_position is not None
+            position_details = None
+            if has_position:
+                pos = self.strategy.current_position
+                position_details = {
+                    'trade_id': pos.trade_id,
+                    'side': pos.side,
+                    'entry_price': pos.entry_price,
+                    'quantity': pos.quantity,
+                    'tp_price': pos.tp_price,
+                    'sl_price': pos.sl_price,
+                }
+                logger.warning(f"⚠️ ACTIVE POSITION DETECTED: {pos.trade_id} - {pos.side.upper()}")
+                logger.warning(f"   Entry: {pos.entry_price:.2f} | TP: {pos.tp_price:.2f} | SL: {pos.sl_price:.2f}")
+            
             logger.warning("=" * 80)
             
-            try:
-                self.data_manager.stop()
-            except Exception as e:
-                logger.error(f"Error stopping data manager: {e}")
-            
-            time.sleep(2.0)
+            # ✅ NEW: Use restart_streams instead of stop/start cycle
+            logger.info("🔄 Attempting stream reconnection...")
             
             for attempt in range(3):
                 try:
-                    logger.info(f"Restart attempt {attempt + 1}/3...")
-                    if self.data_manager.start():
-                        self._register_strategy_callbacks()
-                        logger.info("✓ Data manager restarted")
+                    logger.info(f"Reconnect attempt {attempt + 1}/3...")
+                    
+                    if self.data_manager.restart_streams():
+                        # ✅ Callbacks are preserved, just verify they're working
+                        logger.info("✓ Streams reconnected successfully")
+                        
+                        # Verify position still exists
+                        if has_position and self.strategy.current_position is not None:
+                            logger.info(f"✓ Position preserved: {position_details['trade_id']}")
+                            logger.info("✓ Position management will resume automatically")
+                        elif has_position and self.strategy.current_position is None:
+                            logger.error("⚠️ Position lost during reconnection!")
+                            send_telegram_message(
+                                f"⚠️ CRITICAL: Position lost during reconnection\n"
+                                f"Details: {position_details}\n"
+                                f"Manual verification required!"
+                            )
+                        
                         break
                     else:
-                        logger.warning(f"Restart attempt {attempt + 1} failed")
+                        logger.warning(f"Reconnect attempt {attempt + 1} failed")
                         time.sleep(5.0)
+                        
                 except Exception as e:
-                    logger.error(f"Error in restart: {e}")
+                    logger.error(f"Error in reconnect attempt {attempt + 1}: {e}")
                     time.sleep(5.0)
-        
+            else:
+                logger.error("❌ All reconnection attempts failed")
+                if has_position:
+                    send_telegram_message(
+                        f"🚨 CRITICAL: Reconnection failed with active position!\n"
+                        f"Position: {position_details}\n"
+                        f"TP/SL should still be active on exchange\n"
+                        f"Manual intervention required!"
+                    )
+            
         except Exception as e:
-            logger.error(f"Error in stream health check: {e}")
+            logger.error(f"Error in stream health check: {e}", exc_info=True)
 
     def stop(self) -> None:
         """Clean shutdown."""
         self.running = False
+        
         try:
             if self.data_manager:
                 self.data_manager.stop()
@@ -311,7 +358,6 @@ class ZScoreIcebergBot:
                 position_side = pos.side
                 position_qty = pos.quantity
                 position_entry = pos.entry_price
-                
                 direction = 1.0 if pos.side == "long" else -1.0
                 position_upnl = (last_price - pos.entry_price) * direction * pos.quantity
             

@@ -1317,3 +1317,36 @@ class ZScoreDataManager:
 
         momentum = (last - first) / first
         return float(max(-1.0, min(1.0, momentum)))
+
+    def restart_streams(self) -> bool:
+        """
+        ✅ CRITICAL FIX: Restart streams WITHOUT creating new WebSocket instance.
+        Reuses existing ws with auto-resubscribe functionality.
+        """
+        if not self.ws:
+            logger.error("WebSocket not initialized, cannot restart")
+            return self.start()
+        
+        try:
+            logger.info("🔄 Restarting streams (reconnection mode)...")
+            
+            # Check if already connected (socketio auto-reconnected)
+            if self.ws.is_connected:
+                logger.info("✓ WebSocket already reconnected automatically")
+                # Callbacks are preserved, subscriptions auto-resubscribed
+                self.is_streaming = True
+                return True
+            
+            # Attempt reconnection if not connected
+            logger.info("Attempting to reconnect WebSocket...")
+            if not self.ws.connect():
+                logger.error("WebSocket reconnection failed")
+                return False
+            
+            self.is_streaming = True
+            logger.info("✓ Streams restarted successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error restarting streams: {e}", exc_info=True)
+            return False

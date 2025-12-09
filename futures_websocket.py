@@ -6,6 +6,7 @@ Features:
 - Connection health monitoring
 - Thread-safe callback management
 - Graceful degradation on errors
+- AUTO-RESUBSCRIPTION after reconnect
 """
 
 import socketio
@@ -20,12 +21,12 @@ logger = logging.getLogger(__name__)
 
 
 class FuturesWebSocket:
-    """Production-grade WebSocket client with auto-reconnect"""
+    """Production-grade WebSocket client with auto-reconnect and auto-resubscribe"""
 
     BASE_URL = "https://ws.coinswitch.co"
     HANDSHAKE_PATH = "/pro/realtime-rates-socket/futures/exchange_2"
     NAMESPACE = "/exchange_2"
-
+    
     EVENT_ORDERBOOK = "FETCH_ORDER_BOOK_CS_PRO"
     EVENT_CANDLESTICK = "FETCH_CANDLESTICK_CS_PRO"
     EVENT_TRADES = "FETCH_TRADES_CS_PRO"
@@ -50,14 +51,22 @@ class FuturesWebSocket:
         self.trades_callbacks: List[Callable] = []
         self.ticker_callbacks: List[Callable] = []
         
+        # ✅ NEW: Store subscription parameters for auto-resubscribe
+        self._subscriptions_lock = threading.RLock()
+        self._subscriptions: Dict[str, Dict] = {
+            "orderbook": [],
+            "candlestick": [],
+            "trades": [],
+            "ticker": []
+        }
+        
         # Connection health monitoring
         self._last_message_time: Optional[datetime] = None
         self._connection_failures = 0
         self._max_connection_failures = 5
         
         self._setup_handlers()
-        
-        logger.info("WebSocket client initialized (production grade)")
+        logger.info("WebSocket client initialized (production grade with auto-resubscribe)")
 
     def _setup_handlers(self):
         """Setup WebSocket event handlers"""
@@ -69,13 +78,16 @@ class FuturesWebSocket:
             self._last_message_time = datetime.now()
             print("✓ Connected to futures market")
             logger.info(f"WebSocket connected to {self.NAMESPACE}")
-
+            
+            # ✅ CRITICAL FIX: Auto-resubscribe to all previous subscriptions
+            self._resubscribe_all()
+        
         @self.sio.event(namespace=self.NAMESPACE)
         def disconnect():
             self.is_connected = False
             print("✗ Disconnected from futures market")
             logger.warning("WebSocket disconnected")
-
+        
         @self.sio.event(namespace=self.NAMESPACE)
         def connect_error(data):
             self._connection_failures += 1
@@ -88,13 +100,12 @@ class FuturesWebSocket:
             if self._connection_failures >= self._max_connection_failures:
                 logger.critical("Max connection failures reached - stopping reconnection")
                 self.stop_event.set()
-
+        
         # ORDERBOOK handler with error isolation
         @self.sio.on(self.EVENT_ORDERBOOK, namespace=self.NAMESPACE)
         def on_orderbook(data):
             try:
                 self._last_message_time = datetime.now()
-                
                 if not isinstance(data, dict) or not ("bids" in data or "b" in data):
                     return
                 
@@ -113,16 +124,14 @@ class FuturesWebSocket:
                         callback(formatted)
                     except Exception as e:
                         logger.error(f"Orderbook callback error: {e}", exc_info=True)
-            
             except Exception as e:
                 logger.error(f"Error in orderbook handler: {e}", exc_info=True)
-
+        
         # TRADES handler with error isolation
         @self.sio.on(self.EVENT_TRADES, namespace=self.NAMESPACE)
         def on_trades(data):
             try:
                 self._last_message_time = datetime.now()
-                
                 if not isinstance(data, dict) or "p" not in data:
                     return
                 
@@ -142,16 +151,14 @@ class FuturesWebSocket:
                         callback(formatted)
                     except Exception as e:
                         logger.error(f"Trade callback error: {e}", exc_info=True)
-            
             except Exception as e:
                 logger.error(f"Error in trades handler: {e}", exc_info=True)
-
+        
         # CANDLESTICK handler with error isolation
         @self.sio.on(self.EVENT_CANDLESTICK, namespace=self.NAMESPACE)
         def on_candlestick(data):
             try:
                 self._last_message_time = datetime.now()
-                
                 if not isinstance(data, dict) or "c" not in data:
                     return
                 
@@ -163,15 +170,68 @@ class FuturesWebSocket:
                         callback(data)
                     except Exception as e:
                         logger.error(f"Candlestick callback error: {e}", exc_info=True)
-            
             except Exception as e:
                 logger.error(f"Error in candlestick handler: {e}", exc_info=True)
+
+    def _resubscribe_all(self):
+        """✅ CRITICAL FIX: Resubscribe to all previous subscriptions after reconnect"""
+        with self._subscriptions_lock:
+            logger.info("🔄 Resubscribing to all streams after reconnect...")
+            
+            # Resubscribe orderbook
+            for sub in self._subscriptions["orderbook"]:
+                try:
+                    self.sio.emit(
+                        self.EVENT_ORDERBOOK,
+                        {'event': 'subscribe', 'pair': sub['pair']},
+                        namespace=self.NAMESPACE
+                    )
+                    logger.info(f"✓ Resubscribed to orderbook: {sub['pair']}")
+                except Exception as e:
+                    logger.error(f"Error resubscribing orderbook {sub['pair']}: {e}")
+            
+            # Resubscribe candlestick
+            for sub in self._subscriptions["candlestick"]:
+                try:
+                    self.sio.emit(
+                        self.EVENT_CANDLESTICK,
+                        {'event': 'subscribe', 'pair': sub['pair']},
+                        namespace=self.NAMESPACE
+                    )
+                    logger.info(f"✓ Resubscribed to candlestick: {sub['pair']}")
+                except Exception as e:
+                    logger.error(f"Error resubscribing candlestick {sub['pair']}: {e}")
+            
+            # Resubscribe trades
+            for sub in self._subscriptions["trades"]:
+                try:
+                    self.sio.emit(
+                        self.EVENT_TRADES,
+                        {'event': 'subscribe', 'pair': sub['pair']},
+                        namespace=self.NAMESPACE
+                    )
+                    logger.info(f"✓ Resubscribed to trades: {sub['pair']}")
+                except Exception as e:
+                    logger.error(f"Error resubscribing trades {sub['pair']}: {e}")
+            
+            # Resubscribe ticker
+            for sub in self._subscriptions["ticker"]:
+                try:
+                    self.sio.emit(
+                        self.EVENT_TICKER,
+                        {'event': 'subscribe', 'pair': sub['pair']},
+                        namespace=self.NAMESPACE
+                    )
+                    logger.info(f"✓ Resubscribed to ticker: {sub['pair']}")
+                except Exception as e:
+                    logger.error(f"Error resubscribing ticker {sub['pair']}: {e}")
+            
+            logger.info("🔄 Resubscription complete")
 
     def connect(self, timeout: int = 30) -> bool:
         """Connect to WebSocket server with timeout"""
         try:
             logger.info(f"Connecting to {self.BASE_URL} with namespace {self.NAMESPACE}...")
-            
             self.sio.connect(
                 url=self.BASE_URL,
                 namespaces=[self.NAMESPACE],
@@ -180,9 +240,7 @@ class FuturesWebSocket:
                 wait=True,
                 wait_timeout=timeout
             )
-            
             return self.is_connected
-        
         except Exception as e:
             logger.error(f"Connection error: {e}", exc_info=True)
             print(f"Connection error: {e}")
@@ -192,13 +250,10 @@ class FuturesWebSocket:
         """Gracefully disconnect from WebSocket"""
         try:
             self.stop_event.set()
-            
             if self.sio.connected:
                 self.sio.disconnect()
-            
             print("✓ Disconnected successfully")
             logger.info("Disconnected successfully")
-        
         except Exception as e:
             logger.error(f"Disconnect error: {e}", exc_info=True)
             print(f"Disconnect error: {e}")
@@ -226,6 +281,11 @@ class FuturesWebSocket:
                 if callback not in self.orderbook_callbacks:
                     self.orderbook_callbacks.append(callback)
         
+        # ✅ Store subscription for auto-resubscribe
+        with self._subscriptions_lock:
+            if not any(s['pair'] == pair for s in self._subscriptions["orderbook"]):
+                self._subscriptions["orderbook"].append({'pair': pair})
+        
         logger.info(f"Subscribing to orderbook: {pair}")
         self.sio.emit(self.EVENT_ORDERBOOK, subscribe_data, namespace=self.NAMESPACE)
         print(f"✓ Subscribed to orderbook: {pair}")
@@ -240,6 +300,11 @@ class FuturesWebSocket:
                 if callback not in self.candlestick_callbacks:
                     self.candlestick_callbacks.append(callback)
         
+        # ✅ Store subscription for auto-resubscribe
+        with self._subscriptions_lock:
+            if not any(s['pair'] == pair_with_interval for s in self._subscriptions["candlestick"]):
+                self._subscriptions["candlestick"].append({'pair': pair_with_interval})
+        
         logger.info(f"Subscribing to candlestick: {pair_with_interval}")
         self.sio.emit(self.EVENT_CANDLESTICK, subscribe_data, namespace=self.NAMESPACE)
         print(f"✓ Subscribed to candlestick: {pair_with_interval}")
@@ -253,6 +318,11 @@ class FuturesWebSocket:
                 if callback not in self.trades_callbacks:
                     self.trades_callbacks.append(callback)
         
+        # ✅ Store subscription for auto-resubscribe
+        with self._subscriptions_lock:
+            if not any(s['pair'] == pair for s in self._subscriptions["trades"]):
+                self._subscriptions["trades"].append({'pair': pair})
+        
         logger.info(f"Subscribing to trades: {pair}")
         self.sio.emit(self.EVENT_TRADES, subscribe_data, namespace=self.NAMESPACE)
         print(f"✓ Subscribed to trades: {pair}")
@@ -265,6 +335,11 @@ class FuturesWebSocket:
             with self._callbacks_lock:
                 if callback not in self.ticker_callbacks:
                     self.ticker_callbacks.append(callback)
+        
+        # ✅ Store subscription for auto-resubscribe
+        with self._subscriptions_lock:
+            if not any(s['pair'] == pair for s in self._subscriptions["ticker"]):
+                self._subscriptions["ticker"].append({'pair': pair})
         
         logger.info(f"Subscribing to ticker: {pair}")
         self.sio.emit(self.EVENT_TICKER, subscribe_data, namespace=self.NAMESPACE)
