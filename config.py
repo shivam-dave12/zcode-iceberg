@@ -32,7 +32,7 @@ MAX_MARGIN_PER_TRADE = 10000
 WEEKEND_PARAMS = {
     "z_threshold": 0.80,
     "imbalance_threshold": 0.50,
-    "entry_score_threshold": 0.65,
+    "entry_score_threshold": 0.70,
     "wall_multiplier": 5.0,
     "min_signal_gap_sec": 180.0,  # 3 minutes
     "tp_roi_target": 0.04,        # 4%
@@ -41,12 +41,12 @@ WEEKEND_PARAMS = {
 
 # Major Sessions (Standard)
 MAJOR_SESSION_PARAMS = {
-    "z_threshold": 2.5,
+    "z_threshold": 2.1,
     "imbalance_threshold": 0.65,
-    "entry_score_threshold": 0.80,
+    "entry_score_threshold": 0.85,
     "wall_multiplier": 4.2,
-    "min_signal_gap_sec": 55.0,   # 1 minute
-    "tp_roi_target": 0.15,        # 15%
+    "min_signal_gap_sec": 60.0,   # 1 minute
+    "tp_roi_target": 0.12,        # 12%
     "sl_roi_max": 0.03,          # 3%
 }
 
