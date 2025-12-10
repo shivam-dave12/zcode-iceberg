@@ -875,28 +875,32 @@ class ZScoreIcebergHunterStrategy:
     # POSITION MANAGEMENT WITH SAFE TIMEOUT
     # ======================================================================
 
-    def manage_open_position(
-        self, datamanager, ordermanager, riskmanager, 
-        currentprice: float, nowsec: float = None
+    def _manage_open_position(
+        self,
+        data_manager,
+        order_manager,
+        risk_manager,
+        current_price: float,
+        now_sec: float = None
     ) -> None:
         """
-        FIXED Position management with SINGLE API call architecture:
-        - ONE position snapshot at entry
-        - State derived from snapshot, not repeated API calls
-        - Order status checked ONLY when critical
+        FIXED Position management - SINGLE API REQUEST ARCHITECTURE
+        - ONE position snapshot at entry, cached for entire cycle
+        - State derived from cached snapshot
+        - NO redundant API calls
         """
-        pos = self.currentposition
+        pos = self.current_position
         if pos is None:
             return
         
         # ====================================================================
-        # CRITICAL: SINGLE POSITION SNAPSHOT - Reused for ALL checks below
+        # CRITICAL: SINGLE POSITION SNAPSHOT - Fetched ONCE and cached
         # ====================================================================
         position_snapshot = None
         snapshot_fetched = False
         
         def get_position_once():
-            """Fetch position ONCE and cache for this cycle"""
+            """Fetch position ONCE per management cycle"""
             nonlocal position_snapshot, snapshot_fetched
             if snapshot_fetched:
                 return position_snapshot
@@ -904,7 +908,7 @@ class ZScoreIcebergHunterStrategy:
             try:
                 from order_manager import GlobalRateLimiter
                 GlobalRateLimiter.wait()
-                resp = ordermanager.api.get_positions(
+                resp = order_manager.api.getpositions(
                     symbol=config.SYMBOL, 
                     exchange=config.EXCHANGE
                 )
@@ -918,12 +922,11 @@ class ZScoreIcebergHunterStrategy:
                                     position_snapshot = {
                                         "quantity": qty,
                                         "entryprice": float(p.get("entryPrice", currentprice)),
-                                        "markprice": float(p.get("markPrice", currentprice)),
+                                        "markprice": float(p.get("markPrice", current_price)),
                                         "exists": True
                                     }
                                     snapshot_fetched = True
                                     return position_snapshot
-                # No position found
                 position_snapshot = {"exists": False}
                 snapshot_fetched = True
                 return position_snapshot
@@ -934,89 +937,104 @@ class ZScoreIcebergHunterStrategy:
                 return position_snapshot
         
         # ====================================================================
-        # PHASE 1: Limit Order Fill Detection (if not yet filled)
+        # PHASE 1: Limit Order Fill Detection
         # ====================================================================
-        if not pos.mainfilled:
-            elapsed_since_place = nowsec - pos.limitorderplacedtime
+        if not pos.main_filled:
+            elapsed_since_place = now_sec - pos.limit_order_placed_time
             
-            # Timeout handler - SINGLE CHECK
-            if elapsed_since_place > config.LIMITORDERWAITTIMEOUTSEC and not pos.timeoutcancelled:
-                pos.timeoutcancelled = True
-                logger.warning(f"⏱️ LIMIT TIMEOUT {elapsed_since_place:.1f}s - SINGLE-FIRE HANDLER")
+            if (elapsed_since_place > config.LIMIT_ORDER_WAIT_TIMEOUT_SEC and 
+                not pos.timeout_cancelled):
+                pos.timeout_cancelled = True
+                logger.warning(f"⏱️ LIMIT TIMEOUT {elapsed_since_place:.1f}s → SINGLE-FIRE HANDLER")
                 
-                if self.checkingorderstatus:
-                    logger.warning("Status check already in progress, skipping")
+                if self._checking_order_status:
+                    logger.warning("⚠️ Status check already in progress, skipping")
                     return
                 
-                self.checkingorderstatus = True
+                self._checking_order_status = True
                 try:
-                    # Use the SINGLE position snapshot
+                    # Use SINGLE position snapshot
                     snapshot = get_position_once()
                     
                     if snapshot["exists"]:
-                        logger.info(f"✅ ACTIVE POSITION {snapshot['quantity']:.6f} - ACTIVATING MANAGEMENT")
-                        pos.mainfilled = True
-                        pos.timeoutcancelled = False
-                        pos.entryprice = snapshot["entryprice"]
-                        logger.info(f"Position detected @{pos.entryprice:.2f} - TPSL PROTECTED")
+                        logger.info(f"✅ ACTIVE POSITION {snapshot['quantity']:.6f} → ACTIVATING MANAGEMENT")
+                        pos.main_filled = True
+                        pos.timeout_cancelled = False
+                        pos.entry_price = snapshot["entryprice"]
+                        logger.info(f"Position detected @ {pos.entry_price:.2f} - TPSL PROTECTED")
                         return
                     
                     # Position doesn't exist - check order status
-                    finalstatus_normalized = ordermanager.getorderstatussafe(pos.mainorderid)
-                    logger.info(f"📋 Final status check result: {finalstatus_normalized}")
+                    final_status_normalized = order_manager.getorderstatussafe(pos.main_order_id)
+                    logger.info(f"📊 Final status check result: {final_status_normalized}")
                     
-                    if finalstatus_normalized == "FILLED":
+                    if final_status_normalized == "FILLED":
                         logger.info("✅ ORDER FILLED confirmed - Activating position management")
-                        pos.mainfilled = True
-                        pos.timeoutcancelled = False
-                        pos.entryprice = currentprice
+                        try:
+                            full_status = order_manager.getorderstatus(pos.main_order_id)
+                            if full_status:
+                                pos.entry_price = order_manager.extractfillprice(full_status)
+                            else:
+                                pos.entry_price = current_price
+                        except Exception as e:
+                            logger.warning(f"Could not extract fill price: {e}")
+                            pos.entry_price = current_price
+                        pos.main_filled = True
+                        pos.timeout_cancelled = False
                         return
                         
-                    elif finalstatus_normalized == "UNKNOWN":
+                    elif final_status_normalized == "UNKNOWN":
                         logger.warning("⚠️ ORDER STATUS UNKNOWN (API failed) - Treating as POTENTIALLY FILLED. TPSL KEPT for safety.")
-                        pos.mainfilled = True
-                        pos.entryprice = currentprice
+                        pos.main_filled = True
+                        pos.entry_price = current_price
                         return
                         
-                    elif finalstatus_normalized == "CANCELLED":
-                        logger.info("❌ Order confirmed CANCELLED - cleaning up bracket")
+                    elif final_status_normalized == "CANCELLED":
+                        logger.info("🧹 Order confirmed CANCELLED - cleaning up bracket")
                         try:
                             time.sleep(0.3)
-                            ordermanager.cancelorder(pos.tporderid)
-                            ordermanager.cancelorder(pos.slorderid)
+                            order_manager.cancelorder(pos.tp_order_id)
+                            order_manager.cancelorder(pos.sl_order_id)
                         except Exception as e:
                             logger.error(f"Error cancelling TP/SL: {e}")
                         
-                        self.currentposition = None
-                        self.pendingentry = False
-                        self.lastentrytimesec = nowsec
+                        self.current_position = None
+                        self.pending_entry = False
+                        self.last_entry_time_sec = now_sec
                         return
                         
                     else:
-                        logger.error(f"Unexpected status: {finalstatus_normalized}")
-                        pos.mainfilled = True
-                        pos.entryprice = currentprice
+                        logger.error(f"Unexpected status: {final_status_normalized}")
+                        pos.main_filled = True
+                        pos.entry_price = current_price
                         return
                         
                 finally:
-                    self.checkingorderstatus = False
+                    self._checking_order_status = False
             
             # Early fill detection (throttled)
-            if not hasattr(pos, "lastearlychecktime"):
-                pos.lastearlychecktime = 0.0
+            if not hasattr(pos, "_last_early_check_time"):
+                pos._last_early_check_time = 0.0
             
-            if nowsec - pos.lastearlychecktime > config.EARLYFILLCHECKINTERVALSEC:
-                pos.lastearlychecktime = nowsec
+            if now_sec - pos._last_early_check_time >= config.EARLY_FILL_CHECK_INTERVAL_SEC:
+                pos._last_early_check_time = now_sec
                 
-                if not self.earlyfillhandled.get(pos.mainorderid, False):
-                    status_normalized = ordermanager.getorderstatussafe(pos.mainorderid)
+                if not self.early_fill_handled.get(pos.main_order_id, False):
+                    status_normalized = order_manager.getorderstatussafe(pos.main_order_id)
                     
                     if status_normalized == "FILLED":
-                        self.earlyfillhandled[pos.mainorderid] = True
-                        logger.info(f"🎯 EARLY FILL detected: {pos.mainorderid}")
-                        pos.entryprice = currentprice
-                        pos.mainfilled = True
-                        logger.info(f"Position activated @{pos.entryprice:.2f}")
+                        self.early_fill_handled[pos.main_order_id] = True
+                        logger.info(f"🎯 EARLY FILL detected: {pos.main_order_id}")
+                        try:
+                            full_status = order_manager.getorderstatus(pos.main_order_id)
+                            if full_status:
+                                pos.entry_price = order_manager.extractfillprice(full_status)
+                            else:
+                                pos.entry_price = current_price
+                        except Exception:
+                            pos.entry_price = current_price
+                        pos.main_filled = True
+                        logger.info(f"Position activated @ {pos.entry_price:.2f}")
                         return
             
             return  # Continue waiting for fill
@@ -1024,135 +1042,135 @@ class ZScoreIcebergHunterStrategy:
         # ====================================================================
         # PHASE 2: TPSL Verification (ONE-TIME, uses cached snapshot)
         # ====================================================================
-        if not hasattr(pos, "tpslverified"):
-            pos.tpslverified = False
+        if not hasattr(pos, "_tpsl_verified"):
+            pos._tpsl_verified = False
         
-        if not pos.tpslverified:
+        if not pos._tpsl_verified:
             logger.info("=" * 100)
-            logger.info(f"🔍 TPSL VERIFICATION {pos.tradeid} - SINGLE CHECK")
+            logger.info(f"[TP/SL VERIFICATION] {pos.trade_id} - SINGLE CHECK")
             logger.info("=" * 100)
             
-            tpplaced = False
-            slplaced = False
+            tp_placed = False
+            sl_placed = False
             
             # Check TP status - SINGLE CHECK
             try:
                 from order_manager import GlobalRateLimiter
                 GlobalRateLimiter.wait()
-                tpstatus_resp = ordermanager.getorderstatus(pos.tporderid)
-                if tpstatus_resp:
-                    tpstatus = str(tpstatus_resp.get("status", "")).upper()
-                    if tpstatus in ["PENDING", "RAISED"]:
-                        tpplaced = True
-                        logger.info(f"✅ TP order verified: {pos.tporderid} (status: {tpstatus})")
+                tp_status_resp = order_manager.getorderstatus(pos.tp_order_id)
+                if tp_status_resp:
+                    tp_status = str(tp_status_resp.get("status", "")).upper()
+                    if tp_status in ("PENDING", "RAISED"):
+                        tp_placed = True
+                        logger.info(f" ✓ TP order verified: {pos.tp_order_id} (status: {tp_status})")
                     else:
-                        logger.warning(f"⚠️ TP status unexpected: {tpstatus}")
+                        logger.warning(f" ⚠️ TP status unexpected: {tp_status}")
                 else:
-                    logger.error(f"❌ TP order not found: {pos.tporderid}")
+                    logger.error(f" ✗ TP order not found: {pos.tp_order_id}")
             except Exception as e:
-                logger.error(f"TP verification error: {e}")
+                logger.error(f" ✗ TP verification error: {e}")
             
             # Check SL status - SINGLE CHECK
             try:
                 GlobalRateLimiter.wait()
-                slstatus_resp = ordermanager.getorderstatus(pos.slorderid)
-                if slstatus_resp:
-                    slstatus = str(slstatus_resp.get("status", "")).upper()
-                    if slstatus in ["PENDING", "RAISED"]:
-                        slplaced = True
-                        logger.info(f"✅ SL order verified: {pos.slorderid} (status: {slstatus})")
+                sl_status_resp = order_manager.getorderstatus(pos.sl_order_id)
+                if sl_status_resp:
+                    sl_status = str(sl_status_resp.get("status", "")).upper()
+                    if sl_status in ("PENDING", "RAISED"):
+                        sl_placed = True
+                        logger.info(f" ✓ SL order verified: {pos.sl_order_id} (status: {sl_status})")
                     else:
-                        logger.warning(f"⚠️ SL status unexpected: {slstatus}")
+                        logger.warning(f" ⚠️ SL status unexpected: {sl_status}")
                 else:
-                    logger.error(f"❌ SL order not found: {pos.slorderid}")
+                    logger.error(f" ✗ SL order not found: {pos.sl_order_id}")
             except Exception as e:
-                logger.error(f"SL verification error: {e}")
+                logger.error(f" ✗ SL verification error: {e}")
             
             # Emergency TPSL placement if needed
-            if not tpplaced or not slplaced:
-                logger.warning("⚠️ TPSL not properly placed - checking with position snapshot")
+            if not tp_placed or not sl_placed:
+                logger.warning(" ⚠️ TP/SL not properly placed - checking with position snapshot")
                 
                 # Use SINGLE cached snapshot
                 snapshot = get_position_once()
                 
                 if not snapshot["exists"]:
                     logger.warning("❌ No position exists - TPSL may have already triggered")
-                    pos.tpslverified = True
+                    pos._tpsl_verified = True
                     return
                 
                 # Calculate emergency prices
                 direction = 1.0 if pos.side == "long" else -1.0
-                qtywithleverage = (pos.marginused * config.LEVERAGE) / pos.entryprice
+                qty_with_leverage = (pos.margin_used * config.LEVERAGE) / pos.entry_price
                 
                 # TP calculation
-                increaseinbalance = pos.marginused * pos.initialtproi
-                pricemovementtp = increaseinbalance / qtywithleverage
-                emergencytpprice = pos.entryprice + (direction * pricemovementtp)
-                emergencyroi = pos.initialtproi
+                increase_in_balance = pos.margin_used * pos.initial_tp_roi
+                price_movement_tp = increase_in_balance / qty_with_leverage
+                emergency_tp_price = pos.entry_price + (direction * price_movement_tp)
+                emergency_roi = pos.initial_tp_roi
                 
                 # SL calculation  
-                decreaseinbalance = pos.marginused * abs(pos.initialslroi)
-                pricemovementsl = decreaseinbalance / qtywithleverage
-                emergencyslprice = pos.entryprice - (direction * pricemovementsl)
+                decrease_in_balance = pos.margin_used * abs(pos.initial_sl_roi)
+                price_movement_sl = decrease_in_balance / qty_with_leverage
+                emergency_sl_price = pos.entry_price - (direction * price_movement_sl)
                 
-                tpside = "SELL" if pos.side == "long" else "BUY"
+                tp_side = "SELL" if pos.side == "long" else "BUY"
                 
                 # Place emergency TP if needed
-                if not tpplaced:
+                if not tp_placed:
                     try:
                         GlobalRateLimiter.wait()
-                        emergencytp_order = ordermanager.placetakeprofit(
-                            side=tpside,
+                        emergency_tp_order = order_manager.placetakeprofit(
+                            side=tp_side,
                             quantity=pos.quantity,
-                            triggerprice=emergencytpprice,
+                            triggerprice=emergency_tp_price,
                         )
-                        if emergencytp_order and "orderid" in emergencytp_order:
-                            pos.tporderid = emergencytp_order["orderid"]
-                            pos.tpprice = emergencytpprice
-                            pos.tproi = emergencyroi
-                            pos.currenttproi = emergencyroi
-                            pos.currenttpprice = emergencytpprice
-                            logger.info(f"🚨 Emergency TP placed: {pos.tporderid}")
-                            tpplaced = True
+                        if emergency_tp_order and "orderid" in emergency_tp_order:
+                            pos.tp_order_id = emergency_tp_order["orderid"]
+                            pos.tp_price = emergency_tp_price
+                            pos.tp_roi = emergency_roi
+                            pos.current_tp_roi = emergency_roi
+                            pos.current_tp_price = emergency_tp_price
+                            logger.info(f"🚨 Emergency TP placed: {pos.tp_order_id}")
+                            tp_placed = True
                         else:
                             logger.error(f"Emergency TP placement failed")
                     except Exception as e:
                         logger.error(f"Emergency TP error: {e}")
                 
                 # Place emergency SL if needed
-                if not slplaced:
+                if not sl_placed:
                     try:
                         GlobalRateLimiter.wait()
-                        emergencysl_order = ordermanager.placestoploss(
-                            side=tpside,
+                        emergency_sl_order = order_manager.placestoploss(
+                            side=tp_side,
                             quantity=pos.quantity,
-                            triggerprice=emergencyslprice,
+                            triggerprice=emergency_sl_price,
                         )
-                        if emergencysl_order and "orderid" in emergencysl_order:
-                            pos.slorderid = emergencysl_order["orderid"]
-                            pos.slprice = emergencyslprice
-                            pos.slroi = emergencyroi
-                            logger.info(f"🚨 Emergency SL placed: {pos.slorderid}")
-                            slplaced = True
+                        if emergency_sl_order and "orderid" in emergency_sl_order:
+                            pos.sl_order_id = emergency_sl_order["orderid"]
+                            pos.sl_price = emergency_sl_price
+                            pos.sl_roi = emergency_roi
+                            logger.info(f"🚨 Emergency SL placed: {pos.sl_order_id}")
+                            sl_placed = True
                         else:
                             logger.error(f"Emergency SL placement failed")
                     except Exception as e:
                         logger.error(f"Emergency SL error: {e}")
             
-            pos.tpslverified = True
-            logger.info(f"✅ TPSL verification complete - TP: {tpplaced}, SL: {slplaced}")
+            pos._tpsl_verified = True
+            logger.info(f"✅ TPSL verification complete - TP: {tp_placed}, SL: {sl_placed}")
         
         # ====================================================================
         # PHASE 3: TP/SL Trigger Detection (Throttled, uses snapshot)
         # ====================================================================
-        if not hasattr(self, "lastbracketchecksec"):
-            self.lastbracketchecksec = 0
+        if not hasattr(self, '_last_bracket_check_sec'):
+            self._last_bracket_check_sec = 0
         
-        if nowsec - self.lastbracketchecksec > 30.0:  # Check every 30s, not every tick
-            self.lastbracketchecksec = nowsec
+        if now_sec - self._last_bracket_check_sec >= 30.0:  # Check every 30s, not every tick
+            self._last_bracket_check_sec = now_sec
             
-            tptriggered = False
-            sltriggered = False
+            tp_triggered = False
+            sl_triggered = False
             
             # Use SINGLE cached snapshot for trigger detection
             snapshot = get_position_once()
@@ -1164,134 +1182,60 @@ class ZScoreIcebergHunterStrategy:
                 try:
                     from order_manager import GlobalRateLimiter
                     GlobalRateLimiter.wait()
-                    tpstatus_resp = ordermanager.getorderstatus(pos.tporderid)
-                    if tpstatus_resp:
-                        tpstatus = str(tpstatus_resp.get("status", "")).upper()
-                        if tpstatus in ["EXECUTED", "FILLED", "PARTIALLYEXECUTED", "PARTIALLYFILLED", "COMPLETE", "CLOSED"]:
-                            tptriggered = True
-                            logger.info(f"✅ TP triggered (status: {tpstatus})")
+                    tp_status_resp = order_manager.getorderstatus(pos.tp_order_id)
+                    if tp_status_resp:
+                        tp_status = str(tp_status_resp.get("status", "")).upper()
+                        if tp_status in ("EXECUTED", "FILLED", "PARTIALLY_EXECUTED", "PARTIALLY_FILLED", "COMPLETE", "CLOSED"):
+                            tp_triggered = True
+                            logger.info(f"✅ TP triggered (status: {tp_status})")
                 except Exception as e:
                     logger.error(f"TP status check error: {e}")
                 
                 # Check SL status once  
                 try:
                     GlobalRateLimiter.wait()
-                    slstatus_resp = ordermanager.getorderstatus(pos.slorderid)
-                    if slstatus_resp:
-                        slstatus = str(slstatus_resp.get("status", "")).upper()
-                        if slstatus in ["EXECUTED", "FILLED", "PARTIALLYEXECUTED", "PARTIALLYFILLED", "COMPLETE", "CLOSED"]:
-                            sltriggered = True
-                            logger.info(f"✅ SL triggered (status: {slstatus})")
+                    sl_status_resp = order_manager.getorderstatus(pos.sl_order_id)
+                    if sl_status_resp:
+                        sl_status = str(sl_status_resp.get("status", "")).upper()
+                        if sl_status in ("EXECUTED", "FILLED", "PARTIALLY_EXECUTED", "PARTIALLY_FILLED", "COMPLETE", "CLOSED"):
+                            sl_triggered = True
+                            logger.info(f"✅ SL triggered (status: {sl_status})")
                 except Exception as e:
                     logger.error(f"SL status check error: {e}")
             
-            if tptriggered:
-                self.exitposition(ordermanager, riskmanager, currentprice, "TPHIT", nowsec)
+            if tp_triggered:
+                self._exit_position(order_manager, risk_manager, current_price, "TP_HIT", now_sec)
                 return
             
-            if sltriggered:
-                self.exitposition(ordermanager, riskmanager, currentprice, "SLHIT", nowsec)
+            if sl_triggered:
+                self._exit_position(order_manager, risk_manager, current_price, "SL_HIT", now_sec)
                 return
         
         # ====================================================================
-        # PHASE 4: Periodic Position Logging (No API calls)
+        # PHASE 4: Position Logging (No API calls)
         # ====================================================================
-        holdmin = (nowsec - pos.entrytimesec) / 60.0
+        hold_min = (now_sec - pos.entry_time_sec) / 60.0
         direction = 1.0 if pos.side == "long" else -1.0
         
-        if nowsec - self.lastpositionlogsec > self.POSITIONLOGINTERVALSEC:
-            self.lastpositionlogsec = nowsec
+        if now_sec - self._last_position_log_sec >= self.POSITION_LOG_INTERVAL_SEC:
+            self._last_position_log_sec = now_sec
             
-            upnl = (currentprice - pos.entryprice) * direction * pos.quantity
-            balancechange = upnl
+            upnl = (current_price - pos.entry_price) * direction * pos.quantity
+            balance_change = upnl
+            current_profit_pct = balance_change / pos.margin_used if pos.margin_used > 0 else 0.0
             
+            logger.info("\n" + "=" * 100)
+            logger.info(f"[POSITION STATUS] {pos.trade_id}")
             logger.info("=" * 100)
-            logger.info(f"📊 POSITION STATUS: {pos.tradeid}")
-            logger.info("=" * 100)
-            logger.info(f"  Side: {pos.side.upper()}")
-            logger.info(f"  Entry: {pos.entryprice:.2f} | Current: {currentprice:.2f}")
-            logger.info(f"  Quantity: {pos.quantity:.6f} BTC")
-            logger.info(f"  Margin: {pos.marginused:.2f} USDT")
-            logger.info(f"  TP: {pos.tpprice:.2f} ({pos.tproi*100:.2f}%) | SL: {pos.slprice:.2f} ({pos.slroi*100:.2f}%)")
-            logger.info(f"  Hold Time: {holdmin:.1f} min")
-            logger.info(f"  Unrealized P/L: {upnl:.2f} USDT ({(balancechange/pos.marginused)*100:.2f}%)")
-            logger.info("=" * 100)
-
-        # ========================================
-        # ✅ IMPROVED TP/SL HIT DETECTION - NO SPAM
-        # Check every 30 seconds, NOT every tick
-        # ========================================
-        if not hasattr(self, '_last_bracket_check_sec'):
-            self._last_bracket_check_sec = 0
-        if now_sec - self._last_bracket_check_sec >= 30.0:  # Check every 30s, not every tick
-            self._last_bracket_check_sec = now_sec
-            tp_triggered = False
-            sl_triggered = False
-
-            # Check TP status
-            try:
-                from order_manager import GlobalRateLimiter
-                GlobalRateLimiter.wait()
-                tp_status_resp = order_manager.get_order_status(pos.tp_order_id)
-                if tp_status_resp:
-                    tp_status = str(tp_status_resp.get("status", "")).upper()
-                    if tp_status in ("EXECUTED", "FILLED", "PARTIALLY_EXECUTED", "PARTIALLY_FILLED", "COMPLETE", "CLOSED"):
-                        tp_triggered = True
-                        logger.info(f"🎯 TP triggered (status: {tp_status})")
-                    elif tp_status in ("CANCELLED", "REJECTED", "EXPIRED"):
-                        logger.warning(f"⚠️ TP order {tp_status} - checking position")
-                        # Single position check to verify if it actually triggered
-                        try:
-                            GlobalRateLimiter.wait()
-                            positions_resp = order_manager.api.get_positions(
-                                symbol=config.SYMBOL, exchange=config.EXCHANGE
-                            )
-                            if positions_resp and not positions_resp.get("error"):
-                                data = positions_resp.get("data", [])
-                                if isinstance(data, list):
-                                    for p in data:
-                                        if p.get("symbol") == config.SYMBOL:
-                                            qty = abs(float(p.get("quantity", 0)))
-                                            if qty <= 0:
-                                                tp_triggered = True
-                                                logger.info(" → Position closed, treating as TP hit")
-                                                break
-                        except Exception as e:
-                            logger.debug(f"Position check error: {e}")
-            except Exception as e:
-                logger.error(f"TP status check error: {e}")
-
-            # Check SL status
-            try:
-                GlobalRateLimiter.wait()
-                sl_status_resp = order_manager.get_order_status(pos.sl_order_id)
-                if sl_status_resp:
-                    sl_status = str(sl_status_resp.get("status", "")).upper()
-                    if sl_status in ("EXECUTED", "FILLED", "PARTIALLY_EXECUTED", "PARTIALLY_FILLED", "COMPLETE", "CLOSED"):
-                        sl_triggered = True
-                        logger.info(f"🛑 SL triggered (status: {sl_status})")
-                    elif sl_status in ("CANCELLED", "REJECTED", "EXPIRED"):
-                        logger.warning(f"⚠️ SL order {sl_status} - checking position")
-                        # Single position check
-                        try:
-                            GlobalRateLimiter.wait()
-                            positions_resp = order_manager.api.get_positions(
-                                symbol=config.SYMBOL, exchange=config.EXCHANGE
-                            )
-                            if positions_resp and not positions_resp.get("error"):
-                                data = positions_resp.get("data", [])
-                                if isinstance(data, list):
-                                    for p in data:
-                                        if p.get("symbol") == config.SYMBOL:
-                                            qty = abs(float(p.get("quantity", 0)))
-                                            if qty <= 0:
-                                                sl_triggered = True
-                                                logger.info(" → Position closed, treating as SL hit")
-                                                break
-                        except Exception as e:
-                            logger.debug(f"Position check error: {e}")
-            except Exception as e:
-                logger.error(f"SL status check error: {e}")
+            logger.info(f" Side: {pos.side.upper()}")
+            logger.info(f" Entry: {pos.entry_price:.2f} | Current: {current_price:.2f}")
+            logger.info(f" Quantity: {pos.quantity:.6f} BTC")
+            logger.info(f" Margin: {pos.margin_used:.2f} USDT")
+            logger.info(f" TP: {pos.tp_price:.2f} ({pos.tp_roi*100:.2f}%) | SL: {pos.sl_price:.2f} ({pos.sl_roi*100:.2f}%)")
+            logger.info(f" Hold Time: {hold_min:.1f} min")
+            logger.info(f" Unrealized P&L: {upnl:.2f} USDT ({current_profit_pct*100:.2f}%)")
+            logger.info("=" * 100 + "\n")
+        
 
             if tp_triggered:
                 self._exit_position(order_manager, risk_manager, current_price, "TP_HIT", now_sec)
