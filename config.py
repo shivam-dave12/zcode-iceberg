@@ -41,9 +41,9 @@ WEEKEND_PARAMS = {
 
 # Major Sessions (Standard)
 MAJOR_SESSION_PARAMS = {
-    "z_threshold": 2.1,
+    "z_threshold": 2.5,
     "imbalance_threshold": 0.65,
-    "entry_score_threshold": 0.75,
+    "entry_score_threshold": 0.80,
     "wall_multiplier": 4.2,
     "min_signal_gap_sec": 55.0,   # 1 minute
     "tp_roi_target": 0.15,        # 15%

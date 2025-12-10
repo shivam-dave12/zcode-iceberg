@@ -908,7 +908,7 @@ class ZScoreIcebergHunterStrategy:
             try:
                 from order_manager import GlobalRateLimiter
                 GlobalRateLimiter.wait()
-                resp = order_manager.api.getpositions(
+                resp = order_manager.api.get_positions(
                     symbol=config.SYMBOL, 
                     exchange=config.EXCHANGE
                 )
@@ -921,8 +921,8 @@ class ZScoreIcebergHunterStrategy:
                                 if qty > 0:
                                     position_snapshot = {
                                         "quantity": qty,
-                                        "entryprice": float(p.get("entryPrice", currentprice)),
-                                        "markprice": float(p.get("markPrice", current_price)),
+                                        "entry_price": float(p.get("entryPrice", current_price)),
+                                        "mark_price": float(p.get("markPrice", current_price)),
                                         "exists": True
                                     }
                                     snapshot_fetched = True
@@ -960,20 +960,20 @@ class ZScoreIcebergHunterStrategy:
                         logger.info(f"✅ ACTIVE POSITION {snapshot['quantity']:.6f} → ACTIVATING MANAGEMENT")
                         pos.main_filled = True
                         pos.timeout_cancelled = False
-                        pos.entry_price = snapshot["entryprice"]
+                        pos.entry_price = snapshot["entry_price"]
                         logger.info(f"Position detected @ {pos.entry_price:.2f} - TPSL PROTECTED")
                         return
                     
                     # Position doesn't exist - check order status
-                    final_status_normalized = order_manager.getorderstatussafe(pos.main_order_id)
+                    final_status_normalized = order_manager.get_order_status_safe(pos.main_order_id)
                     logger.info(f"📊 Final status check result: {final_status_normalized}")
                     
                     if final_status_normalized == "FILLED":
                         logger.info("✅ ORDER FILLED confirmed - Activating position management")
                         try:
-                            full_status = order_manager.getorderstatus(pos.main_order_id)
+                            full_status = order_manager.get_order_status(pos.main_order_id)
                             if full_status:
-                                pos.entry_price = order_manager.extractfillprice(full_status)
+                                pos.entry_price = order_manager.extract_fill_price(full_status)
                             else:
                                 pos.entry_price = current_price
                         except Exception as e:
@@ -993,8 +993,8 @@ class ZScoreIcebergHunterStrategy:
                         logger.info("🧹 Order confirmed CANCELLED - cleaning up bracket")
                         try:
                             time.sleep(0.3)
-                            order_manager.cancelorder(pos.tp_order_id)
-                            order_manager.cancelorder(pos.sl_order_id)
+                            order_manager.cancel_order(pos.tp_order_id)
+                            order_manager.cancel_order(pos.sl_order_id)
                         except Exception as e:
                             logger.error(f"Error cancelling TP/SL: {e}")
                         
@@ -1020,15 +1020,15 @@ class ZScoreIcebergHunterStrategy:
                 pos._last_early_check_time = now_sec
                 
                 if not self.early_fill_handled.get(pos.main_order_id, False):
-                    status_normalized = order_manager.getorderstatussafe(pos.main_order_id)
+                    status_normalized = order_manager.get_order_status_safe(pos.main_order_id)
                     
                     if status_normalized == "FILLED":
                         self.early_fill_handled[pos.main_order_id] = True
                         logger.info(f"🎯 EARLY FILL detected: {pos.main_order_id}")
                         try:
-                            full_status = order_manager.getorderstatus(pos.main_order_id)
+                            full_status = order_manager.get_order_status(pos.main_order_id)
                             if full_status:
-                                pos.entry_price = order_manager.extractfillprice(full_status)
+                                pos.entry_price = order_manager.extract_fill_price(full_status)
                             else:
                                 pos.entry_price = current_price
                         except Exception:
@@ -1057,7 +1057,7 @@ class ZScoreIcebergHunterStrategy:
             try:
                 from order_manager import GlobalRateLimiter
                 GlobalRateLimiter.wait()
-                tp_status_resp = order_manager.getorderstatus(pos.tp_order_id)
+                tp_status_resp = order_manager.get_order_status(pos.tp_order_id)
                 if tp_status_resp:
                     tp_status = str(tp_status_resp.get("status", "")).upper()
                     if tp_status in ("PENDING", "RAISED"):
@@ -1073,7 +1073,7 @@ class ZScoreIcebergHunterStrategy:
             # Check SL status - SINGLE CHECK
             try:
                 GlobalRateLimiter.wait()
-                sl_status_resp = order_manager.getorderstatus(pos.sl_order_id)
+                sl_status_resp = order_manager.get_order_status(pos.sl_order_id)
                 if sl_status_resp:
                     sl_status = str(sl_status_resp.get("status", "")).upper()
                     if sl_status in ("PENDING", "RAISED"):
@@ -1119,13 +1119,13 @@ class ZScoreIcebergHunterStrategy:
                 if not tp_placed:
                     try:
                         GlobalRateLimiter.wait()
-                        emergency_tp_order = order_manager.placetakeprofit(
+                        emergency_tp_order = order_manager.place_take_profit(
                             side=tp_side,
                             quantity=pos.quantity,
-                            triggerprice=emergency_tp_price,
+                            trigger_price=emergency_tp_price,
                         )
-                        if emergency_tp_order and "orderid" in emergency_tp_order:
-                            pos.tp_order_id = emergency_tp_order["orderid"]
+                        if emergency_tp_order and "order_id" in emergency_tp_order:
+                            pos.tp_order_id = emergency_tp_order["order_id"]
                             pos.tp_price = emergency_tp_price
                             pos.tp_roi = emergency_roi
                             pos.current_tp_roi = emergency_roi
@@ -1141,13 +1141,13 @@ class ZScoreIcebergHunterStrategy:
                 if not sl_placed:
                     try:
                         GlobalRateLimiter.wait()
-                        emergency_sl_order = order_manager.placestoploss(
+                        emergency_sl_order = order_manager.place_stop_loss(
                             side=tp_side,
                             quantity=pos.quantity,
-                            triggerprice=emergency_sl_price,
+                            trigger_price=emergency_sl_price,
                         )
-                        if emergency_sl_order and "orderid" in emergency_sl_order:
-                            pos.sl_order_id = emergency_sl_order["orderid"]
+                        if emergency_sl_order and "order_id" in emergency_sl_order:
+                            pos.sl_order_id = emergency_sl_order["order_id"]
                             pos.sl_price = emergency_sl_price
                             pos.sl_roi = emergency_roi
                             logger.info(f"🚨 Emergency SL placed: {pos.sl_order_id}")
@@ -1182,7 +1182,7 @@ class ZScoreIcebergHunterStrategy:
                 try:
                     from order_manager import GlobalRateLimiter
                     GlobalRateLimiter.wait()
-                    tp_status_resp = order_manager.getorderstatus(pos.tp_order_id)
+                    tp_status_resp = order_manager.get_order_status(pos.tp_order_id)
                     if tp_status_resp:
                         tp_status = str(tp_status_resp.get("status", "")).upper()
                         if tp_status in ("EXECUTED", "FILLED", "PARTIALLY_EXECUTED", "PARTIALLY_FILLED", "COMPLETE", "CLOSED"):
@@ -1194,7 +1194,7 @@ class ZScoreIcebergHunterStrategy:
                 # Check SL status once  
                 try:
                     GlobalRateLimiter.wait()
-                    sl_status_resp = order_manager.getorderstatus(pos.sl_order_id)
+                    sl_status_resp = order_manager.get_order_status(pos.sl_order_id)
                     if sl_status_resp:
                         sl_status = str(sl_status_resp.get("status", "")).upper()
                         if sl_status in ("EXECUTED", "FILLED", "PARTIALLY_EXECUTED", "PARTIALLY_FILLED", "COMPLETE", "CLOSED"):
@@ -1235,7 +1235,7 @@ class ZScoreIcebergHunterStrategy:
             logger.info(f" Hold Time: {hold_min:.1f} min")
             logger.info(f" Unrealized P&L: {upnl:.2f} USDT ({current_profit_pct*100:.2f}%)")
             logger.info("=" * 100 + "\n")
-        
+
 
             if tp_triggered:
                 self._exit_position(order_manager, risk_manager, current_price, "TP_HIT", now_sec)
