@@ -1591,21 +1591,14 @@ class ZScoreIcebergHunterStrategy:
         self,
         order_manager,
         current_price: float,
-        current_profit_pct: float,
+        current_profit_roi: float,
     ) -> None:
         """
-        ✅ FIXED: T+15min management following Excel flow with BREAKEVEN FLOOR
-
-        Excel Flow:
-        - Case 1 (profit < half of original TP):
-          - Set new TP to current profit + buffer (e.g., 0.8% → 0.9%)
-          - Set new SL to half of original TP
-        - Case 2 (profit >= half of original TP): No changes
-
-        BREAKEVEN PROTECTION:
-        - New TP ROI is clamped to minimum of (fees + GST + 10% cushion)
-        - Uses config.BREAKEVEN_FEE_BUFFER_PCT which already includes
-          taker fees on both sides and 18% GST on fees
+        ✅ FIXED T+15min management:
+        - If profit >= half of ORIGINAL TP: no changes.
+        - Else:
+        - TP becomes (current profit ROI + buffer), clamped above breakeven floor.
+        - SL becomes HALF of the NEW tightened TP (profit-lock when in profit).
         """
         pos = self.current_position
         if pos is None:
@@ -1620,56 +1613,62 @@ class ZScoreIcebergHunterStrategy:
 
             try:
                 pos.tp_tightened_15min = True
-                half_tp_roi = pos.initial_tp_roi * config.HALF_TP_THRESHOLD
 
-                # Calculate requested new TP ROI
-                new_tp_roi = current_profit_pct + config.TP_BUFFER_PERCENT
-
-                # ─────────────────────────────────────────────────────────────────────
-                # FIX: Ensure TP is never set below breakeven (fees + GST) + small buffer
-                # Uses config.BREAKEVEN_FEE_BUFFER_PCT which already includes taker fees
-                # on both sides and GST on fees. [config: MAKER_FEE_PCT, TAKER_FEE_PCT,
-                # GST_ON_FEES_PCT, BREAKEVEN_FEE_BUFFER_PCT]
-                # ─────────────────────────────────────────────────────────────────────
-                breakeven_min_tp_roi = config.BREAKEVEN_FEE_BUFFER_PCT * 1.10  # +10% cushion above breakeven
-
-                if new_tp_roi < breakeven_min_tp_roi:
-                    logger.info(
-                        f"  ⚠️ TP breakeven clamp: requested {new_tp_roi*100:.2f}% "
-                        f"< breakeven+buffer {breakeven_min_tp_roi*100:.2f}% "
-                        f"(fees+GST). Using breakeven floor."
-                    )
-                    new_tp_roi = breakeven_min_tp_roi
+                half_original_tp_roi = pos.initial_tp_roi * config.HALF_TP_THRESHOLD
 
                 logger.info("=" * 100)
                 logger.info(f"[TP/SL MANAGEMENT 15MIN] {pos.trade_id}")
-                logger.info(f"  Current profit: {current_profit_pct*100:.2f}%")
-                logger.info(f"  Half TP threshold: {half_tp_roi*100:.2f}%")
-                logger.info(f"  New TP target: {new_tp_roi*100:.2f}%")
-                logger.info(f"  New SL target (ROI): {half_tp_roi*100:.2f}%")
+                logger.info(f"  Current profit ROI: {current_profit_roi*100:.2f}%")
+                logger.info(f"  Half original TP threshold: {half_original_tp_roi*100:.2f}%")
 
-                # Case 2: Profit >= half of original TP -> No changes
-                if current_profit_pct >= half_tp_roi:
+                # Case 2: already strong enough move, keep bracket as-is
+                if current_profit_roi >= half_original_tp_roi:
                     logger.info(
-                        f"  [TP/SL MANAGEMENT 15MIN] Profit >= half TP "
-                        f"({current_profit_pct*100:.2f}% >= {half_tp_roi*100:.2f}%) - NO CHANGES"
+                        f"  [TP/SL MANAGEMENT 15MIN] Profit >= half original TP "
+                        f"({current_profit_roi*100:.2f}% >= {half_original_tp_roi*100:.2f}%) - NO CHANGES"
                     )
                     logger.info("=" * 100)
                     return
 
-                # Case 1: Profit < half of original TP -> Adjust TP and SL
+                # Case 1: tighten TP to current profit + buffer
+                new_tp_roi = current_profit_roi + config.TP_BUFFER_PERCENT
+
+                # Breakeven clamp so TP never goes below fees+GST (+10% cushion)
+                breakeven_floor = config.BREAKEVEN_FEE_BUFFER_PCT * 1.10
+                if new_tp_roi < breakeven_floor:
+                    logger.info(
+                        f"  ⚠️ TP breakeven clamp: requested {new_tp_roi*100:.2f}% "
+                        f"< floor {breakeven_floor*100:.2f}%, using floor."
+                    )
+                    new_tp_roi = breakeven_floor
+
+                # SL should be HALF of the NEW tightened TP (not half of original TP).
+                # Use negative ROI to convert SL into profit-lock (SL above entry for LONG / below entry for SHORT).
+                half_new_tp = abs(new_tp_roi) * config.HALF_TP_THRESHOLD
+                new_sl_roi = -half_new_tp if current_profit_roi > 0 else pos.sl_roi
+
+                logger.info(f"  New TP target ROI: {new_tp_roi*100:.2f}%")
+                logger.info(
+                    f"  New SL target ROI: {abs(new_sl_roi)*100:.2f}% "
+                    f"({'PROFIT-LOCK' if new_sl_roi < 0 else 'UNCHANGED'})"
+                )
+
                 new_tp_price, new_sl_price = self._compute_bracket_prices(
                     entry_price=pos.entry_price,
                     margin_used=pos.margin_used,
                     quantity=pos.quantity,
                     side=pos.side,
                     tp_roi=new_tp_roi,
-                    sl_roi=half_tp_roi,
+                    sl_roi=new_sl_roi,
                     session=pos.entry_session,
                 )
 
                 tp_success = self._replace_take_profit_order(order_manager, new_tp_price, new_tp_roi)
-                sl_success = self._replace_stop_loss_order(order_manager, new_sl_price, half_tp_roi)
+
+                # Only attempt SL replace if it is meant to change
+                sl_success = False
+                if new_sl_roi != pos.sl_roi:
+                    sl_success = self._replace_stop_loss_order(order_manager, new_sl_price, new_sl_roi)
 
                 if tp_success or sl_success:
                     pos.tp_adjustment_count += 1
@@ -1677,13 +1676,14 @@ class ZScoreIcebergHunterStrategy:
                 if tp_success and sl_success:
                     logger.info("  ✅ TP and SL updated at 15min")
                 elif tp_success:
-                    logger.warning("  ⚠️ TP updated but SL update failed")
+                    logger.warning("  ⚠️ TP updated but SL update skipped/failed")
                 elif sl_success:
                     logger.warning("  ⚠️ SL updated but TP update failed")
                 else:
                     logger.error("  ❌ TP and SL update failed - keeping existing bracket")
 
                 logger.info("=" * 100)
+
             finally:
                 self._adjusting_tp = False
 
