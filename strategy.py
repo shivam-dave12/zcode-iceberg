@@ -1146,7 +1146,9 @@ class ZScoreIcebergHunterStrategy:
         # ========================================
         hold_min = (now_sec - pos.entry_time_sec) / 60.0
         direction = 1.0 if pos.side == "long" else -1.0
-        current_profit_pct = ((current_price - pos.entry_price) / pos.entry_price) * direction
+        # ✅ FIX: Use margin-based ROI (same methodology as _compute_bracket_prices)
+        current_profit_roi = ((current_price - pos.entry_price) * pos.quantity / pos.margin_used) * direction
+
         
         # ========================================
         # Periodic Position Status Logging (60s)
@@ -1165,7 +1167,7 @@ class ZScoreIcebergHunterStrategy:
             logger.info(f"  Margin: {pos.margin_used:.2f} USDT")
             logger.info(f"  TP: {pos.tp_price:.2f} ({pos.tp_roi*100:.2f}%) | SL: {pos.sl_price:.2f} ({pos.sl_roi*100:.2f}%)")
             logger.info(f"  Hold Time: {hold_min:.1f} min")
-            logger.info(f"  Unrealized P&L: {upnl:.2f} USDT ({current_profit_pct*100:.2f}%)")
+            logger.info(f"  Unrealized P&L: {upnl:.2f} USDT ({current_profit_roi*100:.2f}%)")
             logger.info(f"  TP Adjustments: {pos.tp_adjustment_count}")
             logger.info("=" * 100 + "\n")
         
@@ -1215,7 +1217,7 @@ class ZScoreIcebergHunterStrategy:
         if now_sec - pos.last_momentum_log_sec >= config.MOMENTUM_LOG_INTERVAL_SEC:
             pos.last_momentum_log_sec = now_sec
             logger.info(
-                f"[MOMENTUM] {pos.trade_id} | Hold={hold_min:.1f}m | P&L={current_profit_pct*100:.2f}% | "
+                f"[MOMENTUM] {pos.trade_id} | Hold={hold_min:.1f}m | P&L={current_profit_roi*100:.2f}% | "
                 f"M={momentum_favorable} V={vol_favorable} T={trend_favorable}"
             )
         
@@ -1228,13 +1230,13 @@ class ZScoreIcebergHunterStrategy:
             self._adjust_tp_and_sl_after_10min(
                 data_manager, order_manager, current_price, now_sec,
                 momentum_favorable, vol_favorable, trend_favorable,
-                current_profit_pct
+                current_profit_roi
             )
         
         # T+15min: Final TP Tightening
         elif (hold_min >= (config.FIRST_TP_WAIT_MINUTES + config.SECOND_TP_WAIT_MINUTES) and not pos.tp_tightened_15min):
             self._tighten_tp_after_15min(
-                order_manager, current_price, current_profit_pct
+                order_manager, current_price, current_profit_roi
             )
 
     # ======================================================================
@@ -1280,11 +1282,11 @@ class ZScoreIcebergHunterStrategy:
 
                 logger.info("=" * 100)
                 logger.info(f"[TP/SL MANAGEMENT 10MIN] {pos.trade_id}")
-                logger.info(f"  Current profit: {current_profit_pct*100:.2f}%")
+                logger.info(f"  Current profit: {current_profit_roi*100:.2f}%")
                 logger.info(f"  Half TP target: {half_tp_roi*100:.2f}%")
 
                 # Case 2: Profit >= half of original TP -> Move SL to breakeven, TP unchanged
-                if current_profit_pct >= half_tp_roi:
+                if current_profit_roi >= half_tp_roi:
                     logger.info("  → Excel Case 2: Profit >= half TP → SL to breakeven, TP unchanged")
 
                     success = self._move_sl_to_breakeven(order_manager, current_price, pos.entry_price)
