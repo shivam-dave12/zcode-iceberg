@@ -1250,7 +1250,7 @@ class ZScoreIcebergHunterStrategy:
         momentum_favorable: bool,
         vol_favorable: bool,
         trend_favorable: bool,
-        current_profit_pct: float,
+        current_profit_roi: float,
     ) -> None:
         """
         ✅ FIXED: T+10min management following Excel flow
@@ -1595,10 +1595,11 @@ class ZScoreIcebergHunterStrategy:
     ) -> None:
         """
         ✅ FIXED T+15min management:
-        - If profit >= half of ORIGINAL TP: no changes.
-        - Else:
-        - TP becomes (current profit ROI + buffer), clamped above breakeven floor.
-        - SL becomes HALF of the NEW tightened TP (profit-lock when in profit).
+        
+        **ALWAYS** tighten TP to current profit + buffer (with breakeven floor).
+        **ALWAYS** set SL to half of the NEW tightened TP (profit-lock when in profit).
+        
+        Example: If current profit is 8%, set TP at 9% (8% + 1% buffer).
         """
         pos = self.current_position
         if pos is None:
@@ -1621,19 +1622,10 @@ class ZScoreIcebergHunterStrategy:
                 logger.info(f"  Current profit ROI: {current_profit_roi*100:.2f}%")
                 logger.info(f"  Half original TP threshold: {half_original_tp_roi*100:.2f}%")
 
-                # Case 2: already strong enough move, keep bracket as-is
-                if current_profit_roi >= half_original_tp_roi:
-                    logger.info(
-                        f"  [TP/SL MANAGEMENT 15MIN] Profit >= half original TP "
-                        f"({current_profit_roi*100:.2f}% >= {half_original_tp_roi*100:.2f}%) - NO CHANGES"
-                    )
-                    logger.info("=" * 100)
-                    return
-
-                # Case 1: tighten TP to current profit + buffer
+                # ✅ ALWAYS tighten TP to current profit + buffer
                 new_tp_roi = current_profit_roi + config.TP_BUFFER_PERCENT
 
-                # Breakeven clamp so TP never goes below fees+GST (+10% cushion)
+                # Breakeven clamp: TP never goes below fees+GST (+10% cushion)
                 breakeven_floor = config.BREAKEVEN_FEE_BUFFER_PCT * 1.10
                 if new_tp_roi < breakeven_floor:
                     logger.info(
@@ -1642,8 +1634,9 @@ class ZScoreIcebergHunterStrategy:
                     )
                     new_tp_roi = breakeven_floor
 
-                # SL should be HALF of the NEW tightened TP (not half of original TP).
-                # Use negative ROI to convert SL into profit-lock (SL above entry for LONG / below entry for SHORT).
+                # SL should be HALF of the NEW tightened TP (not half of original TP)
+                # Use negative ROI to convert SL into profit-lock when in profit
+                # (SL above entry for LONG / below entry for SHORT)
                 half_new_tp = abs(new_tp_roi) * config.HALF_TP_THRESHOLD
                 new_sl_roi = -half_new_tp if current_profit_roi > 0 else pos.sl_roi
 
@@ -1665,10 +1658,13 @@ class ZScoreIcebergHunterStrategy:
 
                 tp_success = self._replace_take_profit_order(order_manager, new_tp_price, new_tp_roi)
 
-                # Only attempt SL replace if it is meant to change
+                # Only attempt SL replace if it needs to change
                 sl_success = False
                 if new_sl_roi != pos.sl_roi:
                     sl_success = self._replace_stop_loss_order(order_manager, new_sl_price, new_sl_roi)
+                else:
+                    logger.info("  SL unchanged (already optimal)")
+                    sl_success = True  # Consider it success if no change needed
 
                 if tp_success or sl_success:
                     pos.tp_adjustment_count += 1
