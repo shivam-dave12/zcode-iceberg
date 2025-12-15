@@ -1587,7 +1587,6 @@ class ZScoreIcebergHunterStrategy:
             logger.error(f"   ⚠️ Position protection status UNKNOWN - manual check required")
             return False
 
-
     def _tighten_tp_after_15min(
         self,
         order_manager,
@@ -1595,13 +1594,18 @@ class ZScoreIcebergHunterStrategy:
         current_profit_pct: float,
     ) -> None:
         """
-        ✅ FIXED: T+15min management following Excel flow
+        ✅ FIXED: T+15min management following Excel flow with BREAKEVEN FLOOR
 
         Excel Flow:
         - Case 1 (profit < half of original TP):
-          - Set new TP to current profit + buffer (e.g., 8% -> 9%)
+          - Set new TP to current profit + buffer (e.g., 0.8% → 0.9%)
           - Set new SL to half of original TP
         - Case 2 (profit >= half of original TP): No changes
+
+        BREAKEVEN PROTECTION:
+        - New TP ROI is clamped to minimum of (fees + GST + 10% cushion)
+        - Uses config.BREAKEVEN_FEE_BUFFER_PCT which already includes
+          taker fees on both sides and 18% GST on fees
         """
         pos = self.current_position
         if pos is None:
@@ -1616,18 +1620,26 @@ class ZScoreIcebergHunterStrategy:
 
             try:
                 pos.tp_tightened_15min = True
-
                 half_tp_roi = pos.initial_tp_roi * config.HALF_TP_THRESHOLD
 
-                # Case 2: Profit >= half TP -> No changes
-                if current_profit_pct >= half_tp_roi:
-                    logger.info(
-                        f"[TP/SL MANAGEMENT 15MIN] Profit >= half TP ({current_profit_pct*100:.2f}% >= {half_tp_roi*100:.2f}%) → NO CHANGES"
-                    )
-                    return
-
-                # Case 1: Profit < half TP -> adjust TP and SL
+                # Calculate requested new TP ROI
                 new_tp_roi = current_profit_pct + config.TP_BUFFER_PERCENT
+
+                # ─────────────────────────────────────────────────────────────────────
+                # FIX: Ensure TP is never set below breakeven (fees + GST) + small buffer
+                # Uses config.BREAKEVEN_FEE_BUFFER_PCT which already includes taker fees
+                # on both sides and GST on fees. [config: MAKER_FEE_PCT, TAKER_FEE_PCT,
+                # GST_ON_FEES_PCT, BREAKEVEN_FEE_BUFFER_PCT]
+                # ─────────────────────────────────────────────────────────────────────
+                breakeven_min_tp_roi = config.BREAKEVEN_FEE_BUFFER_PCT * 1.10  # +10% cushion above breakeven
+
+                if new_tp_roi < breakeven_min_tp_roi:
+                    logger.info(
+                        f"  ⚠️ TP breakeven clamp: requested {new_tp_roi*100:.2f}% "
+                        f"< breakeven+buffer {breakeven_min_tp_roi*100:.2f}% "
+                        f"(fees+GST). Using breakeven floor."
+                    )
+                    new_tp_roi = breakeven_min_tp_roi
 
                 logger.info("=" * 100)
                 logger.info(f"[TP/SL MANAGEMENT 15MIN] {pos.trade_id}")
@@ -1636,6 +1648,16 @@ class ZScoreIcebergHunterStrategy:
                 logger.info(f"  New TP target: {new_tp_roi*100:.2f}%")
                 logger.info(f"  New SL target (ROI): {half_tp_roi*100:.2f}%")
 
+                # Case 2: Profit >= half of original TP -> No changes
+                if current_profit_pct >= half_tp_roi:
+                    logger.info(
+                        f"  [TP/SL MANAGEMENT 15MIN] Profit >= half TP "
+                        f"({current_profit_pct*100:.2f}% >= {half_tp_roi*100:.2f}%) - NO CHANGES"
+                    )
+                    logger.info("=" * 100)
+                    return
+
+                # Case 1: Profit < half of original TP -> Adjust TP and SL
                 new_tp_price, new_sl_price = self._compute_bracket_prices(
                     entry_price=pos.entry_price,
                     margin_used=pos.margin_used,
@@ -1662,7 +1684,6 @@ class ZScoreIcebergHunterStrategy:
                     logger.error("  ❌ TP and SL update failed - keeping existing bracket")
 
                 logger.info("=" * 100)
-
             finally:
                 self._adjusting_tp = False
 
