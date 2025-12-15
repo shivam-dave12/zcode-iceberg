@@ -35,7 +35,7 @@ WEEKEND_PARAMS = {
     "entry_score_threshold": 0.70,
     "wall_multiplier": 5.0,
     "min_signal_gap_sec": 180.0,  # 3 minutes
-    "tp_roi_target": 0.04,        # 4%
+    "tp_roi_target": 0.08,        # 8%
     "sl_roi_max": 0.02,           # 2%
 }
 
@@ -43,22 +43,22 @@ WEEKEND_PARAMS = {
 MAJOR_SESSION_PARAMS = {
     "z_threshold": 2.1,
     "imbalance_threshold": 0.65,
-    "entry_score_threshold": 0.85,
+    "entry_score_threshold": 0.80,
     "wall_multiplier": 4.2,
     "min_signal_gap_sec": 60.0,   # 1 minute
-    "tp_roi_target": 0.12,        # 12%
+    "tp_roi_target": 0.15,        # 15%
     "sl_roi_max": 0.03,          # 3%
 }
 
 # Overlap Sessions (Aggressive)
 OVERLAP_SESSION_PARAMS = {
     "z_threshold": 2.5,
-    "imbalance_threshold": 0.65,
-    "entry_score_threshold": 0.65,
+    "imbalance_threshold": 0.75,
+    "entry_score_threshold": 0.85,
     "wall_multiplier": 4.0,
     "min_signal_gap_sec": 45.0,   # 45 seconds
-    "tp_roi_target": 0.10,        # 10%
-    "sl_roi_max": 0.02,          # 2%
+    "tp_roi_target": 0.20,        # 20%
+    "sl_roi_max": 0.04,          # 4%
 }
 
 # ============================================================================
