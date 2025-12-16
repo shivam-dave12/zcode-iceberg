@@ -90,9 +90,9 @@ MAX_DAILY_LOSS = 2000
 # LOGGING & MONITORING
 # ============================================================================
 LOG_LEVEL = "INFO"
-ENABLE_EXCEL_LOGGING = True
+ENABLE_EXCEL_LOGGING = False
 EXCEL_LOG_FILE = "zscore_iceberg_hunter_log.xlsx"
-ENABLE_TRADING = True
+ENABLE_TRADING = True   
 AUTO_CLOSE_ON_ERROR = True
 EMERGENCY_STOP_ENABLED = True
 RATE_LIMIT_ORDERS = 20

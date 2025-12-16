@@ -18,7 +18,7 @@ from data_manager import ZScoreDataManager
 from order_manager import OrderManager
 from risk_manager import RiskManager
 from strategy import ZScoreIcebergHunterStrategy
-from zscore_excel_logger import ZScoreExcelLogger
+#from zscore_excel_logger import ZScoreExcelLogger
 import telegram_config
 from telegram_notifier import send_telegram_message, install_global_telegram_log_handler
 
@@ -67,13 +67,13 @@ class ZScoreIcebergBot:
         self.order_manager = OrderManager()
         self.risk_manager = RiskManager()
         
-        if config.ENABLE_EXCEL_LOGGING:
-            excel_file = f"zscore_iceberg_hunter_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            self.excel_logger = ZScoreExcelLogger(filepath=excel_file)
-        else:
-            self.excel_logger = None
+     #   if config.ENABLE_EXCEL_LOGGING:
+     #       excel_file = f"zscore_iceberg_hunter_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+     #       self.excel_logger = ZScoreExcelLogger(filepath=excel_file)
+     #   else:
+     #       self.excel_logger = None
         
-        self.strategy = ZScoreIcebergHunterStrategy(excel_logger=self.excel_logger)
+        sself.strategy = ZScoreIcebergHunterStrategy()
         
         self.running = False
         self._last_stream_check_sec: float = 0.0
@@ -314,11 +314,11 @@ class ZScoreIcebergBot:
         except Exception as e:
             logger.error(f"Error stopping data manager: {e}")
         
-        try:
-            if self.excel_logger:
-                self.excel_logger.close()
-        except Exception as e:
-            logger.error(f"Error closing Excel logger: {e}")
+      #  try:
+      #      if self.excel_logger:
+      #          self.excel_logger.close()
+      #  except Exception as e:
+      #      logger.error(f"Error closing Excel logger: {e}")
         
         logger.info("=" * 80)
         logger.info("BOT STOPPED")

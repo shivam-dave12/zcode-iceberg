@@ -24,7 +24,7 @@ import numpy as np
 from scipy.stats import norm
 import threading
 import config
-from zscore_excel_logger import ZScoreExcelLogger
+#from zscore_excel_logger import ZScoreExcelLogger
 from telegram_notifier import (
     send_telegram_message,
     format_entry_message,
@@ -92,11 +92,11 @@ class ZScoreIcebergHunterStrategy:
     POSITION_LOG_INTERVAL_SEC = 60.0
     ORDER_STATUS_CHECK_INTERVAL_SEC = 10.0
 
-    def __init__(self, excel_logger: Optional[ZScoreExcelLogger] = None) -> None:
+    def __init__(self) -> None:
         self.current_position: Optional[ZScorePosition] = None
         self.pending_entry: bool = False
         self.last_exit_time_min: float = 0.0
-        self.excel_logger = excel_logger
+       # self.excel_logger = excel_logger
         self.trade_seq = 0
         self._delta_population: deque = deque(maxlen=3000)
         self._last_decision_log_sec: float = 0.0
@@ -2626,31 +2626,31 @@ class ZScoreIcebergHunterStrategy:
             logger.error(f"Error sending exit notification: {e}")
         
         # Excel logging
-        if self.excel_logger:
-            try:
-                from datetime import datetime
-                self.excel_logger.log_trade(
-                    trade_id=pos.trade_id,
-                    entry_time=datetime.fromtimestamp(pos.entry_time_sec).strftime("%Y-%m-%d %H:%M:%S"),
-                    exit_time=datetime.fromtimestamp(now_sec).strftime("%Y-%m-%d %H:%M:%S"),
-                    duration_minutes=(now_sec - pos.entry_time_sec) / 60.0,
-                    side=pos.side,
-                    entry_price=pos.entry_price,
-                    exit_price=exit_price,
-                    quantity=pos.quantity,
-                    margin_used=pos.margin_used,
-                    leverage=config.LEVERAGE,
-                    tp_price=pos.tp_price,
-                    sl_price=pos.sl_price,
-                    entry_imbalance=pos.entry_imbalance,
-                    entry_z_score=pos.entry_z_score,
-                    entry_wall_volume=pos.entry_wall_volume,
-                    exit_reason=reason,
-                    pnl_usdt=pnl,
-                    entry_htf_trend=pos.entry_htf_trend,
-                )
-            except Exception as e:
-                logger.error(f"Error logging to Excel: {e}")
+     #   if self.excel_logger:
+     #       try:
+     #           from datetime import datetime
+     ##           self.excel_logger.log_trade(
+     #               trade_id=pos.trade_id,
+     #               entry_time=datetime.fromtimestamp(pos.entry_time_sec).strftime("%Y-%m-%d %H:%M:%S"),
+     #               exit_time=datetime.fromtimestamp(now_sec).strftime("%Y-%m-%d %H:%M:%S"),
+     #               duration_minutes=(now_sec - pos.entry_time_sec) / 60.0,
+     #               side=pos.side,
+     #               entry_price=pos.entry_price,
+     #               exit_price=exit_price,
+     #               quantity=pos.quantity,
+     #               margin_used=pos.margin_used,
+     #               leverage=config.LEVERAGE,
+     #               tp_price=pos.tp_price,
+     #               sl_price=pos.sl_price,
+     #               entry_imbalance=pos.entry_imbalance,
+     #               entry_z_score=pos.entry_z_score,
+     #               entry_wall_volume=pos.entry_wall_volume,
+     #               exit_reason=reason,
+     #               pnl_usdt=pnl,
+     #               entry_htf_trend=pos.entry_htf_trend,
+     #           )
+     #       except Exception as e:
+     #           logger.error(f"Error logging to Excel: {e}")
         
         self.last_exit_time_min = now_sec / 60.0
         self.current_position = None
