@@ -1285,7 +1285,8 @@ class ZScoreIcebergHunterStrategy:
         # ========================================
         # PHASE 2: FILLED POSITION MANAGEMENT
         # ========================================
-                hold_min = (now_sec - pos.entry_time_sec) / 60.0
+        
+        hold_min = (now_sec - pos.entry_time_sec) / 60.0
         direction = 1.0 if pos.side == "long" else -1.0
         # ✅ FIX: Use margin-based ROI (same methodology as _compute_bracket_prices)
         current_profit_roi = ((current_price - pos.entry_price) * pos.quantity / pos.margin_used) * direction
