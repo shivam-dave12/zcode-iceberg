@@ -896,247 +896,194 @@ class ZScoreIcebergHunterStrategy:
             return
         
         # ========================================
-        # PHASE 1: Wait for Limit Fill (120s timeout)
+        # PHASE 1: Wait for Limit Fill with Enhanced Timeout
         # ========================================
-    # ========================================
-    # PHASE 1: Wait for Limit Fill with Enhanced Timeout
-    # ========================================
-    if not pos.main_filled:
-        elapsed_since_place = now_sec - pos.limit_order_placed_time
+        if not pos.main_filled:
+            elapsed_since_place = now_sec - pos.limit_order_placed_time
 
-        # Initialize timeout tracking attributes if not exist
-        if not hasattr(pos, '_first_timeout_check_time'):
-            pos._first_timeout_check_time = 0.0
-            pos._second_timeout_check_time = 0.0
-            pos._price_proximity_extension_granted = False
+            # Initialize timeout tracking attributes if not exist
+            if not hasattr(pos, '_first_timeout_check_time'):
+                pos._first_timeout_check_time = 0.0
+                pos._second_timeout_check_time = 0.0
+                pos._price_proximity_extension_granted = False
 
-        # ===================================================================
-        # FIRST TIMEOUT CHECK @ 60s
-        # ===================================================================
-        if (
-            elapsed_since_place >= config.LIMIT_ORDER_WAIT_TIMEOUT_SEC
-            and not pos.timeout_cancelled
-            and pos._first_timeout_check_time == 0.0
-        ):
-            pos._first_timeout_check_time = now_sec
-            logger.warning(
-                f"⏱️ FIRST TIMEOUT CHECK @ {elapsed_since_place:.1f}s"
-            )
-
-            if self._checking_order_status:
-                logger.warning("⚠️ Status check already in progress, skipping")
-                return
-
-            self._checking_order_status = True
-
-            try:
-                # Step 1: Check current price proximity to limit order (NO API CALL)
-                current_price = data_manager.get_last_price()  # From websocket stream
-                limit_price = pos.entry_price
-                price_diff_ticks = abs(current_price - limit_price) / config.TICK_SIZE
-                proximity_threshold = 50  # 50 ticks proximity threshold
-
-                logger.info(f"📊 Price Proximity Check:")
-                logger.info(f"   Current Price: {current_price:.2f}")
-                logger.info(f"   Limit Price: {limit_price:.2f}")
-                logger.info(f"   Distance: {price_diff_ticks:.1f} ticks")
-                logger.info(f"   Threshold: {proximity_threshold} ticks")
-
-                # If price is NEAR limit order, extend timeout by 60s
-                if price_diff_ticks <= proximity_threshold:
-                    logger.warning(
-                        f"💡 PRICE PROXIMITY DETECTED: {price_diff_ticks:.1f} ticks from limit\n"
-                        f"   → EXTENDING timeout by 60s (potential fill imminent)"
-                    )
-                    pos._price_proximity_extension_granted = True
-                    return  # Exit and wait another 60s
-
-                # If price is FAR, check order status immediately
-                logger.info(f"✓ Price is FAR from limit ({price_diff_ticks:.1f} ticks) - checking order status")
-
-                # Step 2: Check order status with single API call
-                from order_manager import GlobalRateLimiter
-                GlobalRateLimiter.wait()
-
-                status_normalized = order_manager.get_order_status_safe(pos.main_order_id)
-                logger.info(f"📊 Order status result: {status_normalized}")
-
-                if status_normalized == "FILLED":
-                    logger.info("✅ ORDER FILLED - Activating position management")
-                    try:
-                        full_status = order_manager.get_order_status(pos.main_order_id)
-                        if full_status:
-                            pos.entry_price = order_manager.extract_fill_price(full_status)
-                        else:
-                            pos.entry_price = current_price
-                    except Exception as e:
-                        logger.warning(f"Could not extract fill price: {e}")
-                        pos.entry_price = current_price
-
-                    pos.main_filled = True
-                    pos.timeout_cancelled = False
-
-                    try:
-                        from telegram_notifier import format_fill_message, send_telegram_message
-                        msg = format_fill_message(
-                            trade_id=pos.trade_id,
-                            side=pos.side,
-                            fill_price=pos.entry_price,
-                            quantity=pos.quantity,
-                            tp_price=pos.tp_price,
-                            sl_price=pos.sl_price,
-                        )
-                        send_telegram_message(msg)
-                    except Exception as e:
-                        logger.error(f"Error sending fill notification: {e}")
-
-                    return
-
-                # If status is UNKNOWN or PENDING, extend timeout
-                elif status_normalized in ("UNKNOWN", "PENDING"):
-                    logger.warning(
-                        f"⚠️ ORDER STATUS: {status_normalized}\n"
-                        f"   → EXTENDING timeout by 60s for status clarity"
-                    )
-                    pos._price_proximity_extension_granted = True
-                    return  # Wait another 60s
-
-                # If order is CANCELLED or REJECTED, proceed to cleanup
-                else:
-                    logger.info(f"🧹 Order status: {status_normalized} - proceeding to cleanup")
-                    # Will handle cleanup in second timeout check
-
-            finally:
-                self._checking_order_status = False
-
-        # ===================================================================
-        # SECOND TIMEOUT CHECK @ 120s (after extension)
-        # ===================================================================
-        elif (
-            elapsed_since_place >= (config.LIMIT_ORDER_WAIT_TIMEOUT_SEC * 2)
-            and pos._first_timeout_check_time > 0.0
-            and pos._second_timeout_check_time == 0.0
-        ):
-            pos._second_timeout_check_time = now_sec
-            logger.warning(
-                f"⏱️ SECOND TIMEOUT CHECK @ {elapsed_since_place:.1f}s"
-            )
-
-            if self._checking_order_status:
-                logger.warning("⚠️ Status check already in progress, skipping")
-                return
-
-            self._checking_order_status = True
-
-            try:
-                # Step 1: Re-check price proximity (NO API CALL)
-                current_price = data_manager.get_last_price()
-                limit_price = pos.entry_price
-                price_diff_ticks = abs(current_price - limit_price) / config.TICK_SIZE
-                proximity_threshold = 50
-
-                logger.info(f"📊 Second Price Proximity Check:")
-                logger.info(f"   Current Price: {current_price:.2f}")
-                logger.info(f"   Limit Price: {limit_price:.2f}")
-                logger.info(f"   Distance: {price_diff_ticks:.1f} ticks")
-
-                # Step 2: Check order status (single API call)
-                from order_manager import GlobalRateLimiter
-                GlobalRateLimiter.wait()
-
-                status_normalized = order_manager.get_order_status_safe(pos.main_order_id)
-                logger.info(f"📊 Final order status: {status_normalized}")
-
-                # If FILLED, activate position
-                if status_normalized == "FILLED":
-                    logger.info("✅ ORDER FILLED at second check - Activating position")
-                    try:
-                        full_status = order_manager.get_order_status(pos.main_order_id)
-                        if full_status:
-                            pos.entry_price = order_manager.extract_fill_price(full_status)
-                        else:
-                            pos.entry_price = current_price
-                    except Exception as e:
-                        logger.warning(f"Could not extract fill price: {e}")
-                        pos.entry_price = current_price
-
-                    pos.main_filled = True
-                    pos.timeout_cancelled = False
-
-                    try:
-                        from telegram_notifier import format_fill_message, send_telegram_message
-                        msg = format_fill_message(
-                            trade_id=pos.trade_id,
-                            side=pos.side,
-                            fill_price=pos.entry_price,
-                            quantity=pos.quantity,
-                            tp_price=pos.tp_price,
-                            sl_price=pos.sl_price,
-                        )
-                        send_telegram_message(msg)
-                    except Exception as e:
-                        logger.error(f"Error sending fill notification: {e}")
-
-                    return
-
-                # If still price is near AND status is PENDING/UNKNOWN, do FINAL position check
-                if price_diff_ticks <= proximity_threshold and status_normalized in ("PENDING", "UNKNOWN"):
-                    logger.warning(
-                        f"⚠️ CRITICAL: Price still near limit ({price_diff_ticks:.1f} ticks) AND status {status_normalized}\n"
-                        f"   → Performing FINAL position check before any cancellations"
-                    )
-
-                    # Step 3: Final position check (single API call)
-                    GlobalRateLimiter.wait()
-                    positions_resp = order_manager.api.get_positions(
-                        symbol=config.SYMBOL,
-                        exchange=config.EXCHANGE,
-                    )
-
-                    if positions_resp and not positions_resp.get("error"):
-                        data = positions_resp.get("data", [])
-                        if isinstance(data, list):
-                            for p in data:
-                                if p.get("symbol") == config.SYMBOL:
-                                    qty = abs(float(p.get("quantity", 0)))
-                                    if qty > 0:
-                                        logger.info(
-                                            f"🛡️ ACTIVE POSITION DETECTED: {qty:.6f} BTC\n"
-                                            f"   → Position is FILLED! Activating management with TP/SL PROTECTED"
-                                        )
-                                        pos.main_filled = True
-                                        pos.timeout_cancelled = False
-                                        pos.entry_price = float(p.get("entry_price", current_price))
-                                        logger.info(f"✅ Position activated @ {pos.entry_price:.2f}")
-                                        return
-
-                # ===================================================================
-                # SMART CANCELLATION: Cancel LIMIT first, preserve TP/SL if needed
-                # ===================================================================
+            # ===================================================================
+            # FIRST TIMEOUT CHECK @ 60s
+            # ===================================================================
+            if (
+                elapsed_since_place >= config.LIMIT_ORDER_WAIT_TIMEOUT_SEC
+                and not pos.timeout_cancelled
+                and pos._first_timeout_check_time == 0.0
+            ):
+                pos._first_timeout_check_time = now_sec
                 logger.warning(
-                    f"⚠️ FINAL TIMEOUT @ {elapsed_since_place:.0f}s\n"
-                    f"   Order Status: {status_normalized}\n"
-                    f"   Proceeding with smart cancellation..."
+                    f"⏱️ FIRST TIMEOUT CHECK @ {elapsed_since_place:.1f}s"
                 )
 
-                # Step 4: Cancel LIMIT order FIRST (single API call)
-                logger.info(f"[1/3] Cancelling LIMIT order: {pos.main_order_id}")
-                GlobalRateLimiter.wait()
+                if self._checking_order_status:
+                    logger.warning("⚠️ Status check already in progress, skipping")
+                    return
 
-                limit_cancel_resp = order_manager.api.cancel_order(
-                    order_id=pos.main_order_id,
-                    exchange=config.EXCHANGE,
-                )
+                self._checking_order_status = True
 
-                limit_cancelled = False
-                if limit_cancel_resp.get("error"):
-                    error_msg = str(limit_cancel_resp.get("message", ""))
-                    if "cannot be cancelled" in error_msg.lower() or "filled" in error_msg.lower():
+                try:
+                    # Step 1: Check current price proximity to limit order (NO API CALL)
+                    current_price = data_manager.get_last_price()  # From websocket stream
+                    limit_price = pos.entry_price
+                    price_diff_ticks = abs(current_price - limit_price) / config.TICK_SIZE
+                    proximity_threshold = 50  # 50 ticks proximity threshold
+
+                    logger.info(f"📊 Price Proximity Check:")
+                    logger.info(f"   Current Price: {current_price:.2f}")
+                    logger.info(f"   Limit Price: {limit_price:.2f}")
+                    logger.info(f"   Distance: {price_diff_ticks:.1f} ticks")
+                    logger.info(f"   Threshold: {proximity_threshold} ticks")
+
+                    # If price is NEAR limit order, extend timeout by 60s
+                    if price_diff_ticks <= proximity_threshold:
                         logger.warning(
-                            f"⚠️ LIMIT order already FILLED during cancellation attempt!\n"
-                            f"   → ABORTING all cancellations - KEEPING TP/SL intact"
+                            f"💡 PRICE PROXIMITY DETECTED: {price_diff_ticks:.1f} ticks from limit\n"
+                            f"   → EXTENDING timeout by 60s (potential fill imminent)"
                         )
-                        # Re-check position one more time
+                        pos._price_proximity_extension_granted = True
+                        return  # Exit and wait another 60s
+
+                    # If price is FAR, check order status immediately
+                    logger.info(f"✓ Price is FAR from limit ({price_diff_ticks:.1f} ticks) - checking order status")
+
+                    # Step 2: Check order status with single API call
+                    from order_manager import GlobalRateLimiter
+                    GlobalRateLimiter.wait()
+
+                    status_normalized = order_manager.get_order_status_safe(pos.main_order_id)
+                    logger.info(f"📊 Order status result: {status_normalized}")
+
+                    if status_normalized == "FILLED":
+                        logger.info("✅ ORDER FILLED - Activating position management")
+                        try:
+                            full_status = order_manager.get_order_status(pos.main_order_id)
+                            if full_status:
+                                pos.entry_price = order_manager.extract_fill_price(full_status)
+                            else:
+                                pos.entry_price = current_price
+                        except Exception as e:
+                            logger.warning(f"Could not extract fill price: {e}")
+                            pos.entry_price = current_price
+
+                        pos.main_filled = True
+                        pos.timeout_cancelled = False
+
+                        try:
+                            from telegram_notifier import format_fill_message, send_telegram_message
+                            msg = format_fill_message(
+                                trade_id=pos.trade_id,
+                                side=pos.side,
+                                fill_price=pos.entry_price,
+                                quantity=pos.quantity,
+                                tp_price=pos.tp_price,
+                                sl_price=pos.sl_price,
+                            )
+                            send_telegram_message(msg)
+                        except Exception as e:
+                            logger.error(f"Error sending fill notification: {e}")
+
+                        return
+
+                    # If status is UNKNOWN or PENDING, extend timeout
+                    elif status_normalized in ("UNKNOWN", "PENDING"):
+                        logger.warning(
+                            f"⚠️ ORDER STATUS: {status_normalized}\n"
+                            f"   → EXTENDING timeout by 60s for status clarity"
+                        )
+                        pos._price_proximity_extension_granted = True
+                        return  # Wait another 60s
+
+                    # If order is CANCELLED or REJECTED, proceed to cleanup
+                    else:
+                        logger.info(f"🧹 Order status: {status_normalized} - proceeding to cleanup")
+                        # Will handle cleanup in second timeout check
+
+                finally:
+                    self._checking_order_status = False
+
+            # ===================================================================
+            # SECOND TIMEOUT CHECK @ 120s (after extension)
+            # ===================================================================
+            elif (
+                elapsed_since_place >= (config.LIMIT_ORDER_WAIT_TIMEOUT_SEC * 2)
+                and pos._first_timeout_check_time > 0.0
+                and pos._second_timeout_check_time == 0.0
+            ):
+                pos._second_timeout_check_time = now_sec
+                logger.warning(
+                    f"⏱️ SECOND TIMEOUT CHECK @ {elapsed_since_place:.1f}s"
+                )
+
+                if self._checking_order_status:
+                    logger.warning("⚠️ Status check already in progress, skipping")
+                    return
+
+                self._checking_order_status = True
+
+                try:
+                    # Step 1: Re-check price proximity (NO API CALL)
+                    current_price = data_manager.get_last_price()
+                    limit_price = pos.entry_price
+                    price_diff_ticks = abs(current_price - limit_price) / config.TICK_SIZE
+                    proximity_threshold = 50
+
+                    logger.info(f"📊 Second Price Proximity Check:")
+                    logger.info(f"   Current Price: {current_price:.2f}")
+                    logger.info(f"   Limit Price: {limit_price:.2f}")
+                    logger.info(f"   Distance: {price_diff_ticks:.1f} ticks")
+
+                    # Step 2: Check order status (single API call)
+                    from order_manager import GlobalRateLimiter
+                    GlobalRateLimiter.wait()
+
+                    status_normalized = order_manager.get_order_status_safe(pos.main_order_id)
+                    logger.info(f"📊 Final order status: {status_normalized}")
+
+                    # If FILLED, activate position
+                    if status_normalized == "FILLED":
+                        logger.info("✅ ORDER FILLED at second check - Activating position")
+                        try:
+                            full_status = order_manager.get_order_status(pos.main_order_id)
+                            if full_status:
+                                pos.entry_price = order_manager.extract_fill_price(full_status)
+                            else:
+                                pos.entry_price = current_price
+                        except Exception as e:
+                            logger.warning(f"Could not extract fill price: {e}")
+                            pos.entry_price = current_price
+
+                        pos.main_filled = True
+                        pos.timeout_cancelled = False
+
+                        try:
+                            from telegram_notifier import format_fill_message, send_telegram_message
+                            msg = format_fill_message(
+                                trade_id=pos.trade_id,
+                                side=pos.side,
+                                fill_price=pos.entry_price,
+                                quantity=pos.quantity,
+                                tp_price=pos.tp_price,
+                                sl_price=pos.sl_price,
+                            )
+                            send_telegram_message(msg)
+                        except Exception as e:
+                            logger.error(f"Error sending fill notification: {e}")
+
+                        return
+
+                    # If still price is near AND status is PENDING/UNKNOWN, do FINAL position check
+                    if price_diff_ticks <= proximity_threshold and status_normalized in ("PENDING", "UNKNOWN"):
+                        logger.warning(
+                            f"⚠️ CRITICAL: Price still near limit ({price_diff_ticks:.1f} ticks) AND status {status_normalized}\n"
+                            f"   → Performing FINAL position check before any cancellations"
+                        )
+
+                        # Step 3: Final position check (single API call)
                         GlobalRateLimiter.wait()
                         positions_resp = order_manager.api.get_positions(
                             symbol=config.SYMBOL,
@@ -1150,145 +1097,195 @@ class ZScoreIcebergHunterStrategy:
                                     if p.get("symbol") == config.SYMBOL:
                                         qty = abs(float(p.get("quantity", 0)))
                                         if qty > 0:
+                                            logger.info(
+                                                f"🛡️ ACTIVE POSITION DETECTED: {qty:.6f} BTC\n"
+                                                f"   → Position is FILLED! Activating management with TP/SL PROTECTED"
+                                            )
                                             pos.main_filled = True
                                             pos.timeout_cancelled = False
                                             pos.entry_price = float(p.get("entry_price", current_price))
-                                            logger.info(
-                                                f"✅ LAST-SECOND FILL DETECTED @ {pos.entry_price:.2f}\n"
-                                                f"   → TP/SL orders remain ACTIVE and PROTECTED"
-                                            )
+                                            logger.info(f"✅ Position activated @ {pos.entry_price:.2f}")
                                             return
 
-                        # If no position found, something went wrong - keep TP/SL anyway
-                        logger.error(
-                            f"❌ LIMIT cancellation failed but no position found\n"
-                            f"   → Playing safe: KEEPING TP/SL orders\n"
-                            f"   → Manual verification required"
-                        )
-                        self.current_position = None
-                        self.pending_entry = False
-                        return
-
-                    elif "not found" in error_msg.lower() or "cancelled" in error_msg.lower():
-                        logger.info(f"✓ LIMIT order already cancelled/not found")
-                        limit_cancelled = True
-                    else:
-                        logger.error(f"❌ LIMIT cancel error: {error_msg}")
-                        # Proceed with TP/SL cancellation anyway
-                        limit_cancelled = False
-                else:
-                    logger.info(f"✓ LIMIT order cancelled successfully")
-                    limit_cancelled = True
-
-                time.sleep(0.5)  # Brief delay for exchange processing
-
-                # Step 5: Cancel TP order (single API call)
-                logger.info(f"[2/3] Cancelling TP order: {pos.tp_order_id}")
-                GlobalRateLimiter.wait()
-
-                tp_cancel_resp = order_manager.api.cancel_order(
-                    order_id=pos.tp_order_id,
-                    exchange=config.EXCHANGE,
-                )
-
-                if tp_cancel_resp.get("error"):
-                    logger.debug(f"TP cancel: {tp_cancel_resp.get('message', '')}")
-                else:
-                    logger.info(f"✓ TP order cancelled")
-
-                time.sleep(0.3)
-
-                # Step 6: Cancel SL order (single API call)
-                logger.info(f"[3/3] Cancelling SL order: {pos.sl_order_id}")
-                GlobalRateLimiter.wait()
-
-                sl_cancel_resp = order_manager.api.cancel_order(
-                    order_id=pos.sl_order_id,
-                    exchange=config.EXCHANGE,
-                )
-
-                if sl_cancel_resp.get("error"):
-                    logger.debug(f"SL cancel: {sl_cancel_resp.get('message', '')}")
-                else:
-                    logger.info(f"✓ SL order cancelled")
-
-                # Cleanup
-                logger.info(
-                    f"✅ TIMEOUT CLEANUP COMPLETE\n"
-                    f"   → All orders cancelled after {elapsed_since_place:.0f}s\n"
-                    f"   → Strategy reset, ready for next signal"
-                )
-
-                try:
-                    msg = (
-                        f"⏱️ TIMEOUT #{pos.trade_id}\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"  {pos.side.upper()} @ ${pos.entry_price:.2f}\n"
-                        f"  No fill after {elapsed_since_place:.0f}s\n"
-                        f"  All orders cancelled\n"
-                        f"  Final Status: {status_normalized}"
+                    # ===================================================================
+                    # SMART CANCELLATION: Cancel LIMIT first, preserve TP/SL if needed
+                    # ===================================================================
+                    logger.warning(
+                        f"⚠️ FINAL TIMEOUT @ {elapsed_since_place:.0f}s\n"
+                        f"   Order Status: {status_normalized}\n"
+                        f"   Proceeding with smart cancellation..."
                     )
-                    from telegram_notifier import send_telegram_message
-                    send_telegram_message(msg)
-                except Exception as e:
-                    logger.error(f"Error sending timeout notification: {e}")
 
-                self.current_position = None
-                self.pending_entry = False
-                self.last_entry_time_sec = now_sec
-                return
+                    # Step 4: Cancel LIMIT order FIRST (single API call)
+                    logger.info(f"[1/3] Cancelling LIMIT order: {pos.main_order_id}")
+                    GlobalRateLimiter.wait()
 
-            finally:
-                self._checking_order_status = False
+                    limit_cancel_resp = order_manager.api.cancel_order(
+                        order_id=pos.main_order_id,
+                        exchange=config.EXCHANGE,
+                    )
 
-        # ===================================================================
-        # EARLY FILL DETECTION (between timeout checks)
-        # ===================================================================
-        if not hasattr(pos, "_last_early_check_time"):
-            pos._last_early_check_time = 0.0
+                    limit_cancelled = False
+                    if limit_cancel_resp.get("error"):
+                        error_msg = str(limit_cancel_resp.get("message", ""))
+                        if "cannot be cancelled" in error_msg.lower() or "filled" in error_msg.lower():
+                            logger.warning(
+                                f"⚠️ LIMIT order already FILLED during cancellation attempt!\n"
+                                f"   → ABORTING all cancellations - KEEPING TP/SL intact"
+                            )
+                            # Re-check position one more time
+                            GlobalRateLimiter.wait()
+                            positions_resp = order_manager.api.get_positions(
+                                symbol=config.SYMBOL,
+                                exchange=config.EXCHANGE,
+                            )
 
-        if now_sec - pos._last_early_check_time >= config.EARLY_FILL_CHECK_INTERVAL_SEC:
-            pos._last_early_check_time = now_sec
+                            if positions_resp and not positions_resp.get("error"):
+                                data = positions_resp.get("data", [])
+                                if isinstance(data, list):
+                                    for p in data:
+                                        if p.get("symbol") == config.SYMBOL:
+                                            qty = abs(float(p.get("quantity", 0)))
+                                            if qty > 0:
+                                                pos.main_filled = True
+                                                pos.timeout_cancelled = False
+                                                pos.entry_price = float(p.get("entry_price", current_price))
+                                                logger.info(
+                                                    f"✅ LAST-SECOND FILL DETECTED @ {pos.entry_price:.2f}\n"
+                                                    f"   → TP/SL orders remain ACTIVE and PROTECTED"
+                                                )
+                                                return
 
-            if not self.early_fill_handled.get(pos.main_order_id, False):
-                status_normalized = order_manager.get_order_status_safe(pos.main_order_id)
+                            # If no position found, something went wrong - keep TP/SL anyway
+                            logger.error(
+                                f"❌ LIMIT cancellation failed but no position found\n"
+                                f"   → Playing safe: KEEPING TP/SL orders\n"
+                                f"   → Manual verification required"
+                            )
+                            self.current_position = None
+                            self.pending_entry = False
+                            return
 
-                if status_normalized == "FILLED":
-                    self.early_fill_handled[pos.main_order_id] = True
-                    logger.info(f"✅ EARLY FILL detected: {pos.main_order_id}")
-
-                    try:
-                        full_status = order_manager.get_order_status(pos.main_order_id)
-                        if full_status:
-                            pos.entry_price = order_manager.extract_fill_price(full_status)
+                        elif "not found" in error_msg.lower() or "cancelled" in error_msg.lower():
+                            logger.info(f"✓ LIMIT order already cancelled/not found")
+                            limit_cancelled = True
                         else:
-                            pos.entry_price = current_price
-                    except Exception:
-                        pos.entry_price = current_price
+                            logger.error(f"❌ LIMIT cancel error: {error_msg}")
+                            # Proceed with TP/SL cancellation anyway
+                            limit_cancelled = False
+                    else:
+                        logger.info(f"✓ LIMIT order cancelled successfully")
+                        limit_cancelled = True
 
-                    pos.main_filled = True
-                    logger.info(f"Position activated @ {pos.entry_price:.2f}")
+                    time.sleep(0.5)  # Brief delay for exchange processing
+
+                    # Step 5: Cancel TP order (single API call)
+                    logger.info(f"[2/3] Cancelling TP order: {pos.tp_order_id}")
+                    GlobalRateLimiter.wait()
+
+                    tp_cancel_resp = order_manager.api.cancel_order(
+                        order_id=pos.tp_order_id,
+                        exchange=config.EXCHANGE,
+                    )
+
+                    if tp_cancel_resp.get("error"):
+                        logger.debug(f"TP cancel: {tp_cancel_resp.get('message', '')}")
+                    else:
+                        logger.info(f"✓ TP order cancelled")
+
+                    time.sleep(0.3)
+
+                    # Step 6: Cancel SL order (single API call)
+                    logger.info(f"[3/3] Cancelling SL order: {pos.sl_order_id}")
+                    GlobalRateLimiter.wait()
+
+                    sl_cancel_resp = order_manager.api.cancel_order(
+                        order_id=pos.sl_order_id,
+                        exchange=config.EXCHANGE,
+                    )
+
+                    if sl_cancel_resp.get("error"):
+                        logger.debug(f"SL cancel: {sl_cancel_resp.get('message', '')}")
+                    else:
+                        logger.info(f"✓ SL order cancelled")
+
+                    # Cleanup
+                    logger.info(
+                        f"✅ TIMEOUT CLEANUP COMPLETE\n"
+                        f"   → All orders cancelled after {elapsed_since_place:.0f}s\n"
+                        f"   → Strategy reset, ready for next signal"
+                    )
 
                     try:
-                        from telegram_notifier import format_fill_message, send_telegram_message
-                        msg = format_fill_message(
-                            trade_id=pos.trade_id,
-                            side=pos.side,
-                            fill_price=pos.entry_price,
-                            quantity=pos.quantity,
-                            tp_price=pos.tp_price,
-                            sl_price=pos.sl_price,
+                        msg = (
+                            f"⏱️ TIMEOUT #{pos.trade_id}\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"  {pos.side.upper()} @ ${pos.entry_price:.2f}\n"
+                            f"  No fill after {elapsed_since_place:.0f}s\n"
+                            f"  All orders cancelled\n"
+                            f"  Final Status: {status_normalized}"
                         )
+                        from telegram_notifier import send_telegram_message
                         send_telegram_message(msg)
                     except Exception as e:
-                        logger.error(f"Error sending fill notification: {e}")
+                        logger.error(f"Error sending timeout notification: {e}")
 
-            return  # Continue waiting for fill
+                    self.current_position = None
+                    self.pending_entry = False
+                    self.last_entry_time_sec = now_sec
+                    return
 
-    # ========================================
-    # PHASE 2: FILLED POSITION MANAGEMENT
-    # ========================================
-        hold_min = (now_sec - pos.entry_time_sec) / 60.0
+                finally:
+                    self._checking_order_status = False
+
+            # ===================================================================
+            # EARLY FILL DETECTION (between timeout checks)
+            # ===================================================================
+            if not hasattr(pos, "_last_early_check_time"):
+                pos._last_early_check_time = 0.0
+
+            if now_sec - pos._last_early_check_time >= config.EARLY_FILL_CHECK_INTERVAL_SEC:
+                pos._last_early_check_time = now_sec
+
+                if not self.early_fill_handled.get(pos.main_order_id, False):
+                    status_normalized = order_manager.get_order_status_safe(pos.main_order_id)
+
+                    if status_normalized == "FILLED":
+                        self.early_fill_handled[pos.main_order_id] = True
+                        logger.info(f"✅ EARLY FILL detected: {pos.main_order_id}")
+
+                        try:
+                            full_status = order_manager.get_order_status(pos.main_order_id)
+                            if full_status:
+                                pos.entry_price = order_manager.extract_fill_price(full_status)
+                            else:
+                                pos.entry_price = current_price
+                        except Exception:
+                            pos.entry_price = current_price
+
+                        pos.main_filled = True
+                        logger.info(f"Position activated @ {pos.entry_price:.2f}")
+
+                        try:
+                            from telegram_notifier import format_fill_message, send_telegram_message
+                            msg = format_fill_message(
+                                trade_id=pos.trade_id,
+                                side=pos.side,
+                                fill_price=pos.entry_price,
+                                quantity=pos.quantity,
+                                tp_price=pos.tp_price,
+                                sl_price=pos.sl_price,
+                            )
+                            send_telegram_message(msg)
+                        except Exception as e:
+                            logger.error(f"Error sending fill notification: {e}")
+
+                return  # Continue waiting for fill
+
+        # ========================================
+        # PHASE 2: FILLED POSITION MANAGEMENT
+        # ========================================
+                hold_min = (now_sec - pos.entry_time_sec) / 60.0
         direction = 1.0 if pos.side == "long" else -1.0
         # ✅ FIX: Use margin-based ROI (same methodology as _compute_bracket_prices)
         current_profit_roi = ((current_price - pos.entry_price) * pos.quantity / pos.margin_used) * direction
