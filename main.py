@@ -73,7 +73,7 @@ class ZScoreIcebergBot:
      #   else:
      #       self.excel_logger = None
         
-        sself.strategy = ZScoreIcebergHunterStrategy()
+        self.strategy = ZScoreIcebergHunterStrategy()
         
         self.running = False
         self._last_stream_check_sec: float = 0.0
