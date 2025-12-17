@@ -30,8 +30,8 @@ MAX_MARGIN_PER_TRADE = 10000
 # ============================================================================
 # Weekend / Off-Hours (Conservative)
 WEEKEND_PARAMS = {
-    "z_threshold": 0.80,
-    "imbalance_threshold": 0.50,
+    "z_threshold": 1.50,
+    "imbalance_threshold": 0.65,
     "entry_score_threshold": 0.70,
     "wall_multiplier": 5.0,
     "min_signal_gap_sec": 180.0,  # 3 minutes
@@ -42,7 +42,7 @@ WEEKEND_PARAMS = {
 # Major Sessions (Standard)
 MAJOR_SESSION_PARAMS = {
     "z_threshold": 2.1,
-    "imbalance_threshold": 0.65,
+    "imbalance_threshold": 0.75,
     "entry_score_threshold": 0.80,
     "wall_multiplier": 4.2,
     "min_signal_gap_sec": 60.0,   # 1 minute
@@ -53,7 +53,7 @@ MAJOR_SESSION_PARAMS = {
 # Overlap Sessions (Aggressive)
 OVERLAP_SESSION_PARAMS = {
     "z_threshold": 2.5,
-    "imbalance_threshold": 0.75,
+    "imbalance_threshold": 0.8,
     "entry_score_threshold": 0.85,
     "wall_multiplier": 4.0,
     "min_signal_gap_sec": 45.0,   # 45 seconds
