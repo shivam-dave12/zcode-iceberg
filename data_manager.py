@@ -1339,10 +1339,8 @@ class ZScoreDataManager:
         return float(max(-1.0, min(1.0, momentum)))
 
     def restart_streams(self) -> bool:
-        """
-        ✅ CRITICAL FIX: Restart streams WITHOUT creating new WebSocket instance.
-        Reuses existing ws with auto-resubscribe functionality.
-        """
+        """CRITICAL FIX: Restart streams WITHOUT creating new WebSocket instance.
+        Reuses existing ws with auto-resubscribe functionality."""
         if not self.ws:
             logger.error("WebSocket not initialized, cannot restart")
             return self.start()
@@ -1350,22 +1348,33 @@ class ZScoreDataManager:
         try:
             logger.info("🔄 Restarting streams (reconnection mode)...")
             
-            # Check if already connected (socketio auto-reconnected)
-            if self.ws.is_connected:
-                logger.info("✓ WebSocket already reconnected automatically")
-                # Callbacks are preserved, subscriptions auto-resubscribed
-                self.is_streaming = True
-                return True
+            # FORCE disconnect first (even if is_connected=True)
+            try:
+                if self.ws.sio.connected:
+                    self.ws.sio.disconnect()
+                    time.sleep(0.5)  # Brief pause to ensure clean disconnect
+            except Exception as e:
+                logger.warning(f"Error during forced disconnect: {e}")
             
-            # Attempt reconnection if not connected
+            # Reconnect - this will trigger auto-resubscribe
             logger.info("Attempting to reconnect WebSocket...")
-            if not self.ws.connect():
+            if not self.ws.connect(timeout=10):
                 logger.error("WebSocket reconnection failed")
                 return False
             
-            self.is_streaming = True
-            logger.info("✓ Streams restarted successfully")
-            return True
+            # Wait for data to start flowing (up to 5 seconds)
+            wait_start = time.time()
+            while time.time() - wait_start < 5.0:
+                if self.stats.get('last_update'):
+                    age = (datetime.now() - self.stats['last_update']).total_seconds()
+                    if age < 3.0:  # Fresh data received
+                        logger.info("✓ Data flow confirmed after reconnect")
+                        self.is_streaming = True
+                        return True
+                time.sleep(0.2)
+            
+            logger.warning("WebSocket reconnected but no data flow detected")
+            return False
             
         except Exception as e:
             logger.error(f"Error restarting streams: {e}", exc_info=True)
